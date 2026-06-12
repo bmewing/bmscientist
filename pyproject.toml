@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "app-discovery-agent"
+version = "0.1.0"
+description = "Local MVP for discovering application-development evidence and summarizing material substitution opportunities."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI Codex" }
+]
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "langgraph>=0.2.34",
+  "lancedb>=0.24.0",
+  "openai>=1.51.0",
+  "pydantic>=2.9.2",
+  "pyarrow>=17.0.0",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.3",
+  "rich>=13.9.2",
+  "sentence-transformers>=3.2.1",
+  "trafilatura>=1.12.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app_discovery_agent"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv]
+dev-dependencies = [
+  "pytest>=8.3.3",
+]
+
