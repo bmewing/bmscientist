@@ -76,6 +76,41 @@ class EvidenceClassification(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class EvidenceClassificationDraft(BaseModel):
+    relevant: bool | None = None
+    relevance_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    application: str | None = None
+    incumbent_material: str | None = None
+    candidate_materials: list[str] = Field(default_factory=list)
+    evidence_type: str | None = None
+    application_requirements: list[str] = Field(default_factory=list)
+    substitution_drivers: list[str] = Field(default_factory=list)
+    rationale: str = Field(default="")
+    supporting_quotes: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator(
+        "candidate_materials",
+        "application_requirements",
+        "substitution_drivers",
+        "supporting_quotes",
+        mode="before",
+    )
+    @classmethod
+    def default_list_fields(cls, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return value
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def default_metadata(cls, value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        return value
+
+
 class ChunkRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -136,4 +171,3 @@ class OpportunityReport(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     narrative: str
     items: list[OpportunityItem] = Field(default_factory=list)
-

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -96,3 +98,13 @@ class ExaSearchClient:
             raw=item,
         )
 
+
+def load_search_results_file(path: Path) -> list[SearchResultItem]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    items: list[SearchResultItem] = []
+    for entry in payload:
+        query = entry.get("query", "")
+        raw_payload = entry.get("payload", {})
+        for result in raw_payload.get("results", []):
+            items.append(ExaSearchClient._to_result_item(query, result))
+    return items

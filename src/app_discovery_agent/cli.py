@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     opportunities.add_argument("--incumbent-material", required=True)
     opportunities.add_argument("--candidate-material", required=True)
 
+    replay = subparsers.add_parser("replay", help="Replay a discovery run from cached raw artifacts without using Exa.")
+    replay.add_argument("--query")
+    replay.add_argument("--run-id")
+    replay.add_argument("--search-results-file")
+    replay.add_argument("--fetched-pages-file")
+    replay.add_argument("--max-pages", type=int, default=20)
+
     return parser
 
 
@@ -114,6 +121,61 @@ def run_opportunities(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+def run_replay(args: argparse.Namespace, config: AppConfig) -> int:
+    agent = DiscoveryAgent(config)
+    search_results_path, fetched_pages_path = resolve_replay_paths(args.run_id, args.search_results_file, args.fetched_pages_file)
+    query = args.query or infer_query_from_search_results(search_results_path)
+
+    if not query:
+        raise ValueError("Replay requires --query, or a search_results.json file containing the original query.")
+
+    summary = agent.replay_discovery(
+        query=query,
+        search_results_path=search_results_path,
+        fetched_pages_path=fetched_pages_path,
+        max_pages=args.max_pages,
+    )
+    console.print(f"[bold]Replay run ID:[/bold] {summary.run_id}")
+    console.print(f"[bold]Stored chunks:[/bold] {summary.stored_chunks}")
+    console.print(f"[bold]Relevant pages:[/bold] {summary.relevant_pages}")
+    console.print(f"[bold]Summary:[/bold] {summary.output_path}")
+    console.print(summary.opportunity_summary)
+    return 0
+
+
+def resolve_replay_paths(
+    run_id: str | None,
+    search_results_file: str | None,
+    fetched_pages_file: str | None,
+) -> tuple[Path | None, Path | None]:
+    if search_results_file or fetched_pages_file:
+        return (
+            Path(search_results_file) if search_results_file else None,
+            Path(fetched_pages_file) if fetched_pages_file else None,
+        )
+
+    raw_dir = Path("data/raw")
+    if run_id:
+        return raw_dir / f"{run_id}_search_results.json", raw_dir / f"{run_id}_fetched_pages.json"
+
+    latest_search = max(raw_dir.glob("*_search_results.json"), key=lambda path: path.stat().st_mtime, default=None)
+    latest_pages = max(raw_dir.glob("*_fetched_pages.json"), key=lambda path: path.stat().st_mtime, default=None)
+    return latest_search, latest_pages
+
+
+def infer_query_from_search_results(search_results_path: Path | None) -> str | None:
+    if not search_results_path or not search_results_path.exists():
+        return None
+    import json
+
+    payload = json.loads(search_results_path.read_text(encoding="utf-8"))
+    for entry in payload:
+        query = entry.get("query")
+        if query:
+            return query
+    return None
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -126,6 +188,8 @@ def main() -> int:
         return run_search(args, config)
     if args.command == "opportunities":
         return run_opportunities(args, config)
+    if args.command == "replay":
+        return run_replay(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

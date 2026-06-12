@@ -11,4 +11,6 @@ data/outputs/*
 !data/outputs/.gitkeep
 data/lancedb/*
 !data/lancedb/.gitkeep
+AGENTS.md
+.env
 

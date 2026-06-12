@@ -20,10 +20,28 @@ class LanceEvidenceStore:
         self._vector_dim: int | None = None
 
     def _table_names(self) -> set[str]:
-        listing = self._db.table_names()
-        if isinstance(listing, list):
-            return set(listing)
-        return set(list(listing))
+        if hasattr(self._db, "list_tables"):
+            listing = self._db.list_tables()
+        else:
+            listing = self._db.table_names()
+        names: set[str] = set()
+        for item in list(listing):
+            normalized = self._normalize_table_name(item)
+            if normalized:
+                names.add(normalized)
+        return names
+
+    @staticmethod
+    def _normalize_table_name(item: Any) -> str | None:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            name = item.get("name")
+            return str(name) if name else None
+        if isinstance(item, (list, tuple)) and item:
+            head = item[0]
+            return str(head) if isinstance(head, str) else None
+        return None
 
     def _build_schema(self, vector_dim: int) -> pa.Schema:
         return pa.schema(
@@ -59,8 +77,16 @@ class LanceEvidenceStore:
             self._table = self._db.open_table(TABLE_NAME)
             return self._table
         schema = self._build_schema(vector_dim)
-        self._table = self._db.create_table(TABLE_NAME, schema=schema)
-        return self._table
+        try:
+            self._table = self._db.create_table(TABLE_NAME, schema=schema)
+            return self._table
+        except Exception as exc:
+            # LanceDB can report "already exists" even when the preceding table listing
+            # did not surface the table in a stable shape. In that case, open and append.
+            if "already exists" in str(exc).lower():
+                self._table = self._db.open_table(TABLE_NAME)
+                return self._table
+            raise
 
     def _serialize_record(self, record: ChunkRecord) -> dict[str, Any]:
         return {
@@ -114,4 +140,3 @@ class LanceEvidenceStore:
         if hasattr(table, "to_arrow"):
             return [self._deserialize_row(row) for row in table.to_arrow().to_pylist()]
         return [self._deserialize_row(row) for row in table.search([0.0] * (self._vector_dim or 1)).limit(1000).to_list()]
-

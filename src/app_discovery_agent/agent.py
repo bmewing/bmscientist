@@ -13,7 +13,7 @@ from app_discovery_agent.chunking import TextChunker
 from app_discovery_agent.classify import EvidenceClassifier
 from app_discovery_agent.config import AppConfig
 from app_discovery_agent.embeddings import LocalEmbedder
-from app_discovery_agent.extract import PageFetcher
+from app_discovery_agent.extract import PageFetcher, extract_domain
 from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.models import (
     ChunkRecord,
@@ -23,7 +23,7 @@ from app_discovery_agent.models import (
     SearchQueryPlan,
     SearchResultItem,
 )
-from app_discovery_agent.search import ExaSearchClient, deduplicate_search_results
+from app_discovery_agent.search import ExaSearchClient, deduplicate_search_results, load_search_results_file
 from app_discovery_agent.store import LanceEvidenceStore
 
 
@@ -107,23 +107,117 @@ class DiscoveryAgent:
         final_state = self._graph.invoke(state)
         return final_state["summary"]
 
+    def replay_discovery(
+        self,
+        query: str,
+        search_results_path: Path | None = None,
+        fetched_pages_path: Path | None = None,
+        max_pages: int = 20,
+    ) -> DiscoverySummary:
+        state: DiscoveryState = {
+            "run_id": str(uuid4()),
+            "original_query": query,
+            "max_search_queries": 0,
+            "results_per_query": 0,
+            "max_pages": max_pages,
+            "search_queries": [],
+            "skipped_pages": [],
+            "errors": [],
+        }
+
+        if search_results_path and search_results_path.exists():
+            search_results = load_search_results_file(search_results_path)
+            state["search_results"] = search_results
+            state.update(self.deduplicate_results(state))
+        else:
+            state["search_results"] = []
+            state["unique_results"] = []
+
+        if fetched_pages_path and fetched_pages_path.exists():
+            fetched_pages, preload_skips = self._load_cached_fetched_pages(fetched_pages_path, max_pages=max_pages)
+            state["fetched_pages"] = fetched_pages
+            state["skipped_pages"] = state.get("skipped_pages", []) + preload_skips
+        else:
+            fetched_update = self.fetch_pages(state)
+            state.update(fetched_update)
+
+        state.update(self.filter_relevance(state))
+        state.update(self.classify_evidence(state))
+        state.update(self.chunk_content(state))
+        state.update(self.embed_chunks(state))
+        state.update(self.write_to_lancedb(state))
+        state.update(self.summarize_discoveries(state))
+        return state["summary"]
+
     def plan_search_queries(self, state: DiscoveryState) -> DiscoveryState:
         system_prompt = (
             "You create precise web search queries for technical application discovery. "
             "Return JSON only."
         )
+        example_output = json.dumps(
+            {
+                "queries": [
+                    "material application market segment form performance requirements",
+                    "material thermoformed tray clarity impact resistance food packaging alternatives",
+                    "material vs glass stainless steel aluminum application requirements substitution",
+                ]
+            },
+            indent=2,
+        )
         user_prompt = f"""
 Original query:
 {state["original_query"]}
 
-Generate up to {state["max_search_queries"]} search queries that can uncover:
-- applications currently using PVC
-- clear rigid or semi-rigid product requirements
-- references to PET, PETG, or Eastman Tritan as alternatives or comparable materials
-- sustainability, regulatory, or customer pressure affecting material choices
+Generate up to {state["max_search_queries"]} targeted web search queries to help discover how the material named or implied in the original query is used in real-world applications.
 
-Favor targeted, evidence-rich queries over generic ones.
-Return JSON with a single field: queries
+Your goal is to uncover evidence about:
+
+Current applications
+Specific products, components, packages, assemblies, or end uses where the material is currently used.
+The relevant market segment, industry, or value chain context for each application.
+Examples: food packaging, medical devices, appliances, construction materials, automotive interiors, consumer electronics, durable goods, signage, industrial equipment, textiles, coatings, films, sheets, bottles, cladding, housings, trays, tubing, profiles, etc.
+Material form and conversion route
+The physical form in which the material is used.
+Examples: film, sheet, rigid container, bottle, thermoformed tray, extrusion profile, injection molded part, fiber, coating, laminate, foam, adhesive, cladding, panel, tube, cap, closure, liner, compound, resin, blend, composite, etc.
+Include likely manufacturing or forming terms when useful, such as thermoforming, injection molding, extrusion, blow molding, calendaring, lamination, coating, casting, compression molding, or additive manufacturing.
+Critical-to-quality features
+The application-specific performance attributes that make the material suitable or unsuitable.
+Examples: clarity, gloss, haze, stiffness, toughness, impact resistance, chemical resistance, heat resistance, dimensional stability, barrier performance, food contact compliance, biocompatibility, sterilization compatibility, weatherability, flame retardancy, scratch resistance, cleanability, flexibility, sealability, printability, processability, cost, weight, aesthetics, recyclability, carbon footprint, regulatory status, durability, or customer perception.
+Competing or substitutable materials
+Materials that compete with, replace, or are compared against the target material in the same application.
+Include both direct competitors within the same material family and functional substitutes from other material domains.
+Examples: PET vs glass bottles, PETG vs polycarbonate, PVC vs TPU, ABS cladding vs stainless steel cladding, acrylic vs glass, aluminum vs engineering plastic, paperboard vs plastic packaging, coated metal vs polymer film, ceramic vs polymer components.
+Look for phrases such as “alternative to,” “replacement for,” “substitute for,” “compared with,” “versus,” “material selection,” “material requirements,” “specification,” “performance requirements,” “design guide,” or “case study.”
+Market, sustainability, regulatory, or customer drivers
+Evidence of why material choices are changing or being challenged.
+Examples: recycling requirements, circularity goals, PFAS restrictions, PVC reduction, BPA concerns, food contact regulations, medical device regulations, building codes, fire safety standards, carbon footprint, lightweighting, durability, brand-owner sustainability commitments, customer complaints, retailer requirements, or procurement specifications.
+
+Favor evidence-rich queries that are likely to return:
+technical datasheets
+application guides
+material selection guides
+case studies
+product pages with specifications
+regulatory or standards references
+converter or fabricator pages
+industry articles
+patents only when useful for application discovery
+sustainability or substitution discussions
+
+Avoid generic queries that only search for the material name alone.
+
+Create a diverse set of queries that cover:
+application discovery
+market segment discovery
+material form or processing route
+performance requirements
+competing materials and substitutes
+sustainability, regulatory, or customer-driven material changes
+
+Return valid JSON only, with a single field named "queries".
+
+Example output format:
+{example_output}
 """
         plan = self._llm.complete_json(SearchQueryPlan, system_prompt, user_prompt)
         queries = plan.queries[: state["max_search_queries"]]
@@ -155,9 +249,25 @@ Return JSON with a single field: queries
         fetched_pages: list[PageContent] = []
         skipped = list(state.get("skipped_pages", []))
         for result in state.get("unique_results", [])[: state["max_pages"]]:
+            if self._fetcher.should_skip_direct_fetch(str(result.url)):
+                skipped.append(
+                    {
+                        "url": str(result.url),
+                        "search_query": result.search_query,
+                        "reason": "blocked_domain",
+                        "error": "Domain skipped for direct fetch based on configured policy",
+                    }
+                )
+                fallback_page = self._build_partial_page_from_search_result(result, "blocked_domain")
+                if fallback_page:
+                    fetched_pages.append(fallback_page)
+                continue
             page, error = self._fetcher.safe_fetch(result)
             if error:
-                skipped.append({"reason": "fetch_error", **error})
+                skipped.append(error)
+                fallback_page = self._build_partial_page_from_search_result(result, error.get("reason", "fetch_error"))
+                if fallback_page:
+                    fetched_pages.append(fallback_page)
                 continue
             if page:
                 fetched_pages.append(page)
@@ -188,11 +298,14 @@ Return JSON with a single field: queries
         candidates: list[PageContent] = []
         skipped = list(state.get("skipped_pages", []))
         for page in state.get("fetched_pages", []):
-            if len(page.text) < self._config.min_page_characters:
+            is_partial = bool(page.metadata.get("is_partial_evidence"))
+            min_characters = self._config.min_snippet_characters if is_partial else self._config.min_page_characters
+            if len(page.text) < min_characters:
                 skipped.append({"url": str(page.url), "reason": "too_little_text"})
                 continue
             heuristic_score = self._classifier.heuristic_relevance(state["original_query"], page.text)
-            if heuristic_score < 0.2:
+            min_heuristic_score = 0.1 if is_partial else 0.2
+            if heuristic_score < min_heuristic_score:
                 skipped.append({"url": str(page.url), "reason": "low_heuristic_relevance", "score": heuristic_score})
                 continue
             candidates.append(page)
@@ -301,13 +414,79 @@ Original query:
 Evidence preview:
 {json.dumps(evidence_preview, indent=2)}
 
-Write a concise summary with:
-- plausible application clusters
-- what evidence currently supports
-- what evidence is missing
-- next best research steps
+You are a discovery summarizer. Your job is to synthesize search-result evidence into a cautious, useful application-discovery summary for the material, material family, product form, or technology described in the original query.
 
-Keep the tone cautious and cite chunk IDs and URLs when referencing evidence.
+Focus on identifying:
+
+Application clusters
+Group evidence into plausible current or emerging application clusters.
+For each cluster, identify the likely market segment or industry.
+Prefer specific applications over broad categories.
+Example: “clear thermoformed food trays” is better than “packaging.”
+Material form and processing route
+Identify the form in which the material appears to be used.
+Examples: film, sheet, rigid container, bottle, thermoformed tray, injection molded component, extrusion profile, tube, panel, coating, laminate, fiber, foam, resin, blend, compound, cladding, housing, cap, closure, liner, or composite.
+Include processing or conversion methods when supported by evidence, such as thermoforming, injection molding, extrusion, blow molding, calendaring, lamination, coating, casting, compression molding, or additive manufacturing.
+Critical-to-quality requirements
+Extract the performance, regulatory, aesthetic, processing, or commercial requirements that appear important for the application.
+Examples: clarity, haze, gloss, stiffness, toughness, impact resistance, chemical resistance, heat resistance, dimensional stability, barrier performance, food contact compliance, biocompatibility, sterilization compatibility, weatherability, flame retardancy, scratch resistance, cleanability, flexibility, sealability, printability, processability, cost, weight, aesthetics, recyclability, carbon footprint, durability, regulatory compliance, or customer perception.
+Distinguish between explicitly stated requirements and inferred requirements.
+Competing or substitutable materials
+Identify materials mentioned as alternatives, substitutes, replacements, or comparables.
+Include both direct competitors within the same material family and functional substitutes from other material domains.
+Examples: PET vs glass bottles, PETG vs polycarbonate, PVC vs TPU, ABS cladding vs stainless steel cladding, acrylic vs glass, aluminum vs engineering plastic, paperboard vs plastic packaging, coated metal vs polymer film, ceramic vs polymer components.
+Do not overstate competition unless the evidence explicitly supports it.
+Market, sustainability, regulatory, or customer drivers
+Summarize evidence of forces affecting material selection.
+Examples: recycling requirements, circularity goals, restricted substances, food contact rules, medical regulations, building codes, fire safety standards, carbon footprint, lightweighting, durability, brand-owner sustainability commitments, customer complaints, retailer requirements, procurement specifications, or cost pressure.
+Evidence quality and gaps
+State what the evidence currently supports.
+State what remains uncertain or missing.
+Note whether evidence comes from strong sources, such as technical datasheets, application guides, regulatory documents, product specifications, case studies, or credible industry sources, versus weaker sources, such as vague marketing copy, SEO content, or isolated mentions.
+
+Write the summary in a concise, cautious tone. Do not invent applications, requirements, or competing materials that are not supported by the evidence preview.
+
+Use the following structure:
+
+Summary
+
+Briefly state the most important discovery from the evidence.
+
+Plausible application clusters
+
+For each cluster, include:
+
+Application / market segment:
+Material form / process:
+Critical-to-quality features:
+Competing or substitutable materials:
+Evidence currently supporting this:
+Confidence: High / Medium / Low
+Cross-cutting material-selection drivers
+
+Summarize recurring sustainability, regulatory, customer, economic, or performance drivers.
+
+What the evidence supports
+
+List the strongest supported findings. Cite chunk IDs and URLs for each finding.
+
+What is missing or uncertain
+
+List the most important evidence gaps, ambiguities, or weak assumptions.
+
+Next best research steps
+
+Recommend targeted follow-up research steps or search angles. Focus on searches that would clarify applications, material form, critical-to-quality requirements, competing materials, or market drivers.
+
+Citation rules:
+
+Cite chunk IDs and URLs whenever referencing evidence.
+If multiple chunks support a point, cite all relevant chunk IDs.
+If a conclusion is inferred rather than directly stated, label it as an inference.
+Do not cite evidence that does not actually support the statement.
+Do not include uncited factual claims about specific applications, materials, regulations, or competitors.
+
+Keep the output concise but information-dense.
 """
         narrative = self._llm.complete_text(system_prompt, user_prompt)
 
@@ -342,6 +521,67 @@ Keep the tone cautious and cite chunk IDs and URLs when referencing evidence.
         errors_path = Path("data/raw") / f'{state["run_id"]}_errors.json'
         errors_path.write_text(json.dumps(state.get("errors", []), indent=2), encoding="utf-8")
         return {"summary": summary, "output_path": str(output_path.resolve())}
+
+    def _load_cached_fetched_pages(self, path: Path, max_pages: int) -> tuple[list[PageContent], list[dict[str, Any]]]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pages: list[PageContent] = []
+        skipped: list[dict[str, Any]] = []
+
+        for entry in payload[:max_pages]:
+            content_type = (entry.get("content_type") or "").lower()
+            text = entry.get("text") or ""
+            if ("application/pdf" in content_type and text.startswith("%PDF-")) or (not text.strip()):
+                skipped.append(
+                    {
+                        "url": entry.get("url"),
+                        "search_query": entry.get("search_query"),
+                        "reason": "unsupported_cached_content_type",
+                        "content_type": content_type or "application/pdf",
+                    }
+                )
+                continue
+            try:
+                pages.append(PageContent.model_validate(entry))
+            except Exception as exc:
+                skipped.append(
+                    {
+                        "url": entry.get("url"),
+                        "search_query": entry.get("search_query"),
+                        "reason": "invalid_cached_page",
+                        "error": str(exc),
+                    }
+                )
+        return pages, skipped
+
+    def _build_partial_page_from_search_result(self, result: SearchResultItem, reason: str) -> PageContent | None:
+        partial_text = self._compose_partial_text(result)
+        if len(partial_text) < self._config.min_snippet_characters:
+            return None
+        return PageContent(
+            title=result.title,
+            url=str(result.url),
+            search_query=result.search_query,
+            source_domain=extract_domain(str(result.url)),
+            fetched_at=datetime.now(timezone.utc),
+            text=partial_text,
+            status_code=None,
+            content_type="application/x-search-snippet",
+            raw_excerpt=partial_text[:500],
+            metadata={
+                "is_partial_evidence": True,
+                "partial_evidence_reason": reason,
+                "source_type": "exa_search_result",
+                "search_result_summary": result.summary,
+                "search_result_snippet": result.snippet,
+                "search_result_score": result.score,
+                "search_result_published_date": result.published_date,
+            },
+        )
+
+    @staticmethod
+    def _compose_partial_text(result: SearchResultItem) -> str:
+        parts = [result.title.strip(), result.summary.strip(), result.snippet.strip()]
+        return "\n\n".join(part for part in parts if part)
 
     @property
     def store(self) -> LanceEvidenceStore:

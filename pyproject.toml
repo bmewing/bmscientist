@@ -18,6 +18,7 @@ dependencies = [
   "lancedb>=0.24.0",
   "openai>=1.51.0",
   "pydantic>=2.9.2",
+  "pypdf>=4.3.1",
   "pyarrow>=17.0.0",
   "python-dotenv>=1.0.1",
   "requests>=2.32.3",
@@ -42,4 +43,3 @@ testpaths = ["tests"]
 dev-dependencies = [
   "pytest>=8.3.3",
 ]
-

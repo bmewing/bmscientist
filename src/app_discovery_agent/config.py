@@ -20,6 +20,8 @@ class AppConfig(BaseModel):
     user_agent: str = Field(default="app-discovery-agent/0.1.0")
     min_relevance_score: float = Field(default=0.6, ge=0.0, le=1.0)
     min_page_characters: int = Field(default=600, ge=100)
+    min_snippet_characters: int = Field(default=120, ge=20)
+    skip_fetch_domains: list[str] = Field(default_factory=lambda: ["sciencedirect.com"])
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "AppConfig":
@@ -32,6 +34,11 @@ class AppConfig(BaseModel):
                 "exa_api_key": os.getenv("EXA_API_KEY", ""),
                 "lancedb_path": Path(os.getenv("LANCEDB_PATH", "./data/lancedb")),
                 "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
+                "skip_fetch_domains": [
+                    item.strip()
+                    for item in os.getenv("SKIP_FETCH_DOMAINS", "sciencedirect.com").split(",")
+                    if item.strip()
+                ],
             }
         )
 
@@ -42,4 +49,3 @@ class AppConfig(BaseModel):
         self.resolved_lancedb_path().mkdir(parents=True, exist_ok=True)
         Path("data/raw").mkdir(parents=True, exist_ok=True)
         Path("data/outputs").mkdir(parents=True, exist_ok=True)
-
