@@ -13,10 +13,13 @@ class AppConfig(BaseModel):
     deepseek_api_key: str = Field(min_length=1)
     deepseek_base_url: str = Field(default="https://api.deepseek.com")
     chat_model: str = Field(default="deepseek-v4-flash")
+    generation_chat_model: str | None = None
+    reflection_chat_model: str | None = None
+    planning_chat_model: str | None = None
     exa_api_key: str = Field(min_length=1)
     lancedb_path: Path = Field(default=Path("./data/lancedb"))
     embedding_model: str = Field(default="BAAI/bge-base-en-v1.5")
-    request_timeout_seconds: int = Field(default=20, ge=5, le=120)
+    request_timeout_seconds: int = Field(default=20, ge=5, le=600)
     user_agent: str = Field(default="app-discovery-agent/0.1.0")
     min_relevance_score: float = Field(default=0.6, ge=0.0, le=1.0)
     min_page_characters: int = Field(default=600, ge=100)
@@ -31,9 +34,13 @@ class AppConfig(BaseModel):
                 "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),
                 "deepseek_base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                 "chat_model": os.getenv("CHAT_MODEL", "deepseek-v4-flash"),
+                "generation_chat_model": os.getenv("GENERATION_CHAT_MODEL") or None,
+                "reflection_chat_model": os.getenv("REFLECTION_CHAT_MODEL") or None,
+                "planning_chat_model": os.getenv("PLANNING_CHAT_MODEL") or None,
                 "exa_api_key": os.getenv("EXA_API_KEY", ""),
                 "lancedb_path": Path(os.getenv("LANCEDB_PATH", "./data/lancedb")),
                 "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
+                "request_timeout_seconds": int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
                 "skip_fetch_domains": [
                     item.strip()
                     for item in os.getenv("SKIP_FETCH_DOMAINS", "sciencedirect.com").split(",")
@@ -49,3 +56,8 @@ class AppConfig(BaseModel):
         self.resolved_lancedb_path().mkdir(parents=True, exist_ok=True)
         Path("data/raw").mkdir(parents=True, exist_ok=True)
         Path("data/outputs").mkdir(parents=True, exist_ok=True)
+        Path("data/manually-obtained").mkdir(parents=True, exist_ok=True)
+        Path("data/manually-obtained/processed").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/research_goals").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/hypotheses").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/reports").mkdir(parents=True, exist_ok=True)

@@ -11,6 +11,11 @@ data/outputs/*
 !data/outputs/.gitkeep
 data/lancedb/*
 !data/lancedb/.gitkeep
+data/coscientist/research_goals/*
+!data/coscientist/research_goals/.gitkeep
+data/coscientist/hypotheses/*
+!data/coscientist/hypotheses/.gitkeep
+data/coscientist/reports/*
+!data/coscientist/reports/.gitkeep
 AGENTS.md
 .env
-

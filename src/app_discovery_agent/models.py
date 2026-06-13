@@ -38,7 +38,7 @@ class SearchResultItem(BaseModel):
 
 class PageContent(BaseModel):
     title: str
-    url: HttpUrl
+    url: str
     search_query: str
     source_domain: str
     fetched_at: datetime
@@ -119,7 +119,7 @@ class ChunkRecord(BaseModel):
     original_query: str
     search_query: str
     source_title: str
-    source_url: HttpUrl
+    source_url: str
     source_domain: str
     retrieved_at: datetime
     chunk_index: int = Field(ge=0)
@@ -161,7 +161,7 @@ class OpportunityItem(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0)
     chunk_id: str
     source_title: str
-    source_url: HttpUrl
+    source_url: str
     summary: str
 
 

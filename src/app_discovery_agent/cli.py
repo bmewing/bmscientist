@@ -10,6 +10,11 @@ from rich.table import Table
 
 from app_discovery_agent.agent import DiscoveryAgent, build_opportunity_report
 from app_discovery_agent.config import AppConfig
+from app_discovery_agent.coscientist_cli import (
+    add_coscientist_parser,
+    run_coscientist_command,
+    run_coscientist_reflect_command,
+)
 
 
 console = Console()
@@ -49,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--search-results-file")
     replay.add_argument("--fetched-pages-file")
     replay.add_argument("--max-pages", type=int, default=20)
+    add_coscientist_parser(subparsers)
 
     return parser
 
@@ -79,7 +85,7 @@ def run_search(args: argparse.Namespace, config: AppConfig) -> int:
     table.add_column("Evidence Type")
     table.add_column("Relevance")
     table.add_column("Chunk ID")
-    table.add_column("Source URL")
+    table.add_column("Source Ref")
     table.add_column("Excerpt")
 
     for row in rows:
@@ -190,6 +196,10 @@ def main() -> int:
         return run_opportunities(args, config)
     if args.command == "replay":
         return run_replay(args, config)
+    if args.command == "coscientist":
+        return run_coscientist_command(args, config)
+    if args.command == "coscientist-reflect":
+        return run_coscientist_reflect_command(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

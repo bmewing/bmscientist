@@ -15,6 +15,7 @@ from app_discovery_agent.config import AppConfig
 from app_discovery_agent.embeddings import LocalEmbedder
 from app_discovery_agent.extract import PageFetcher, extract_domain
 from app_discovery_agent.llm import DeepSeekLLM
+from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
 from app_discovery_agent.models import (
     ChunkRecord,
     DiscoverySummary,
@@ -60,6 +61,14 @@ class DiscoveryAgent:
         self._chunker = TextChunker()
         self._embedder = LocalEmbedder(config)
         self._store = LanceEvidenceStore(config.resolved_lancedb_path())
+        self._manual_ingestor = ManualEvidenceIngestor(
+            config,
+            self._classifier,
+            self._chunker,
+            self._embedder,
+            self._store,
+        )
+        self._manual_ingestor.ingest_pending_files()
         self._graph = self._build_graph()
 
     def _build_graph(self):
