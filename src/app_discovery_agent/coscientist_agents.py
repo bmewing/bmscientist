@@ -1146,6 +1146,7 @@ class ProximityCheckAgent:
                 updated_hypotheses.append(
                     member.model_copy(
                         update={
+                            "status": "retired",
                             "is_active": False,
                             "retired_reason": "merged_into_synthesized_hypothesis",
                             "superseded_by_hypothesis_id": synthesized.hypothesis_id,
@@ -1996,6 +1997,8 @@ class CoScientistRunner:
                 for hypothesis_id in ranking_round.evolved_parent_hypothesis_ids
                 if hypothesis_id in parent_by_id
             ]
+            for parent in parents:
+                self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "evolve"}))
             evolved = self._evolution_agent.evolve(
                 document=document,
                 parent_hypotheses=parents,
@@ -2016,6 +2019,8 @@ class CoScientistRunner:
                     for hypothesis in self._artifact_store.latest_hypotheses(research_id)
                 },
             )
+            for parent in parents:
+                self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "reflected"}))
             for hypothesis in new_hypotheses:
                 self._artifact_store.append_hypothesis_snapshot(hypothesis)
             total_evolved += len([hypothesis for hypothesis in new_hypotheses if hypothesis.generation_source == "evolved"])
@@ -2074,7 +2079,7 @@ class CoScientistRunner:
         )
 
         latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
-        pending_hypotheses = [hypothesis for hypothesis in latest_hypotheses if hypothesis.status != "reflected"]
+        pending_hypotheses = [hypothesis for hypothesis in latest_hypotheses if hypothesis.status == "generated"]
         if max_hypotheses is not None:
             pending_hypotheses = pending_hypotheses[:max_hypotheses]
 
