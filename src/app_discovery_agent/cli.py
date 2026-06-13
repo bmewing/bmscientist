@@ -13,6 +13,7 @@ from app_discovery_agent.config import AppConfig
 from app_discovery_agent.coscientist_cli import (
     add_coscientist_parser,
     run_coscientist_command,
+    run_coscientist_loop_command,
     run_coscientist_reflect_command,
 )
 
@@ -200,6 +201,8 @@ def main() -> int:
         return run_coscientist_command(args, config)
     if args.command == "coscientist-reflect":
         return run_coscientist_reflect_command(args, config)
+    if args.command == "coscientist-loop":
+        return run_coscientist_loop_command(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

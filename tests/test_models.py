@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app_discovery_agent.agent import DiscoveryAgent
 from app_discovery_agent.classify import EvidenceClassifier
+from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, SearchResultItem
 
 
@@ -171,3 +172,28 @@ def test_plan_search_queries_handles_embedded_json_example():
     )
 
     assert result["search_queries"][0] == "major applications of PVC material and key performance requirements"
+
+
+def test_llm_json_coercion_handles_fenced_json_and_trailing_commas():
+    content = """
+Here is the ranking:
+```json
+{
+  "rankings": [
+    {"hypothesis_id": "h1", "score": 0.8,}
+  ],
+}
+```
+"""
+
+    payload = DeepSeekLLM._coerce_json(content)
+
+    assert payload["rankings"][0]["hypothesis_id"] == "h1"
+
+
+def test_llm_json_coercion_uses_first_balanced_object():
+    content = '{"ok": true}\n\nExtra explanation with another object: {"ignored": true}'
+
+    payload = DeepSeekLLM._coerce_json(content)
+
+    assert payload == {"ok": True}

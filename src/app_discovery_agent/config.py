@@ -16,6 +16,10 @@ class AppConfig(BaseModel):
     generation_chat_model: str | None = None
     reflection_chat_model: str | None = None
     planning_chat_model: str | None = None
+    ranking_chat_model: str | None = None
+    evolution_chat_model: str | None = None
+    proximity_chat_model: str | None = None
+    meta_review_chat_model: str | None = None
     exa_api_key: str = Field(min_length=1)
     lancedb_path: Path = Field(default=Path("./data/lancedb"))
     embedding_model: str = Field(default="BAAI/bge-base-en-v1.5")
@@ -37,6 +41,10 @@ class AppConfig(BaseModel):
                 "generation_chat_model": os.getenv("GENERATION_CHAT_MODEL") or None,
                 "reflection_chat_model": os.getenv("REFLECTION_CHAT_MODEL") or None,
                 "planning_chat_model": os.getenv("PLANNING_CHAT_MODEL") or None,
+                "ranking_chat_model": os.getenv("RANKING_CHAT_MODEL") or None,
+                "evolution_chat_model": os.getenv("EVOLUTION_CHAT_MODEL") or None,
+                "proximity_chat_model": os.getenv("PROXIMITY_CHAT_MODEL") or None,
+                "meta_review_chat_model": os.getenv("META_REVIEW_CHAT_MODEL") or None,
                 "exa_api_key": os.getenv("EXA_API_KEY", ""),
                 "lancedb_path": Path(os.getenv("LANCEDB_PATH", "./data/lancedb")),
                 "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
@@ -60,4 +68,7 @@ class AppConfig(BaseModel):
         Path("data/manually-obtained/processed").mkdir(parents=True, exist_ok=True)
         Path("data/coscientist/research_goals").mkdir(parents=True, exist_ok=True)
         Path("data/coscientist/hypotheses").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/rankings").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/proximity").mkdir(parents=True, exist_ok=True)
+        Path("data/coscientist/meta_reviews").mkdir(parents=True, exist_ok=True)
         Path("data/coscientist/reports").mkdir(parents=True, exist_ok=True)

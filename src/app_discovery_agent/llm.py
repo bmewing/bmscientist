@@ -73,10 +73,81 @@ class DeepSeekLLM:
 
     @staticmethod
     def _coerce_json(content: str) -> dict:
+        cleaned = content.strip()
         try:
-            return json.loads(content)
+            return json.loads(cleaned)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-            if not match:
-                raise
-            return json.loads(match.group(0))
+            pass
+
+        candidates = DeepSeekLLM._json_candidates(cleaned)
+        last_error: json.JSONDecodeError | None = None
+        for candidate in candidates:
+            for variant in DeepSeekLLM._json_variants(candidate):
+                try:
+                    return json.loads(variant)
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+        if last_error:
+            raise last_error
+        raise json.JSONDecodeError("No JSON object found", content, 0)
+
+    @staticmethod
+    def _json_candidates(content: str) -> list[str]:
+        candidates: list[str] = []
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.DOTALL | re.IGNORECASE)
+        candidates.extend(fenced)
+        balanced = DeepSeekLLM._balanced_json_object(content)
+        if balanced:
+            candidates.append(balanced)
+        greedy_match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        if greedy_match:
+            candidates.append(greedy_match.group(0))
+        unique: list[str] = []
+        for candidate in candidates:
+            stripped = candidate.strip()
+            if stripped and stripped not in unique:
+                unique.append(stripped)
+        return unique
+
+    @staticmethod
+    def _balanced_json_object(content: str) -> str | None:
+        start = content.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, character in enumerate(content[start:], start=start):
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\":
+                escaped = True
+                continue
+            if character == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return content[start : index + 1]
+        return None
+
+    @staticmethod
+    def _json_variants(candidate: str) -> list[str]:
+        no_trailing_commas = re.sub(r",\s*([}\]])", r"\1", candidate.strip())
+        python_literals = (
+            no_trailing_commas.replace(": None", ": null")
+            .replace(": True", ": true")
+            .replace(": False", ": false")
+        )
+        variants = [candidate.strip(), no_trailing_commas, python_literals]
+        unique: list[str] = []
+        for variant in variants:
+            if variant and variant not in unique:
+                unique.append(variant)
+        return unique
