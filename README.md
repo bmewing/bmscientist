@@ -73,17 +73,17 @@ Run the Ranking Agent, Proximity Check Agent, Meta-review Agent, Evolution Agent
 
 The loop ranks active reflected hypotheses, clusters concepts, can synthesize overlapping ideas into new higher-level hypotheses, reflects any synthesized/generated variants, and uses meta-review whitespace analysis to decide whether one more loop is worth doing. The ranker judges; the meta-review agent is the only agent that writes guidance for the next generation pass.
 
-The loop appends ranking rounds to `data/coscientist/rankings/`, proximity rounds to `data/coscientist/proximity/`, meta-review rounds to `data/coscientist/meta_reviews/`, appends hypothesis snapshots to `data/coscientist/hypotheses/`, and writes a summary report to `data/coscientist/reports/`.
+The loop keeps each research run under `data/coscientist/{research_id}/`. Hypotheses are individual JSON files that move through queue-like folders (`generated`, `reflected`, `evolve`, `retired`), while ranking, proximity, and meta-review rounds remain append-only JSONL logs under the run's `rounds/` directory.
 
 ## Persistence Rules
 
-Evidence remains cumulative in LanceDB under `data/lancedb`. Co-scientist artifacts are local, inspectable, and append-only where practical:
+Evidence remains cumulative in LanceDB under `data/lancedb`. Co-scientist artifacts are local and inspectable:
 
-- Research goals: `data/coscientist/research_goals/{research_id}.json`
-- Hypothesis snapshots: `data/coscientist/hypotheses/{research_id}.jsonl`
-- Ranking rounds: `data/coscientist/rankings/{research_id}.jsonl`
-- Proximity rounds: `data/coscientist/proximity/{research_id}.jsonl`
-- Meta-review rounds: `data/coscientist/meta_reviews/{research_id}.jsonl`
-- Reports: `data/coscientist/reports/`
+- Research goal: `data/coscientist/{research_id}/research_goal.json`
+- Hypotheses: `data/coscientist/{research_id}/hypotheses/{generated,reflected,evolve,retired}/{hypothesis_id}.json`
+- Ranking rounds: `data/coscientist/{research_id}/rounds/rankings.jsonl`
+- Proximity rounds: `data/coscientist/{research_id}/rounds/proximity.jsonl`
+- Meta-review rounds: `data/coscientist/{research_id}/rounds/meta_reviews.jsonl`
+- Reports: `data/coscientist/{research_id}/reports/`
 
 The system should preserve source URLs and chunk IDs, avoid invented citations, and keep scores conservative when evidence is incomplete.

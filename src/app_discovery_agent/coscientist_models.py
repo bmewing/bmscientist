@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-HypothesisStatus = Literal["generated", "reflected"]
+HypothesisStatus = Literal["generated", "reflected", "evolve", "retired"]
 HypothesisGenerationSource = Literal["initial", "evolved", "regenerated", "synthesized"]
 RankingAction = Literal["advance", "hold", "evolve", "reject"]
 GapShrinkageStatus = Literal["improved", "stable", "worse", "unknown"]

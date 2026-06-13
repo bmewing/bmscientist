@@ -672,6 +672,7 @@ def test_proximity_agent_labels_and_synthesizes_overlapping_hypotheses():
     updates_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in updated}
     assert "PETG medical tray conversion cluster" in updates_by_id["hyp-1"].concept_labels
     assert updates_by_id["hyp-2"].retired_reason == "merged_into_synthesized_hypothesis"
+    assert updates_by_id["hyp-2"].status == "retired"
 
 
 def test_meta_review_tracks_gap_persistence_and_requests_one_last_loop():
@@ -850,17 +851,39 @@ def test_coscientist_loop_cli_smoke_writes_expected_summary(tmp_path):
     assert exit_code == 0
 
 
-def test_coscientist_runs_append_hypothesis_snapshots_without_overwrite(tmp_path):
+def test_coscientist_store_moves_hypothesis_file_between_stage_folders(tmp_path):
     store = CoScientistStore(tmp_path / "coscientist")
     hypothesis = make_hypothesis()
     store.append_hypothesis_snapshot(hypothesis)
     store.append_hypothesis_snapshot(hypothesis.model_copy(update={"status": "reflected"}))
 
     snapshots = store.load_hypothesis_snapshots(hypothesis.research_id)
+    generated_path = (
+        tmp_path / "coscientist" / hypothesis.research_id / "hypotheses" / "generated" / f"{hypothesis.hypothesis_id}.json"
+    )
+    reflected_path = (
+        tmp_path / "coscientist" / hypothesis.research_id / "hypotheses" / "reflected" / f"{hypothesis.hypothesis_id}.json"
+    )
 
-    assert len(snapshots) == 2
-    assert snapshots[0].status == "generated"
-    assert snapshots[1].status == "reflected"
+    assert len(snapshots) == 1
+    assert not generated_path.exists()
+    assert reflected_path.exists()
+    assert snapshots[0].status == "reflected"
+
+
+def test_coscientist_store_uses_evolve_and_retired_queue_folders(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    hypothesis = make_reflected_hypothesis()
+
+    evolve_path = store.append_hypothesis_snapshot(hypothesis.model_copy(update={"status": "evolve"}))
+    retired_path = store.append_hypothesis_snapshot(
+        hypothesis.model_copy(update={"status": "retired", "is_active": False, "retired_reason": "merged"})
+    )
+
+    assert evolve_path.parent.name == "evolve"
+    assert not evolve_path.exists()
+    assert retired_path.parent.name == "retired"
+    assert retired_path.exists()
 
 
 def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
