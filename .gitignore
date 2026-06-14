@@ -9,6 +9,8 @@ data/raw/*
 data/outputs/*
 !data/raw/.gitkeep
 !data/outputs/.gitkeep
+data/graph/*
+!data/graph/.gitkeep
 data/lancedb/*
 !data/lancedb/.gitkeep
 data/coscientist/*

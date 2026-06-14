@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+from dataclasses import dataclass
 from threading import Lock
 
 from rich.console import Console
-from rich.status import Status
+from rich.console import Group
+from rich.live import Live
+from rich.text import Text
 
 from app_discovery_agent.config import AppConfig
 from app_discovery_agent.coscientist_agents import CoScientistRunner
@@ -13,29 +17,42 @@ from app_discovery_agent.coscientist_agents import CoScientistRunner
 console = Console()
 
 
+@dataclass
+class PhaseState:
+    message: str
+    completed: int | None = None
+    total: int | None = None
+    is_complete: bool = False
+    details: list[str] | None = None
+
+
 class RichProgressReporter:
     def __init__(self, console: Console):
         self._console = console
         self._lock = Lock()
-        self._status: Status | None = None
-        self._active_phase: str | None = None
+        self._live: Live | None = None
+        self._phases: "OrderedDict[str, PhaseState]" = OrderedDict()
 
     def start(self, phase: str, message: str, total: int | None = None) -> None:
         with self._lock:
-            self._stop_status()
-            self._status = self._console.status(self._format(message, 0 if total is not None else None, total))
-            self._status.start()
-            self._active_phase = phase
+            self._phases[phase] = PhaseState(
+                message=message,
+                completed=0 if total is not None else None,
+                total=total,
+                is_complete=False,
+            )
+            self._refresh_live()
 
     def advance(self, phase: str, message: str, completed: int, total: int | None = None) -> None:
         with self._lock:
-            if self._status is None or self._active_phase != phase:
-                self._stop_status()
-                self._status = self._console.status(self._format(message, completed, total))
-                self._status.start()
-                self._active_phase = phase
-                return
-            self._status.update(self._format(message, completed, total))
+            current = self._phases.get(phase, PhaseState(message=message))
+            self._phases[phase] = PhaseState(
+                message=message,
+                completed=completed,
+                total=total if total is not None else current.total,
+                is_complete=False,
+            )
+            self._refresh_live()
 
     def complete(
         self,
@@ -45,24 +62,72 @@ class RichProgressReporter:
         total: int | None = None,
     ) -> None:
         with self._lock:
-            if self._active_phase == phase:
-                self._stop_status()
-            self._console.print(self._format(message, completed, total, complete=True))
+            current = self._phases.get(phase, PhaseState(message=message))
+            self._phases[phase] = PhaseState(
+                message=message,
+                completed=completed if completed is not None else current.completed,
+                total=total if total is not None else current.total,
+                is_complete=True,
+            )
+            self._refresh_live()
+            if self._all_phases_complete():
+                self._stop_live()
+                self._phases.clear()
+
+    def details(self, phase: str, lines: list[str]) -> None:
+        with self._lock:
+            current = self._phases.get(phase)
+            if current is None:
+                return
+            self._phases[phase] = PhaseState(
+                message=current.message,
+                completed=current.completed,
+                total=current.total,
+                is_complete=current.is_complete,
+                details=lines,
+            )
+            self._refresh_live()
 
     @staticmethod
-    def _format(message: str, completed: int | None, total: int | None, complete: bool = False) -> str:
-        suffix = ""
+    def _format(message: str, completed: int | None, total: int | None, complete: bool = False) -> Text:
+        status_message = message
+        if complete and "complete" not in message.lower() and "processed" not in message.lower():
+            status_message = f"{message} complete"
+        text = Text()
+        text.append(status_message, style="cyan")
+        text.append(".....", style="dim")
         if total is not None:
             current = completed if completed is not None else 0
-            suffix = f" [bold]{current}/{total}[/bold]"
-        status = " complete" if complete and "complete" not in message.lower() and "processed" not in message.lower() else ""
-        return f"[cyan]{message}{status}[/cyan][dim].....[/dim]{suffix}"
+            text.append(f" {current}/{total}", style="bold")
+        return text
 
-    def _stop_status(self) -> None:
-        if self._status is not None:
-            self._status.stop()
-            self._status = None
-        self._active_phase = None
+    def _render(self) -> Group:
+        lines: list[Text] = []
+        for state in self._phases.values():
+            lines.append(self._format(state.message, state.completed, state.total, complete=state.is_complete))
+            for detail in state.details or []:
+                detail_text = Text()
+                detail_text.append("  ", style="dim")
+                detail_text.append(detail, style="dim")
+                lines.append(detail_text)
+        if not lines:
+            lines = [Text("")]
+        return Group(*lines)
+
+    def _refresh_live(self) -> None:
+        if self._live is None:
+            self._live = Live(self._render(), console=self._console, refresh_per_second=8, transient=False)
+            self._live.start()
+            return
+        self._live.update(self._render(), refresh=True)
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def _all_phases_complete(self) -> bool:
+        return bool(self._phases) and all(state.is_complete for state in self._phases.values())
 
 
 def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -97,6 +162,11 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     reflect.add_argument("--max-pages-per-search", type=int)
     reflect.add_argument("--max-hypotheses", type=int)
     reflect.add_argument("--concurrency", type=int, default=3)
+    reflect.add_argument("--daemon", action="store_true")
+    reflect.add_argument("--worker-id")
+    reflect.add_argument("--lease-seconds", type=int, default=1800)
+    reflect.add_argument("--poll-interval-seconds", type=int, default=5)
+    reflect.add_argument("--idle-exit-after-seconds", type=int)
 
     loop = subparsers.add_parser("coscientist-loop", help="Run ranking, evolution, and reflection loops for an existing research run.")
     loop.add_argument("--research-id", "--project-name", dest="research_id", required=True)
@@ -142,6 +212,7 @@ def run_coscientist_command(
         results_per_query=args.results_per_query,
         max_pages_per_search=args.max_pages_per_search,
         reflection_concurrency=args.reflection_concurrency,
+        spawn_reflection_daemons=True,
     )
     loop_result = None
     if not args.skip_loop and hasattr(runner, "run_loop"):
@@ -204,6 +275,11 @@ def run_coscientist_reflect_command(
         max_pages_per_search=args.max_pages_per_search,
         max_hypotheses=args.max_hypotheses,
         concurrency=args.concurrency,
+        daemon=args.daemon,
+        worker_id=args.worker_id,
+        lease_seconds=args.lease_seconds,
+        poll_interval_seconds=args.poll_interval_seconds,
+        idle_exit_after_seconds=args.idle_exit_after_seconds,
     )
     console.print(f"[bold]Project Name:[/bold] {result.research_id}")
     console.print(f"[bold]Generated hypotheses:[/bold] {result.generated_hypotheses}")

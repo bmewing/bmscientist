@@ -61,11 +61,22 @@ Create a research goal, generate hypotheses from local evidence, and reflect the
 .\.venv\Scripts\python.exe -m app_discovery_agent.cli coscientist --goal "I want to find rapid drop-in/drop-out flywheel opportunities for PET against a target material of Styrenics..." --target-hypotheses 25 --regions "North America,Europe" --reflection-concurrency 4
 ```
 
+The `coscientist` command now auto-starts one background reflection worker per generation batch slot, so as soon as each hypothesis batch is written to the queue, reflection begins immediately instead of waiting for all generation to finish.
+
 Resume reflection for generated hypotheses without regenerating:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app_discovery_agent.cli coscientist-reflect --research-id YOUR_RESEARCH_ID --concurrency 4
 ```
+
+Run multiple long-lived reflection workers against the same research run with the file-rename queue:
+
+```powershell
+.\.venv\Scripts\python.exe -m app_discovery_agent.cli coscientist-reflect --research-id YOUR_RESEARCH_ID --daemon --worker-id reflector-a --concurrency 2 --poll-interval-seconds 5
+.\.venv\Scripts\python.exe -m app_discovery_agent.cli coscientist-reflect --research-id YOUR_RESEARCH_ID --daemon --worker-id reflector-b --concurrency 2 --poll-interval-seconds 5
+```
+
+Each worker atomically claims hypotheses by renaming files from `generated/` to `reflecting/`, then moves completed work into `reflected/`. If a worker dies mid-task, the reflection lease eventually expires and another worker can requeue that hypothesis automatically.
 
 Run the Ranking Agent, Proximity Check Agent, Meta-review Agent, Evolution Agent, feedback generation, and bounded reflection loop over an existing research run:
 
@@ -75,14 +86,14 @@ Run the Ranking Agent, Proximity Check Agent, Meta-review Agent, Evolution Agent
 
 The loop ranks active reflected hypotheses, clusters concepts, can synthesize overlapping ideas into new higher-level hypotheses, reflects any synthesized/generated variants, and uses meta-review whitespace analysis to decide whether one more loop is worth doing. The ranker judges; the meta-review agent is the only agent that writes guidance for the next generation pass.
 
-The loop keeps each research run under `data/coscientist/{research_id}/`. Hypotheses are individual JSON files that move through queue-like folders (`generated`, `reflected`, `evolve`, `retired`), while ranking, proximity, and meta-review rounds remain append-only JSONL logs under the run's `rounds/` directory.
+The loop keeps each research run under `data/coscientist/{research_id}/`. Hypotheses are individual JSON files that move through queue-like folders (`generated`, `reflecting`, `reflected`, `evolve`, `retired`), while ranking, proximity, and meta-review rounds remain append-only JSONL logs under the run's `rounds/` directory.
 
 ## Persistence Rules
 
 Evidence remains cumulative in LanceDB under `data/lancedb`. Co-scientist artifacts are local and inspectable:
 
 - Research goal: `data/coscientist/{research_id}/research_goal.json`
-- Hypotheses: `data/coscientist/{research_id}/hypotheses/{generated,reflected,evolve,retired}/{hypothesis_id}.json`
+- Hypotheses: `data/coscientist/{research_id}/hypotheses/{generated,reflecting,reflected,evolve,retired}/{hypothesis_id}.json`
 - Ranking rounds: `data/coscientist/{research_id}/rounds/rankings.jsonl`
 - Proximity rounds: `data/coscientist/{research_id}/rounds/proximity.jsonl`
 - Meta-review rounds: `data/coscientist/{research_id}/rounds/meta_reviews.jsonl`
