@@ -23,10 +23,14 @@ console = Console()
 
 def configure_logging(verbose: bool = False) -> None:
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=logging.INFO if verbose else logging.WARNING,
         format="%(message)s",
         handlers=[RichHandler(rich_tracebacks=True)],
     )
+    if not verbose:
+        for logger_name in ("httpx", "httpcore", "openai", "sentence_transformers", "transformers"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+        logging.getLogger("app_discovery_agent.extract").setLevel(logging.ERROR)
 
 
 def build_parser() -> argparse.ArgumentParser:

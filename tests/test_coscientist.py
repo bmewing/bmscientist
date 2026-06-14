@@ -7,6 +7,7 @@ from app_discovery_agent.coscientist_agents import (
     CoScientistRunner,
     DiscoveryEvidenceTool,
     EvolutionAgent,
+    FinalPortfolioAgent,
     GenerationAgent,
     LocalEvidenceRetriever,
     MetaReviewAgent,
@@ -44,6 +45,20 @@ class FakeStore:
 
     def search_by_vector(self, vector, top_k=8):
         return self.rows[:top_k]
+
+
+class RecordingProgressReporter:
+    def __init__(self):
+        self.events = []
+
+    def start(self, phase, message, total=None):
+        self.events.append(("start", phase, message, total))
+
+    def advance(self, phase, message, completed, total=None):
+        self.events.append(("advance", phase, message, completed, total))
+
+    def complete(self, phase, message, completed=None, total=None):
+        self.events.append(("complete", phase, message, completed, total))
 
 
 class PlanningLLM:
@@ -451,6 +466,7 @@ def make_reflected_hypothesis(hypothesis_id: str = "hyp-1", title: str = "PETG f
 def test_research_planning_sets_generated_target_default():
     agent = ResearchPlanningAgent(PlanningLLM())
     document = agent.create_research_goal(
+        research_id="calm-river-beacon",
         raw_goal="Find PVC replacement opportunities.",
         target_hypotheses_final=5,
         regions=["North America"],
@@ -463,6 +479,18 @@ def test_research_planning_sets_generated_target_default():
     assert document.opportunity_speed_horizon_months == 6
     assert document.target_incumbent_materials == ["PVC"]
     assert document.ranking_weights["speed"] == 0.5
+
+
+def test_coscientist_store_claim_project_name_normalizes_and_avoids_collisions(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+
+    first = store.claim_project_name("My Great Project")
+    second = store.claim_project_name("My Great Project")
+
+    assert first == "my-great-project"
+    assert second == "my-great-project-2"
+    assert (tmp_path / "coscientist" / first).exists()
+    assert (tmp_path / "coscientist" / second).exists()
 
 
 def test_agent_specific_model_selection_from_config():
@@ -491,6 +519,41 @@ def test_generation_uses_local_evidence_with_citations():
     assert len(hypotheses) == 1
     assert hypotheses[0].supporting_chunk_ids == ["chunk-1"]
     assert hypotheses[0].candidate_material == "PETG"
+
+
+def test_generation_reports_batch_progress_for_large_targets():
+    class MultiBatchGenerationLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            self.calls += 1
+            if self.calls == 1:
+                payload = {
+                    "hypotheses": [
+                        {"title": f"Batch 1 idea {index}", "summary": "Idea", "candidate_material": "PETG"}
+                        for index in range(1, 6)
+                    ]
+                }
+            else:
+                payload = {
+                    "hypotheses": [
+                        {"title": "Batch 2 idea 1", "summary": "Idea", "candidate_material": "PETG"}
+                    ]
+                }
+            return response_model.model_validate(payload)
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(MultiBatchGenerationLLM(), retriever)
+    progress_updates = []
+
+    hypotheses = agent.generate(
+        make_document(),
+        on_progress=lambda completed, total: progress_updates.append((completed, total)),
+    )
+
+    assert len(hypotheses) == 6
+    assert progress_updates == [(5, 6)]
 
 
 def test_generation_from_meta_review_uses_only_meta_review_guidance():
@@ -554,6 +617,48 @@ def test_hypothesis_generation_output_accepts_loose_llm_aliases():
     assert seed.substitution_drivers == ["rPET value"]
     assert seed.supporting_chunk_ids == ["chunk-1"]
     assert seed.generation_confidence == 0.52
+
+
+def test_hypothesis_generation_output_accepts_top_level_list_payload():
+    output = HypothesisGenerationOutput.model_validate(
+        [
+            {
+                "title": "Clear deli containers with PETG",
+                "summary": "PETG may fit clear deli container applications.",
+                "candidate_material": "PETG",
+                "incumbent_material": "PVC",
+            }
+        ]
+    )
+
+    assert len(output.hypotheses) == 1
+    assert output.hypotheses[0].title == "Clear deli containers with PETG"
+
+
+def test_hypothesis_generation_output_normalizes_named_confidence_levels():
+    output = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Clear deli containers with PETG",
+                    "summary": "PETG may fit clear deli container applications.",
+                    "candidate_material": "PETG",
+                    "incumbent_material": "PVC",
+                    "generation_confidence": "Medium",
+                },
+                {
+                    "title": "PETG tray lids",
+                    "summary": "Another idea.",
+                    "candidate_material": "PETG",
+                    "incumbent_material": "PVC",
+                    "generation_confidence": "80%",
+                },
+            ]
+        }
+    )
+
+    assert output.hypotheses[0].generation_confidence == 0.55
+    assert output.hypotheses[1].generation_confidence == 0.8
 
 
 def test_reflection_checks_local_evidence_first_and_skips_discovery_when_sufficient():
@@ -699,6 +804,50 @@ def test_meta_review_tracks_gap_persistence_and_requests_one_last_loop():
     assert meta_round.stop_reason == "meta_review_gap_persistence"
 
 
+def test_final_portfolio_agent_writes_conclusive_report_with_validation_gaps():
+    class FinalReportLLM:
+        def __init__(self):
+            self.user_prompt = None
+
+        def complete_text(self, system_prompt, user_prompt, temperature=0.1):
+            self.user_prompt = user_prompt
+            return "# Final Opportunity Portfolio\n\nConclusive report."
+
+    llm = FinalReportLLM()
+    agent = FinalPortfolioAgent(llm)
+    hypothesis = make_reflected_hypothesis().model_copy(
+        update={
+            "ranking_round_id": "ranking-1",
+            "ranking_score": 0.82,
+            "ranking_status": "advance",
+            "reflection_assessment": ReflectionAssessment.model_validate(
+                {
+                    "strategic_fit_score": {"value": 0.8, "confidence": 0.7},
+                    "market_size_score": {"value": None, "confidence": 0.0},
+                    "technical_success_probability": {"value": 0.7, "confidence": 0.6},
+                    "commercial_success_probability": {"value": None, "confidence": 0.0},
+                    "evidence_gap_notes": ["Missing market size validation."],
+                }
+            ),
+        }
+    )
+    ranking_round = RankingAgent(RankingLLM()).rank(make_document(), [hypothesis], 1, 1, 1)[0]
+    meta_round = MetaReviewAgent(MetaReviewLLM()).review(make_document(), [hypothesis], ranking_round, 1, 0.6, 1)[1]
+
+    report = agent.build_report(
+        document=make_document(),
+        hypotheses=[hypothesis],
+        ranking_round=ranking_round,
+        meta_review_round=meta_round,
+        stop_reason="target_portfolio_reached",
+        target_count=1,
+    )
+
+    assert report.startswith("# Final Opportunity Portfolio")
+    assert "Missing market size validation." in llm.user_prompt
+    assert "Market size validation missing or weak" in llm.user_prompt
+
+
 def test_reflection_review_output_accepts_null_metric_objects():
     review = ReflectionReviewOutput.model_validate(
         {
@@ -724,9 +873,15 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
     class FakeRunner:
         def __init__(self, config):
             self.config = config
+            self.prepared = []
+
+        def prepare_project_name(self, preferred_name=None):
+            self.prepared.append(preferred_name)
+            return preferred_name or "calm-river-beacon"
 
         def run(self, **kwargs):
             from app_discovery_agent.coscientist_models import CoScientistRunResult
+            assert kwargs["project_name"] == "calm-river-beacon"
 
             return CoScientistRunResult(
                 research_id="research-123",
@@ -738,8 +893,28 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
                 report_path=str(tmp_path / "report.md"),
             )
 
+        def run_loop(self, **kwargs):
+            from app_discovery_agent.coscientist_models import CoScientistLoopResult
+
+            assert kwargs["research_id"] == "research-123"
+            return CoScientistLoopResult(
+                research_id="research-123",
+                rounds_completed=1,
+                ranked_hypotheses=8,
+                evolved_hypotheses=2,
+                regenerated_hypotheses=2,
+                synthesized_hypotheses=1,
+                reflected_hypotheses=4,
+                automatic_discovery_runs=1,
+                ranking_path=str(tmp_path / "rankings.jsonl"),
+                hypothesis_path=str(tmp_path / "hypotheses.jsonl"),
+                report_path=str(tmp_path / "loop.md"),
+                stop_reason="max_rounds_reached",
+            )
+
     args = argparse.Namespace(
         goal="Find PVC replacement opportunities.",
+        project_name=None,
         target_hypotheses=4,
         regions="North America,Europe",
         strategic_fit_notes="Prefer regulated applications.",
@@ -748,6 +923,17 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
         results_per_query=5,
         max_pages_per_search=8,
         reflection_concurrency=2,
+        skip_loop=False,
+        target_final_hypotheses=None,
+        max_rounds=2,
+        evolve_top_k=5,
+        evolved_per_round=5,
+        regenerated_per_round=5,
+        proximity_check_every=1,
+        max_synthesized_per_round=3,
+        promotion_score_threshold=0.72,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
     )
     config = AppConfig(
         deepseek_api_key="x",
@@ -944,6 +1130,7 @@ def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
     runner = object.__new__(CoScientistRunner)
     runner._artifact_store = store
     runner._reflection_agent = FakeReflectRunner()
+    runner._progress_reporter = RecordingProgressReporter()
 
     result = runner.reflect_existing("research-1")
     latest = {item.hypothesis_id: item for item in store.latest_hypotheses("research-1")}
@@ -953,3 +1140,129 @@ def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
     assert result.reflected_hypotheses == 2
     assert latest["hyp-1"].status == "reflected"
     assert latest["hyp-2"].status == "reflected"
+
+
+def test_reflect_and_append_reports_incremental_progress(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    reporter = RecordingProgressReporter()
+
+    class FakeReflectRunner:
+        def reflect(self, document, hypothesis):
+            return (
+                hypothesis.model_copy(
+                    update={
+                        "status": "reflected",
+                        "reflection_assessment": ReflectionAssessment.model_validate(
+                            {
+                                "strategic_fit_score": {
+                                    "value": 0.6,
+                                    "rationale": "Reflected during progress test.",
+                                    "confidence": 0.5,
+                                    "citation_chunk_ids": ["chunk-1"],
+                                    "citation_urls": ["https://example.com/1"],
+                                    "is_inferred": False,
+                                }
+                            }
+                        ),
+                    }
+                ),
+                1,
+            )
+
+    runner = object.__new__(CoScientistRunner)
+    runner._artifact_store = store
+    runner._reflection_agent = FakeReflectRunner()
+    runner._progress_reporter = reporter
+
+    hypotheses = [make_hypothesis(), make_hypothesis().model_copy(update={"hypothesis_id": "hyp-2"})]
+    reflected, discovery_runs = runner._reflect_and_append(make_document(), hypotheses, concurrency=1)
+
+    assert len(reflected) == 2
+    assert discovery_runs == 2
+    assert reporter.events == [
+        ("start", "reflection", "Reflecting on ideas", 2),
+        ("advance", "reflection", "Reflecting on ideas", 1, 2),
+        ("advance", "reflection", "Reflecting on ideas", 2, 2),
+        ("complete", "reflection", "Reflecting on ideas complete", 2, 2),
+    ]
+
+
+def test_run_reports_stage_progress(tmp_path):
+    document = make_document().model_copy(update={"target_hypotheses_generated": 2})
+    reporter = RecordingProgressReporter()
+    generated = [
+        make_hypothesis(),
+        make_hypothesis().model_copy(update={"hypothesis_id": "hyp-2", "title": "Hypothesis 2"}),
+    ]
+    reflected = [
+        hypothesis.model_copy(
+            update={
+                "status": "reflected",
+                "reflection_assessment": ReflectionAssessment.model_validate(
+                    {
+                        "strategic_fit_score": {
+                            "value": 0.7,
+                            "rationale": "Strong fit.",
+                            "confidence": 0.7,
+                            "citation_chunk_ids": ["chunk-1"],
+                            "citation_urls": ["https://example.com/1"],
+                            "is_inferred": False,
+                        }
+                    }
+                ),
+            }
+        )
+        for hypothesis in generated
+    ]
+
+    class FakePlanningAgent:
+        def create_research_goal(self, **kwargs):
+            return document
+
+    class FakeGenerationAgent:
+        def generate(self, doc, on_progress=None):
+            assert doc.research_id == document.research_id
+            return generated
+
+    class FakeArtifactStore:
+        def __init__(self):
+            self.saved = []
+
+        def claim_project_name(self, preferred_name=None):
+            return preferred_name or document.research_id
+
+        def save_research_goal(self, doc):
+            return tmp_path / "goal.json"
+
+        def append_hypothesis_snapshot(self, hypothesis):
+            self.saved.append(hypothesis.hypothesis_id)
+
+        def write_report(self, research_id, report):
+            return tmp_path / "report.md"
+
+        def hypothesis_path(self, research_id):
+            return tmp_path / "hypotheses"
+
+    runner = object.__new__(CoScientistRunner)
+    runner._planning_agent = FakePlanningAgent()
+    runner._generation_agent = FakeGenerationAgent()
+    runner._artifact_store = FakeArtifactStore()
+    runner._progress_reporter = reporter
+    runner._reflect_and_append = lambda document, hypotheses, concurrency, phase="reflection", progress_message="Reflecting on ideas": (  # noqa: E731
+        reflected,
+        3,
+    )
+    runner._build_report = lambda document, hypotheses: "report"
+
+    result = runner.run("Find PET opportunities", 1, reflection_concurrency=2)
+
+    assert result.generated_hypotheses == 2
+    assert result.reflected_hypotheses == 2
+    assert reporter.events == [
+        ("start", "planning", "Processing goal", None),
+        ("complete", "planning", "Goal processed", None, None),
+        ("start", "generation", "Generating ideas", 2),
+        ("complete", "generation", "Ideas generated", 2, 2),
+        ("start", "reporting", "Writing report", None),
+        ("complete", "reporting", "Report written", None, None),
+    ]

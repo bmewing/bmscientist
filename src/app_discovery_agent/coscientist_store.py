@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import secrets
 from pathlib import Path
 
 from app_discovery_agent.coscientist_models import (
@@ -14,6 +16,110 @@ from app_discovery_agent.coscientist_models import (
 
 class CoScientistStore:
     HYPOTHESIS_STAGES = ("generated", "reflected", "evolve", "retired")
+    _ADJECTIVES = (
+        "amber",
+        "ancient",
+        "autumn",
+        "bold",
+        "brisk",
+        "calm",
+        "cedar",
+        "clear",
+        "cobalt",
+        "crimson",
+        "curious",
+        "daring",
+        "deep",
+        "eager",
+        "ember",
+        "gentle",
+        "golden",
+        "grand",
+        "hidden",
+        "ivory",
+        "jolly",
+        "kind",
+        "lively",
+        "lunar",
+        "mellow",
+        "mossy",
+        "nimble",
+        "novel",
+        "quiet",
+        "rapid",
+        "royal",
+        "silver",
+        "steady",
+        "sunny",
+        "swift",
+        "tidy",
+        "vivid",
+        "wise",
+    )
+    _NATURE_WORDS = (
+        "brook",
+        "canyon",
+        "cliff",
+        "cloud",
+        "coast",
+        "creek",
+        "dawn",
+        "desert",
+        "field",
+        "forest",
+        "garden",
+        "glade",
+        "harbor",
+        "hill",
+        "lake",
+        "meadow",
+        "mesa",
+        "mist",
+        "moon",
+        "ocean",
+        "pine",
+        "prairie",
+        "reef",
+        "river",
+        "shore",
+        "sky",
+        "spring",
+        "stone",
+        "summit",
+        "valley",
+        "willow",
+        "wind",
+    )
+    _OBJECT_WORDS = (
+        "anchor",
+        "arrow",
+        "atlas",
+        "beacon",
+        "bridge",
+        "compass",
+        "engine",
+        "falcon",
+        "forge",
+        "harvest",
+        "lantern",
+        "ledger",
+        "market",
+        "matrix",
+        "meridian",
+        "module",
+        "monarch",
+        "orbit",
+        "otter",
+        "pilot",
+        "ranger",
+        "rocket",
+        "signal",
+        "sparrow",
+        "tandem",
+        "thunder",
+        "voyage",
+        "weaver",
+    )
 
     def __init__(self, root: Path = Path("data/coscientist")):
         self.root = root
@@ -24,6 +130,17 @@ class CoScientistStore:
 
     def research_dir(self, research_id: str) -> Path:
         return self.root / research_id
+
+    def project_exists(self, research_id: str) -> bool:
+        return self.research_dir(research_id).exists()
+
+    def claim_project_name(self, preferred_name: str | None = None) -> str:
+        if preferred_name:
+            project_name = self._uniquify_project_name(self._normalize_project_name(preferred_name))
+        else:
+            project_name = self._random_project_name()
+        self.ensure_run_directories(project_name)
+        return project_name
 
     def hypotheses_dir(self, research_id: str) -> Path:
         return self.research_dir(research_id) / "hypotheses"
@@ -207,3 +324,38 @@ class CoScientistStore:
     @staticmethod
     def to_pretty_json(data: dict) -> str:
         return json.dumps(data, indent=2)
+
+    def _random_project_name(self) -> str:
+        rng = secrets.SystemRandom()
+        for _ in range(100):
+            candidate = "-".join(
+                (
+                    rng.choice(self._ADJECTIVES),
+                    rng.choice(self._NATURE_WORDS),
+                    rng.choice(self._OBJECT_WORDS),
+                )
+            )
+            if not self.project_exists(candidate):
+                return candidate
+        return self._uniquify_project_name(
+            "-".join(
+                (
+                    rng.choice(self._ADJECTIVES),
+                    rng.choice(self._NATURE_WORDS),
+                    rng.choice(self._OBJECT_WORDS),
+                )
+            )
+        )
+
+    def _uniquify_project_name(self, base_name: str) -> str:
+        if not self.project_exists(base_name):
+            return base_name
+        suffix = 2
+        while self.project_exists(f"{base_name}-{suffix}"):
+            suffix += 1
+        return f"{base_name}-{suffix}"
+
+    @staticmethod
+    def _normalize_project_name(name: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+        return normalized or "project"
