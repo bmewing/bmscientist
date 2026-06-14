@@ -19,6 +19,7 @@ Create a `.env` from `.env.example` and add your keys.
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 EXA_API_KEY=your_exa_api_key
+HF_TOKEN=your_huggingface_token
 LANCEDB_PATH=./data/lancedb
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 REQUEST_TIMEOUT_SECONDS=60
@@ -34,6 +35,7 @@ META_REVIEW_CHAT_MODEL=deepseek-v4-pro
 ```
 
 `CHAT_MODEL` remains the default. Agent-specific variables let you route expensive reasoning tasks to stronger DeepSeek models without changing the whole app.
+`HF_TOKEN` is optional but recommended for higher Hugging Face Hub rate limits and authenticated model downloads.
 
 ## Discovery
 

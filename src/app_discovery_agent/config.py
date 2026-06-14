@@ -21,6 +21,7 @@ class AppConfig(BaseModel):
     proximity_chat_model: str | None = None
     meta_review_chat_model: str | None = None
     exa_api_key: str = Field(min_length=1)
+    hf_token: str | None = None
     lancedb_path: Path = Field(default=Path("./data/lancedb"))
     embedding_model: str = Field(default="BAAI/bge-base-en-v1.5")
     request_timeout_seconds: int = Field(default=20, ge=5, le=600)
@@ -46,6 +47,7 @@ class AppConfig(BaseModel):
                 "proximity_chat_model": os.getenv("PROXIMITY_CHAT_MODEL") or None,
                 "meta_review_chat_model": os.getenv("META_REVIEW_CHAT_MODEL") or None,
                 "exa_api_key": os.getenv("EXA_API_KEY", ""),
+                "hf_token": os.getenv("HF_TOKEN") or None,
                 "lancedb_path": Path(os.getenv("LANCEDB_PATH", "./data/lancedb")),
                 "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
                 "request_timeout_seconds": int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),

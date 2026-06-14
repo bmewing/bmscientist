@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_discovery_agent.chunking import TextChunker
@@ -46,6 +46,7 @@ from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
 from app_discovery_agent.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
 from app_discovery_agent.price_cache import StructuredPriceCache
+from app_discovery_agent.prompt_library import PROMPTS
 from app_discovery_agent.search import ExaSearchClient, deduplicate_search_results
 
 
@@ -56,6 +57,37 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ProgressReporter(Protocol):
+    def start(self, phase: str, message: str, total: int | None = None) -> None: ...
+
+    def advance(self, phase: str, message: str, completed: int, total: int | None = None) -> None: ...
+
+    def complete(
+        self,
+        phase: str,
+        message: str,
+        completed: int | None = None,
+        total: int | None = None,
+    ) -> None: ...
+
+
+class NullProgressReporter:
+    def start(self, phase: str, message: str, total: int | None = None) -> None:
+        return None
+
+    def advance(self, phase: str, message: str, completed: int, total: int | None = None) -> None:
+        return None
+
+    def complete(
+        self,
+        phase: str,
+        message: str,
+        completed: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        return None
 
 
 class LocalEvidenceRetriever:
@@ -423,6 +455,7 @@ class ResearchPlanningAgent:
 
     def create_research_goal(
         self,
+        research_id: str,
         raw_goal: str,
         target_hypotheses_final: int,
         regions: list[str] | None,
@@ -430,37 +463,18 @@ class ResearchPlanningAgent:
         preferred_evidence_recency_days: int,
         reflection_search_limits: ReflectionSearchLimits,
     ) -> ResearchGoalDocument:
-        system_prompt = (
-            "You are a research planning agent. Convert a research goal into a structured plan for downstream "
-            "hypothesis generation and reflection. Return strict JSON only."
+        system_prompt = PROMPTS.render("research_planning_agent", "create_research_goal.system")
+        user_prompt = PROMPTS.render(
+            "research_planning_agent",
+            "create_research_goal.user",
+            raw_goal=raw_goal,
+            target_hypotheses_final=target_hypotheses_final,
+            regions=regions or [],
+            strategic_fit_notes=strategic_fit_notes or "",
         )
-        user_prompt = f"""
-Raw research goal:
-{raw_goal}
-
-Target final hypotheses: {target_hypotheses_final}
-Regions: {regions or []}
-Strategic fit notes: {strategic_fit_notes or ""}
-
-Return JSON with:
-- strategic_fit_criteria (array of strings)
-- target_incumbent_materials (array of strings)
-- preferred_candidate_materials (array of strings)
-- candidate_material_preferences (array of strings)
-- recycling_or_sustainability_angles (array of strings)
-- material_scope (array of strings)
-- application_scope (array of strings)
-- opportunity_modes (array of strings)
-- opportunity_speed_horizon_months (integer or null)
-- commercialization_constraints (array of strings)
-- ranking_weights (object with numeric weights like speed, volume, strategic_fit, sustainability)
-- success_definition (string)
-
-Be concise and specific. Do not invent constraints not implied by the goal.
-"""
         draft = self._llm.complete_json(ResearchPlanDraft, system_prompt, user_prompt)
         return ResearchGoalDocument(
-            research_id=str(uuid4()),
+            research_id=research_id,
             raw_goal=raw_goal,
             target_hypotheses_final=target_hypotheses_final,
             target_hypotheses_generated=self._default_generated_count(target_hypotheses_final),
@@ -484,11 +498,17 @@ Be concise and specific. Do not invent constraints not implied by the goal.
 
 
 class GenerationAgent:
+    _batch_size = 5
+
     def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever):
         self._llm = llm
         self._retriever = retriever
 
-    def generate(self, document: ResearchGoalDocument) -> list[Hypothesis]:
+    def generate(
+        self,
+        document: ResearchGoalDocument,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[Hypothesis]:
         evidence_rows = self._retriever.retrieve_for_goal(
             document,
             max_results=max(document.target_hypotheses_generated * 4, 12),
@@ -508,57 +528,16 @@ class GenerationAgent:
             }
             for row in evidence_rows[:40]
         ]
-        system_prompt = (
-            "You are a generation agent for industrial material opportunity research. "
-            "Create hypotheses grounded in the supplied evidence. Return strict JSON only."
-        )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Available evidence:
-{json.dumps(evidence_payload, indent=2)}
-
-Generate {document.target_hypotheses_generated} distinct hypotheses grounded in the evidence.
-
-Each hypothesis must include:
-- title
-- summary
-- application
-- market_segment
-- candidate_material
-- incumbent_material
-- next_best_competitive_alternative
-- incumbent_form
-- candidate_form
-- conversion_process
-- product_type
-- buyer_type
-- application_requirements
-- substitution_drivers
-- strategic_rationale
-- supporting_chunk_ids
-- supporting_urls
-- assumptions
-- unknowns
-- generation_confidence
-
-Rules:
-- Use evidence, not pure brainstorming.
-- Cite chunk IDs and URLs already present in the evidence.
-- Capture material form, product type, buyer type, and conversion process when supported or clearly implied.
-- If a detail is unclear, leave it in unknowns rather than inventing it.
-"""
-        output = self._llm.complete_json(HypothesisGenerationOutput, system_prompt, user_prompt)
-        return self._seeds_to_hypotheses(
+        return self._generate_in_batches(
             document=document,
-            seeds=output.hypotheses,
+            evidence_payload=evidence_payload,
             limit=document.target_hypotheses_generated,
             generation_source="initial",
             round_index=0,
+            system_section="generate.system",
+            user_section="generate.user",
+            progress_total=document.target_hypotheses_generated,
+            on_progress=on_progress,
         )
 
     def generate_from_meta_review(
@@ -567,6 +546,7 @@ Rules:
         meta_review_round: MetaReviewRound,
         target_count: int,
         round_index: int,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[Hypothesis]:
         if target_count <= 0:
             return []
@@ -583,37 +563,90 @@ Rules:
             }
             for row in evidence_rows[:35]
         ]
-        system_prompt = (
-            "You are a generation agent improving an industrial material opportunity portfolio. "
-            "Create new hypotheses grounded in local evidence and meta-review whitespace guidance. Return strict JSON only."
-        )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Meta-review guidance:
-{json.dumps(meta_review_round.generation_guidance, indent=2)}
-
-Whitespace gaps:
-{json.dumps(meta_review_round.whitespace_gaps, indent=2)}
-
-Evidence available for new ideas:
-{json.dumps(evidence_payload, indent=2)}
-
-Generate {target_count} new hypotheses that directly address the whitespace gaps and follow the meta-review guidance.
-Use the same schema as prior hypotheses. Cite only provided chunk IDs and URLs.
-"""
-        output = self._llm.complete_json(HypothesisGenerationOutput, system_prompt, user_prompt)
-        return self._seeds_to_hypotheses(
+        return self._generate_in_batches(
             document=document,
-            seeds=output.hypotheses,
+            evidence_payload=evidence_payload,
             limit=target_count,
             generation_source="regenerated",
             round_index=round_index,
+            system_section="generate_from_meta_review.system",
+            user_section="generate_from_meta_review.user",
+            progress_total=target_count,
+            on_progress=on_progress,
+            generation_guidance_json=json.dumps(meta_review_round.generation_guidance, indent=2),
+            whitespace_gaps_json=json.dumps(meta_review_round.whitespace_gaps, indent=2),
         )
+
+    def _generate_in_batches(
+        self,
+        document: ResearchGoalDocument,
+        evidence_payload: list[dict[str, Any]],
+        limit: int,
+        generation_source: str,
+        round_index: int,
+        system_section: str,
+        user_section: str,
+        progress_total: int,
+        on_progress: Callable[[int, int], None] | None = None,
+        **extra_context: Any,
+    ) -> list[Hypothesis]:
+        hypotheses: "OrderedDict[str, Hypothesis]" = OrderedDict()
+        batch_size = max(1, min(self._batch_size, limit))
+        max_attempts = max(2, ((limit + batch_size - 1) // batch_size) * 2)
+        attempts_without_progress = 0
+
+        while len(hypotheses) < limit and attempts_without_progress < max_attempts:
+            remaining = limit - len(hypotheses)
+            batch_target = min(batch_size, remaining)
+            system_prompt = PROMPTS.render("generation_agent", system_section)
+            user_prompt = PROMPTS.render(
+                "generation_agent",
+                user_section,
+                research_goal=document.raw_goal,
+                document_json=document.model_dump_json(indent=2),
+                evidence_payload_json=json.dumps(evidence_payload, indent=2),
+                target_hypotheses_generated=batch_target,
+                target_count=batch_target,
+                existing_hypotheses_json=json.dumps(
+                    self._existing_hypothesis_prompt_payload(list(hypotheses.values())),
+                    indent=2,
+                ),
+                **extra_context,
+            )
+            output = self._llm.complete_json(HypothesisGenerationOutput, system_prompt, user_prompt)
+            batch_hypotheses = self._seeds_to_hypotheses(
+                document=document,
+                seeds=output.hypotheses,
+                limit=batch_target,
+                generation_source=generation_source,
+                round_index=round_index,
+            )
+            before_count = len(hypotheses)
+            for hypothesis in batch_hypotheses:
+                hypotheses.setdefault(hypothesis.hypothesis_id, hypothesis)
+
+            if len(hypotheses) == before_count:
+                attempts_without_progress += 1
+                continue
+
+            attempts_without_progress = 0
+            if on_progress is not None and len(hypotheses) < progress_total:
+                on_progress(len(hypotheses), progress_total)
+
+        return list(hypotheses.values())[:limit]
+
+    @staticmethod
+    def _existing_hypothesis_prompt_payload(hypotheses: list[Hypothesis]) -> list[dict[str, Any]]:
+        return [
+            {
+                "title": hypothesis.title,
+                "application": hypothesis.application,
+                "market_segment": hypothesis.market_segment,
+                "candidate_material": hypothesis.candidate_material,
+                "incumbent_material": hypothesis.incumbent_material,
+            }
+            for hypothesis in hypotheses
+        ]
 
     @staticmethod
     def _seeds_to_hypotheses(
@@ -782,30 +815,15 @@ class RankingAgent:
             }
             for hypothesis in candidates
         ]
-        system_prompt = (
-            "You are the Ranking Agent in a local AI co-scientist system. "
-            "Judge reflected industrial-material opportunities conservatively. Return strict JSON only."
+        system_prompt = PROMPTS.render("ranking_agent", "rank.system")
+        user_prompt = PROMPTS.render(
+            "ranking_agent",
+            "rank.user",
+            research_goal=document.raw_goal,
+            document_json=document.model_dump_json(indent=2),
+            target_final_count=target_final_count,
+            hypotheses_json=json.dumps(payload, indent=2),
         )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Rank the reflected hypotheses below as a tournament judge. Strong opportunities should fit the research strategy,
-have credible technical and commercial paths, cite evidence, and avoid unresolved fatal gaps.
-Target final portfolio size: {target_final_count}
-
-Hypotheses:
-{json.dumps(payload, indent=2)}
-
-Return:
-- rankings: one item per hypothesis_id with score 0.0-1.0, rank, recommended_action
-  (advance, hold, evolve, reject), rationale, strengths, weaknesses, improvement_directions.
-- best_patterns: what the best hypotheses have in common.
-- worst_patterns: what the weakest hypotheses have in common.
-"""
         return self._llm.complete_json(RankingOutput, system_prompt, user_prompt)
 
     @classmethod
@@ -938,40 +956,16 @@ class EvolutionAgent:
             }
             for hypothesis in parent_hypotheses
         ]
-        system_prompt = (
-            "You are the Evolution Agent in a local AI co-scientist system. "
-            "Create mutated, improved variants of promising material-opportunity hypotheses. Return strict JSON only."
+        system_prompt = PROMPTS.render("evolution_agent", "evolve.system")
+        user_prompt = PROMPTS.render(
+            "evolution_agent",
+            "evolve.user",
+            research_goal=document.raw_goal,
+            best_patterns_json=json.dumps(ranking_round.best_patterns, indent=2),
+            worst_patterns_json=json.dumps(ranking_round.worst_patterns, indent=2),
+            parent_hypotheses_json=json.dumps(parent_payload, indent=2),
+            target_count=target_count,
         )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Ranking feedback:
-Best patterns:
-{json.dumps(ranking_round.best_patterns, indent=2)}
-
-Weakness patterns:
-{json.dumps(ranking_round.worst_patterns, indent=2)}
-
-Improvement guidance:
-[
-  "Use the ranking rationale, best patterns, and worst patterns to mutate promising hypotheses toward stronger variants."
-]
-
-Parent hypotheses:
-{json.dumps(parent_payload, indent=2)}
-
-Generate {target_count} evolved hypotheses. Use genetic-algorithm style mutations such as:
-- narrowing application form
-- changing buyer segment
-- changing NBCA
-- shifting region or activation pathway
-- tightening the rPET value proposition
-- reducing evidence gaps
-
-Each evolved hypothesis must include parent_hypothesis_ids, mutation_strategy, evolution_notes, and the standard hypothesis seed fields.
-Do not simply rename the parent; make a meaningful variant.
-"""
         return self._llm.complete_json(HypothesisEvolutionOutput, system_prompt, user_prompt)
 
     @staticmethod
@@ -1192,33 +1186,15 @@ class ProximityCheckAgent:
             }
             for hypothesis in hypotheses
         ]
-        system_prompt = (
-            "You are the Proximity Check Agent in a local AI co-scientist system. "
-            "Cluster related reflected hypotheses into higher-order concepts and identify truly mergeable ideas. "
-            "Return strict JSON only."
+        system_prompt = PROMPTS.render("proximity_check_agent", "review.system")
+        user_prompt = PROMPTS.render(
+            "proximity_check_agent",
+            "review.user",
+            research_goal=document.raw_goal,
+            document_json=document.model_dump_json(indent=2),
+            hypotheses_json=json.dumps(payload, indent=2),
+            max_synthesized_hypotheses=max_synthesized_hypotheses,
         )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Hypotheses:
-{json.dumps(payload, indent=2)}
-
-Tasks:
-1. Identify emerging concepts across the reflected hypotheses.
-2. Label only hypotheses that genuinely belong in a concept.
-3. If multiple hypotheses are similar enough that they should be combined into a higher-level opportunity,
-   create at most {max_synthesized_hypotheses} synthesized hypotheses that merge the reflected insights.
-
-Rules:
-- Do not force every hypothesis into a concept.
-- Do not synthesize unless the underlying ideas are genuinely overlapping and combinable.
-- Synthesized hypotheses should be broader, cleaner, and more informative than the source hypotheses.
-- Use merged_from_hypothesis_ids to identify the originals being superseded.
-"""
         return self._llm.complete_json(ProximityReviewOutput, system_prompt, user_prompt)
 
     @staticmethod
@@ -1401,37 +1377,16 @@ class MetaReviewAgent:
             }
             for hypothesis in hypotheses
         ]
-        system_prompt = (
-            "You are the Meta-review Agent in a local AI co-scientist system. "
-            "Assess research-space coverage, identify whitespace, and write guidance for the next generation pass. "
-            "Return strict JSON only."
+        system_prompt = PROMPTS.render("meta_review_agent", "review.system")
+        user_prompt = PROMPTS.render(
+            "meta_review_agent",
+            "review.user",
+            research_goal=document.raw_goal,
+            document_json=document.model_dump_json(indent=2),
+            best_patterns_json=json.dumps(ranking_round.best_patterns, indent=2),
+            worst_patterns_json=json.dumps(ranking_round.worst_patterns, indent=2),
+            hypotheses_json=json.dumps(payload, indent=2),
         )
-        user_prompt = f"""
-Research goal:
-{document.raw_goal}
-
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Latest ranking patterns:
-Best patterns:
-{json.dumps(ranking_round.best_patterns, indent=2)}
-
-Worst patterns:
-{json.dumps(ranking_round.worst_patterns, indent=2)}
-
-Active reflected hypotheses:
-{json.dumps(payload, indent=2)}
-
-Tasks:
-1. Identify whitespace gaps versus the research goal.
-2. Determine whether coverage is already sufficient.
-3. Write concrete guidance for the next generation pass that targets missing areas.
-
-Rules:
-- Gaps should be substantive missing regions of the research space, not stylistic complaints.
-- Generation guidance should be specific enough to drive better search-grounded hypotheses.
-"""
         return self._llm.complete_json(MetaReviewOutput, system_prompt, user_prompt)
 
     @staticmethod
@@ -1496,6 +1451,137 @@ Rules:
                 if label
             )
         )
+
+
+class FinalPortfolioAgent:
+    def __init__(self, llm: DeepSeekLLM):
+        self._llm = llm
+
+    def build_report(
+        self,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+        ranking_round: RankingRound | None,
+        meta_review_round: MetaReviewRound | None,
+        stop_reason: str,
+        target_count: int,
+    ) -> str:
+        ranked = [
+            hypothesis
+            for hypothesis in hypotheses
+            if hypothesis.ranking_round_id and hypothesis.status == "reflected" and hypothesis.is_active
+        ]
+        ranked.sort(key=lambda item: (-(item.ranking_score or 0.0), item.title))
+        top_ranked = ranked[:target_count]
+        validation_gaps = self._collect_validation_gaps(top_ranked)
+        ranking_payload = (
+            {
+                "ranking_round_id": ranking_round.ranking_round_id,
+                "round_index": ranking_round.round_index,
+                "candidate_count": ranking_round.candidate_count,
+                "promoted_hypothesis_ids": ranking_round.promoted_hypothesis_ids,
+                "best_patterns": ranking_round.best_patterns,
+                "worst_patterns": ranking_round.worst_patterns,
+                "mean_score": ranking_round.mean_score,
+                "max_score": ranking_round.max_score,
+            }
+            if ranking_round is not None
+            else {}
+        )
+        meta_payload = (
+            {
+                "round_index": meta_review_round.round_index,
+                "whitespace_gaps": meta_review_round.whitespace_gaps,
+                "generation_guidance": meta_review_round.generation_guidance,
+                "coverage_assessment": meta_review_round.coverage_assessment,
+                "gap_shrinkage_status": meta_review_round.gap_shrinkage_status,
+                "coverage_sufficient": meta_review_round.coverage_sufficient,
+                "should_continue": meta_review_round.should_continue,
+                "stop_reason": meta_review_round.stop_reason,
+            }
+            if meta_review_round is not None
+            else {}
+        )
+        opportunity_payload = [self._opportunity_payload(hypothesis) for hypothesis in top_ranked]
+        system_prompt = PROMPTS.render("final_portfolio_agent", "build_report.system")
+        user_prompt = PROMPTS.render(
+            "final_portfolio_agent",
+            "build_report.user",
+            research_goal=document.raw_goal,
+            document_json=document.model_dump_json(indent=2),
+            stop_reason=stop_reason,
+            ranking_round_json=json.dumps(ranking_payload, indent=2),
+            meta_review_round_json=json.dumps(meta_payload, indent=2),
+            top_opportunities_json=json.dumps(opportunity_payload, indent=2),
+            validation_gaps_json=json.dumps(validation_gaps, indent=2),
+        )
+        try:
+            return self._llm.complete_text(system_prompt, user_prompt)
+        except Exception as exc:
+            LOGGER.warning("Final portfolio report generation failed (%s); using deterministic fallback", exc)
+            return CoScientistRunner._build_loop_report(document, ranking_round, meta_review_round, hypotheses, stop_reason)
+
+    @staticmethod
+    def _opportunity_payload(hypothesis: Hypothesis) -> dict[str, Any]:
+        assessment = hypothesis.reflection_assessment or ReflectionAssessment()
+        return {
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "title": hypothesis.title,
+            "summary": hypothesis.summary,
+            "ranking_score": hypothesis.ranking_score,
+            "ranking_status": hypothesis.ranking_status,
+            "generation_source": hypothesis.generation_source,
+            "application": hypothesis.application,
+            "market_segment": hypothesis.market_segment,
+            "candidate_material": hypothesis.candidate_material,
+            "incumbent_material": hypothesis.incumbent_material,
+            "concept_labels": hypothesis.concept_labels,
+            "strategic_fit_score": assessment.strategic_fit_score.value,
+            "market_size_score": assessment.market_size_score.value,
+            "replacement_fit_score": assessment.replacement_fit_score.value,
+            "activation_ease_score": assessment.activation_ease_score.value,
+            "technical_success_probability": assessment.technical_success_probability.value,
+            "commercial_success_probability": assessment.commercial_success_probability.value,
+            "evidence_gap_notes": assessment.evidence_gap_notes,
+            "unknowns": hypothesis.unknowns,
+            "supporting_urls": hypothesis.supporting_urls,
+        }
+
+    @staticmethod
+    def _collect_validation_gaps(hypotheses: list[Hypothesis]) -> list[dict[str, Any]]:
+        gaps: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        metric_labels = {
+            "market_size_score": "Market size validation missing or weak",
+            "incumbent_price_usd_per_kg": "Incumbent pricing validation missing or weak",
+            "nbca_price_usd_per_kg": "Competitive pricing validation missing or weak",
+            "replacement_fit_score": "Replacement fit validation missing or weak",
+            "activation_ease_score": "Activation ease validation missing or weak",
+            "technical_success_probability": "Technical validation missing or weak",
+            "commercial_success_probability": "Commercial validation missing or weak",
+        }
+
+        def bump(label: str) -> None:
+            bucket = gaps.setdefault(label, {"gap": label, "count": 0})
+            bucket["count"] += 1
+
+        for hypothesis in hypotheses:
+            assessment = hypothesis.reflection_assessment or ReflectionAssessment()
+            for note in assessment.evidence_gap_notes:
+                if note:
+                    bump(note)
+            metrics = {
+                "market_size_score": assessment.market_size_score.value,
+                "incumbent_price_usd_per_kg": assessment.incumbent_price_usd_per_kg.value,
+                "nbca_price_usd_per_kg": assessment.nbca_price_usd_per_kg.value,
+                "replacement_fit_score": assessment.replacement_fit_score.value,
+                "activation_ease_score": assessment.activation_ease_score.value,
+                "technical_success_probability": assessment.technical_success_probability.value,
+                "commercial_success_probability": assessment.commercial_success_probability.value,
+            }
+            for field_name, value in metrics.items():
+                if value is None:
+                    bump(metric_labels[field_name])
+        return sorted(gaps.values(), key=lambda item: (-item["count"], item["gap"]))
 
 
 class ReflectionAgent:
@@ -1641,43 +1727,16 @@ class ReflectionAgent:
                 "replacement_driver_strength_score",
             ],
         }
-        system_prompt = (
-            "You are a reflection agent acting as a skeptical peer reviewer for industrial material hypotheses. "
-            "Use only the supplied evidence. Return strict JSON only."
+        system_prompt = PROMPTS.render("reflection_agent", "review_category.system")
+        user_prompt = PROMPTS.render(
+            "reflection_agent",
+            "review_category.user",
+            document_json=document.model_dump_json(indent=2),
+            hypothesis_json=hypothesis.model_dump_json(indent=2),
+            evidence_payload_json=json.dumps(evidence_payload, indent=2),
+            category=category,
+            focus_fields_json=json.dumps(category_fields[category], indent=2),
         )
-        user_prompt = f"""
-Research configuration:
-{document.model_dump_json(indent=2)}
-
-Hypothesis:
-{hypothesis.model_dump_json(indent=2)}
-
-Available evidence:
-{json.dumps(evidence_payload, indent=2)}
-
-Evaluate only the {category} dimension of the hypothesis and return JSON with:
-- assessment
-- needs_additional_search
-- follow_up_search_queries
-
-Focus fields:
-{json.dumps(category_fields[category], indent=2)}
-
-Leave fields outside this focus unset unless the evidence directly resolves them.
-- evidence_gap_notes
-
-For every scored or priced field:
-- for score and probability fields, set value to a normalized number from 0.0 to 1.0 when supported
-- for price fields, set value to a numeric USD/kg amount when supported
-- otherwise set value to null
-- include rationale
-- include confidence from 0 to 1
-- include citation_chunk_ids and citation_urls
-- set is_inferred accurately
-
-If evidence is weak or stale, set needs_additional_search to true and propose targeted web search queries using material, application, incumbent material, form, and conversion process terms.
-Do not invent citations.
-"""
         return self._llm.complete_json(ReflectionReviewOutput, system_prompt, user_prompt)
 
     def _merge_price_metrics(
@@ -1763,6 +1822,7 @@ class CoScientistRunner:
         discovery_agent: DiscoveryAgent | None = None,
         artifact_store: CoScientistStore | None = None,
     ):
+        self._progress_reporter: ProgressReporter = NullProgressReporter()
         self._config = config
         self._config.ensure_directories()
         self._llm = llm or DeepSeekLLM(config)
@@ -1807,6 +1867,7 @@ class CoScientistRunner:
         self._evolution_agent = EvolutionAgent(self._evolution_llm)
         self._proximity_agent = ProximityCheckAgent(self._proximity_llm)
         self._meta_review_agent = MetaReviewAgent(self._meta_review_llm)
+        self._final_portfolio_agent = FinalPortfolioAgent(self._meta_review_llm)
         discovery_tool = (
             DiscoveryEvidenceTool(discovery_agent)
             if discovery_agent is not None
@@ -1819,10 +1880,17 @@ class CoScientistRunner:
             self._price_cache,
         )
 
+    def set_progress_reporter(self, reporter: ProgressReporter | None) -> None:
+        self._progress_reporter = reporter or NullProgressReporter()
+
+    def prepare_project_name(self, preferred_name: str | None = None) -> str:
+        return self._artifact_store.claim_project_name(preferred_name)
+
     def run(
         self,
         goal: str,
         target_hypotheses: int,
+        project_name: str | None = None,
         regions: list[str] | None = None,
         strategic_fit_notes: str | None = None,
         preferred_evidence_recency_days: int = 180,
@@ -1830,13 +1898,16 @@ class CoScientistRunner:
         results_per_query: int = 5,
         max_pages_per_search: int = 8,
         reflection_concurrency: int = 3,
-        ) -> CoScientistRunResult:
+    ) -> CoScientistRunResult:
         limits = ReflectionSearchLimits(
             max_reflection_searches_per_hypothesis=max_reflection_searches_per_hypothesis,
             results_per_query=results_per_query,
             max_pages_per_search=max_pages_per_search,
         )
+        research_id = project_name or self.prepare_project_name()
+        self._progress_reporter.start("planning", "Processing goal")
         document = self._planning_agent.create_research_goal(
+            research_id=research_id,
             raw_goal=goal,
             target_hypotheses_final=target_hypotheses,
             regions=regions,
@@ -1845,8 +1916,24 @@ class CoScientistRunner:
             reflection_search_limits=limits,
         )
         research_goal_path = self._artifact_store.save_research_goal(document)
+        self._progress_reporter.complete("planning", "Goal processed")
 
-        generated = self._generation_agent.generate(document)
+        self._progress_reporter.start("generation", "Generating ideas", document.target_hypotheses_generated)
+        generated = self._generation_agent.generate(
+            document,
+            on_progress=lambda completed, total: self._progress_reporter.advance(
+                "generation",
+                "Generating ideas",
+                completed,
+                total,
+            ),
+        )
+        self._progress_reporter.complete(
+            "generation",
+            "Ideas generated",
+            len(generated),
+            document.target_hypotheses_generated,
+        )
         for hypothesis in generated:
             self._artifact_store.append_hypothesis_snapshot(hypothesis)
 
@@ -1854,12 +1941,16 @@ class CoScientistRunner:
             document,
             generated,
             concurrency=reflection_concurrency,
+            phase="reflection",
+            progress_message="Reflecting on ideas",
         )
 
+        self._progress_reporter.start("reporting", "Writing report")
         report_path = self._artifact_store.write_report(
             document.research_id,
             self._build_report(document, reflected_hypotheses),
         )
+        self._progress_reporter.complete("reporting", "Report written")
         return CoScientistRunResult(
             research_id=document.research_id,
             generated_hypotheses=len(generated),
@@ -1889,6 +1980,7 @@ class CoScientistRunner:
         max_pages_per_search: int | None = None,
         reflection_concurrency: int = 3,
     ) -> CoScientistLoopResult:
+        self._progress_reporter.start("loop_load", "Loading research run")
         document = self._artifact_store.load_research_goal(research_id)
         document = self._with_reflection_overrides(
             document=document,
@@ -1897,6 +1989,7 @@ class CoScientistRunner:
             results_per_query=results_per_query,
             max_pages_per_search=max_pages_per_search,
         )
+        self._progress_reporter.complete("loop_load", "Research run loaded")
         target_final = target_final_hypotheses or document.target_hypotheses_final
         rounds_completed = 0
         total_evolved = 0
@@ -1918,12 +2011,23 @@ class CoScientistRunner:
             if not reflected:
                 stop_reason = "no_active_reflected_hypotheses"
                 break
+            self._progress_reporter.start(
+                "ranking",
+                f"Ranking ideas (round {round_index}/{max_rounds})",
+                len(reflected),
+            )
             ranking_round, ranked_hypotheses = self._ranking_agent.rank(
                 document=document,
                 hypotheses=reflected,
                 round_index=round_index,
                 target_final_count=target_final,
                 evolve_top_k=evolve_top_k,
+            )
+            self._progress_reporter.complete(
+                "ranking",
+                f"Ideas ranked (round {round_index}/{max_rounds})",
+                len(ranked_hypotheses),
+                len(reflected),
             )
             latest_ranking = ranking_round
             self._artifact_store.append_ranking_round(ranking_round)
@@ -1932,9 +2036,15 @@ class CoScientistRunner:
             rounds_completed += 1
 
             if proximity_check_every > 0 and round_index % proximity_check_every == 0:
+                proximity_hypotheses = self._artifact_store.latest_hypotheses(research_id)
+                self._progress_reporter.start(
+                    "proximity",
+                    f"Checking idea overlap (round {round_index}/{max_rounds})",
+                    len(proximity_hypotheses),
+                )
                 proximity_round, proximity_updates, synthesized_hypotheses = self._proximity_agent.review(
                     document=document,
-                    hypotheses=self._artifact_store.latest_hypotheses(research_id),
+                    hypotheses=proximity_hypotheses,
                     round_index=round_index,
                     max_synthesized_hypotheses=max_synthesized_per_round,
                 )
@@ -1948,6 +2058,12 @@ class CoScientistRunner:
                         for hypothesis in self._artifact_store.latest_hypotheses(research_id)
                     },
                 )
+                self._progress_reporter.complete(
+                    "proximity",
+                    f"Idea overlap checked (round {round_index}/{max_rounds})",
+                    len(proximity_hypotheses),
+                    len(proximity_hypotheses),
+                )
                 for hypothesis in synthesized_hypotheses:
                     self._artifact_store.append_hypothesis_snapshot(hypothesis)
                 total_synthesized += len(synthesized_hypotheses)
@@ -1955,11 +2071,17 @@ class CoScientistRunner:
                     document,
                     synthesized_hypotheses,
                     concurrency=reflection_concurrency,
+                    phase="synthesized_reflection",
+                    progress_message=f"Reflecting on synthesized ideas (round {round_index}/{max_rounds})",
                 )
                 total_reflected += len(reflected_synthesized)
                 automatic_discovery_runs += run_count
 
             latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
+            self._progress_reporter.start(
+                "meta_review",
+                f"Reviewing portfolio gaps (round {round_index}/{max_rounds})",
+            )
             document, meta_review_round = self._meta_review_agent.review(
                 document=document,
                 hypotheses=latest_hypotheses,
@@ -1967,6 +2089,10 @@ class CoScientistRunner:
                 round_index=round_index,
                 gap_overlap_threshold=gap_overlap_threshold,
                 max_gap_persistence_rounds=max_gap_persistence_rounds,
+            )
+            self._progress_reporter.complete(
+                "meta_review",
+                f"Portfolio gaps reviewed (round {round_index}/{max_rounds})",
             )
             latest_meta_review = meta_review_round
             self._artifact_store.save_research_goal(document)
@@ -1999,6 +2125,11 @@ class CoScientistRunner:
             ]
             for parent in parents:
                 self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "evolve"}))
+            self._progress_reporter.start(
+                "evolution",
+                f"Evolving top ideas (round {round_index}/{max_rounds})",
+                len(parents),
+            )
             evolved = self._evolution_agent.evolve(
                 document=document,
                 parent_hypotheses=parents,
@@ -2006,11 +2137,34 @@ class CoScientistRunner:
                 target_count=evolved_per_round,
                 round_index=round_index,
             )
+            self._progress_reporter.complete(
+                "evolution",
+                f"Top ideas evolved (round {round_index}/{max_rounds})",
+                len(evolved),
+                len(parents),
+            )
+            self._progress_reporter.start(
+                "regeneration",
+                f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                regenerated_per_round,
+            )
             regenerated = self._generation_agent.generate_from_meta_review(
                 document=document,
                 meta_review_round=meta_review_round,
                 target_count=regenerated_per_round,
                 round_index=round_index,
+                on_progress=lambda completed, total, round_index=round_index: self._progress_reporter.advance(
+                    "regeneration",
+                    f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                    completed,
+                    total,
+                ),
+            )
+            self._progress_reporter.complete(
+                "regeneration",
+                f"Replacement ideas generated (round {round_index}/{max_rounds})",
+                len(regenerated),
+                regenerated_per_round,
             )
             new_hypotheses = self._dedupe_new_hypotheses(
                 evolved + regenerated,
@@ -2031,6 +2185,8 @@ class CoScientistRunner:
                 document,
                 new_hypotheses,
                 concurrency=reflection_concurrency,
+                phase="new_reflection",
+                progress_message=f"Reflecting on new ideas (round {round_index}/{max_rounds})",
             )
             total_reflected += len(reflected_new)
             automatic_discovery_runs += run_count
@@ -2040,10 +2196,20 @@ class CoScientistRunner:
 
         latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
         ranked_count = len([hypothesis for hypothesis in latest_hypotheses if hypothesis.ranking_round_id])
+        self._progress_reporter.start("loop_reporting", "Writing loop report")
+        final_report = self._final_portfolio_agent.build_report(
+            document=document,
+            hypotheses=latest_hypotheses,
+            ranking_round=latest_ranking,
+            meta_review_round=latest_meta_review,
+            stop_reason=stop_reason,
+            target_count=target_final,
+        )
         report_path = self._artifact_store.write_loop_report(
             research_id,
-            self._build_loop_report(document, latest_ranking, latest_meta_review, latest_hypotheses, stop_reason),
+            final_report,
         )
+        self._progress_reporter.complete("loop_reporting", "Loop report written")
         return CoScientistLoopResult(
             research_id=research_id,
             rounds_completed=rounds_completed,
@@ -2069,6 +2235,7 @@ class CoScientistRunner:
         max_hypotheses: int | None = None,
         concurrency: int = 3,
     ) -> CoScientistRunResult:
+        self._progress_reporter.start("resume_load", "Loading research run")
         document = self._artifact_store.load_research_goal(research_id)
         document = self._with_reflection_overrides(
             document=document,
@@ -2077,6 +2244,7 @@ class CoScientistRunner:
             results_per_query=results_per_query,
             max_pages_per_search=max_pages_per_search,
         )
+        self._progress_reporter.complete("resume_load", "Research run loaded")
 
         latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
         pending_hypotheses = [hypothesis for hypothesis in latest_hypotheses if hypothesis.status == "generated"]
@@ -2087,14 +2255,18 @@ class CoScientistRunner:
             document,
             pending_hypotheses,
             concurrency=concurrency,
+            phase="resume_reflection",
+            progress_message="Reflecting on ideas",
         )
 
         refreshed_hypotheses = self._artifact_store.latest_hypotheses(research_id)
         reflected_hypotheses = [hypothesis for hypothesis in refreshed_hypotheses if hypothesis.status == "reflected"]
+        self._progress_reporter.start("resume_reporting", "Writing report")
         report_path = self._artifact_store.write_report(
             document.research_id,
             self._build_report(document, reflected_hypotheses),
         )
+        self._progress_reporter.complete("resume_reporting", "Report written")
         return CoScientistRunResult(
             research_id=document.research_id,
             generated_hypotheses=len(latest_hypotheses),
@@ -2110,22 +2282,30 @@ class CoScientistRunner:
         document: ResearchGoalDocument,
         hypotheses: list[Hypothesis],
         concurrency: int,
+        phase: str = "reflection",
+        progress_message: str = "Reflecting on ideas",
     ) -> tuple[list[Hypothesis], int]:
         if not hypotheses:
+            self._progress_reporter.complete(phase, f"{progress_message} complete", 0, 0)
             return [], 0
         worker_count = max(1, min(concurrency, len(hypotheses)))
+        total_hypotheses = len(hypotheses)
+        self._progress_reporter.start(phase, progress_message, total_hypotheses)
         if worker_count == 1:
             reflected_hypotheses: list[Hypothesis] = []
             discovery_runs = 0
-            for hypothesis in hypotheses:
+            for index, hypothesis in enumerate(hypotheses, start=1):
                 reflected, run_count = self._reflection_agent.reflect(document, hypothesis)
                 reflected_hypotheses.append(reflected)
                 discovery_runs += run_count
                 self._artifact_store.append_hypothesis_snapshot(reflected)
+                self._progress_reporter.advance(phase, progress_message, index, total_hypotheses)
+            self._progress_reporter.complete(phase, f"{progress_message} complete", total_hypotheses, total_hypotheses)
             return reflected_hypotheses, discovery_runs
 
         reflected_hypotheses = []
         discovery_runs = 0
+        completed = 0
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(self._reflection_agent.reflect, document, hypothesis): hypothesis
@@ -2133,15 +2313,24 @@ class CoScientistRunner:
             }
             for future in as_completed(future_map):
                 hypothesis = future_map[future]
+                completed += 1
                 try:
                     reflected, run_count = future.result()
                 except Exception:
                     LOGGER.exception("Reflection failed for hypothesis %s", hypothesis.hypothesis_id)
+                    self._progress_reporter.advance(phase, progress_message, completed, total_hypotheses)
                     continue
                 reflected_hypotheses.append(reflected)
                 discovery_runs += run_count
                 self._artifact_store.append_hypothesis_snapshot(reflected)
+                self._progress_reporter.advance(phase, progress_message, completed, total_hypotheses)
         reflected_hypotheses.sort(key=lambda item: [hyp.hypothesis_id for hyp in hypotheses].index(item.hypothesis_id))
+        completion_message = f"{progress_message} complete"
+        if len(reflected_hypotheses) != total_hypotheses:
+            completion_message = (
+                f"{progress_message} complete ({len(reflected_hypotheses)}/{total_hypotheses} succeeded)"
+            )
+        self._progress_reporter.complete(phase, completion_message, total_hypotheses, total_hypotheses)
         return reflected_hypotheses, discovery_runs
 
     @staticmethod

@@ -5,6 +5,7 @@ from typing import Iterable
 
 from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.models import EVIDENCE_TYPES, EvidenceClassification, EvidenceClassificationDraft, PageContent
+from app_discovery_agent.prompt_library import PROMPTS
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,50 +25,18 @@ class EvidenceClassifier:
         return min((hits / max(len(query_terms), 1)) * 0.7 + density_bonus, 1.0)
 
     def classify(self, original_query: str, page: PageContent) -> EvidenceClassification:
-        system_prompt = (
-            "You are a conservative technical research analyst. "
-            "Classify evidence about application-development opportunities. "
-            "Never overstate suitability. If evidence is partial, preserve it with modest confidence. "
-            "Return strict JSON only."
+        system_prompt = PROMPTS.render("evidence_classifier", "classify.system")
+        user_prompt = PROMPTS.render(
+            "evidence_classifier",
+            "classify.user",
+            original_query=original_query,
+            allowed_evidence_types=", ".join(EVIDENCE_TYPES),
+            source_url=page.url,
+            source_title=page.title,
+            search_query=page.search_query,
+            source_metadata=page.metadata,
+            page_text=page.text[:16000],
         )
-        user_prompt = f"""
-Original query:
-{original_query}
-
-Allowed evidence_type values:
-{", ".join(EVIDENCE_TYPES)}
-
-Source URL: {page.url}
-Source title: {page.title}
-Search query: {page.search_query}
-Source metadata: {page.metadata}
-
-Text:
-\"\"\"
-{page.text[:16000]}
-\"\"\"
-
-Return JSON with:
-- relevant (boolean)
-- relevance_score (0 to 1)
-- confidence_score (0 to 1)
-- application (string or null)
-- incumbent_material (string or null)
-- candidate_materials (array of strings)
-- evidence_type (one allowed value)
-- application_requirements (array of strings)
-- substitution_drivers (array of strings)
-- rationale (short string)
-- supporting_quotes (array of short excerpts copied from the page)
-- metadata (object)
-
-Rules:
-- Do not claim PET, PETG, or Tritan is suitable unless the text supports that.
-- If the page mentions PVC use or requirements without proving substitution, that can still be relevant.
-- If source metadata indicates partial evidence or a search-result snippet, lower confidence and avoid over-interpreting it.
-- Keep confidence conservative.
-- Prefer null over guessing.
-"""
         draft = self._llm.complete_json(EvidenceClassificationDraft, system_prompt, user_prompt)
         return self._normalize_classification(draft)
 

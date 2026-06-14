@@ -49,6 +49,46 @@ def short_title_from_text(text: Any) -> str:
     return (first_sentence or cleaned)[:120]
 
 
+def normalize_confidence_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 1.0 and numeric <= 100.0:
+            numeric = numeric / 100.0
+        return max(0.0, min(1.0, numeric))
+
+    text = str(value).strip().lower()
+    if not text:
+        return 0.0
+    named_levels = {
+        "very low": 0.15,
+        "low": 0.3,
+        "medium-low": 0.4,
+        "medium": 0.55,
+        "moderate": 0.55,
+        "medium-high": 0.7,
+        "high": 0.8,
+        "very high": 0.92,
+    }
+    if text in named_levels:
+        return named_levels[text]
+    if text.endswith("%"):
+        try:
+            return max(0.0, min(1.0, float(text[:-1].strip()) / 100.0))
+        except ValueError:
+            return 0.0
+    try:
+        numeric = float(text)
+    except ValueError:
+        return 0.0
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric = numeric / 100.0
+    return max(0.0, min(1.0, numeric))
+
+
 class ReflectionSearchLimits(BaseModel):
     max_reflection_searches_per_hypothesis: int = Field(default=3, ge=1, le=10)
     results_per_query: int = Field(default=5, ge=1, le=20)
@@ -401,6 +441,11 @@ class HypothesisSeed(BaseModel):
             payload["generation_confidence"] = 0.0
         return payload
 
+    @field_validator("generation_confidence", mode="before")
+    @classmethod
+    def normalize_generation_confidence(cls, value: Any) -> float:
+        return normalize_confidence_value(value)
+
     @field_validator(
         "application_requirements",
         "substitution_drivers",
@@ -417,6 +462,13 @@ class HypothesisSeed(BaseModel):
 
 class HypothesisGenerationOutput(BaseModel):
     hypotheses: list[HypothesisSeed] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_top_level_list(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return {"hypotheses": value}
+        return value
 
     @field_validator("hypotheses", mode="before")
     @classmethod
@@ -504,6 +556,13 @@ class EvolutionHypothesisSeed(HypothesisSeed):
 
 class HypothesisEvolutionOutput(BaseModel):
     hypotheses: list[EvolutionHypothesisSeed] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_top_level_list(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return {"hypotheses": value}
+        return value
 
     @field_validator("hypotheses", mode="before")
     @classmethod
