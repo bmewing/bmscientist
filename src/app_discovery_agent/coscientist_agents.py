@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import socket
+import subprocess
+import sys
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -504,10 +509,15 @@ class GenerationAgent:
         self._llm = llm
         self._retriever = retriever
 
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
     def generate(
         self,
         document: ResearchGoalDocument,
         on_progress: Callable[[int, int], None] | None = None,
+        on_batch: Callable[[list[Hypothesis]], None] | None = None,
     ) -> list[Hypothesis]:
         evidence_rows = self._retriever.retrieve_for_goal(
             document,
@@ -538,6 +548,7 @@ class GenerationAgent:
             user_section="generate.user",
             progress_total=document.target_hypotheses_generated,
             on_progress=on_progress,
+            on_batch=on_batch,
         )
 
     def generate_from_meta_review(
@@ -547,6 +558,7 @@ class GenerationAgent:
         target_count: int,
         round_index: int,
         on_progress: Callable[[int, int], None] | None = None,
+        on_batch: Callable[[list[Hypothesis]], None] | None = None,
     ) -> list[Hypothesis]:
         if target_count <= 0:
             return []
@@ -575,6 +587,7 @@ class GenerationAgent:
             on_progress=on_progress,
             generation_guidance_json=json.dumps(meta_review_round.generation_guidance, indent=2),
             whitespace_gaps_json=json.dumps(meta_review_round.whitespace_gaps, indent=2),
+            on_batch=on_batch,
         )
 
     def _generate_in_batches(
@@ -588,6 +601,7 @@ class GenerationAgent:
         user_section: str,
         progress_total: int,
         on_progress: Callable[[int, int], None] | None = None,
+        on_batch: Callable[[list[Hypothesis]], None] | None = None,
         **extra_context: Any,
     ) -> list[Hypothesis]:
         hypotheses: "OrderedDict[str, Hypothesis]" = OrderedDict()
@@ -622,14 +636,20 @@ class GenerationAgent:
                 round_index=round_index,
             )
             before_count = len(hypotheses)
+            new_hypotheses: list[Hypothesis] = []
             for hypothesis in batch_hypotheses:
-                hypotheses.setdefault(hypothesis.hypothesis_id, hypothesis)
+                if hypothesis.hypothesis_id in hypotheses:
+                    continue
+                hypotheses[hypothesis.hypothesis_id] = hypothesis
+                new_hypotheses.append(hypothesis)
 
             if len(hypotheses) == before_count:
                 attempts_without_progress += 1
                 continue
 
             attempts_without_progress = 0
+            if on_batch is not None and new_hypotheses:
+                on_batch(new_hypotheses)
             if on_progress is not None and len(hypotheses) < progress_total:
                 on_progress(len(hypotheses), progress_total)
 
@@ -1898,6 +1918,7 @@ class CoScientistRunner:
         results_per_query: int = 5,
         max_pages_per_search: int = 8,
         reflection_concurrency: int = 3,
+        spawn_reflection_daemons: bool = False,
     ) -> CoScientistRunResult:
         limits = ReflectionSearchLimits(
             max_reflection_searches_per_hypothesis=max_reflection_searches_per_hypothesis,
@@ -1918,7 +1939,34 @@ class CoScientistRunner:
         research_goal_path = self._artifact_store.save_research_goal(document)
         self._progress_reporter.complete("planning", "Goal processed")
 
+        generated_by_id: "OrderedDict[str, Hypothesis]" = OrderedDict()
+        generated_lock = Lock()
+        stop_reflection_monitor: Callable[[], None] | None = None
+        if spawn_reflection_daemons:
+            self._spawn_reflection_daemons(
+                research_id=document.research_id,
+                worker_count=min(max(1, self._generation_agent.batch_size), document.target_hypotheses_generated),
+                preferred_evidence_recency_days=preferred_evidence_recency_days,
+                max_reflection_searches_per_hypothesis=max_reflection_searches_per_hypothesis,
+                results_per_query=results_per_query,
+                max_pages_per_search=max_pages_per_search,
+                idle_exit_after_seconds=max(300, self._config.request_timeout_seconds * 3 + 15),
+            )
+
+        def persist_generated_batch(batch: list[Hypothesis]) -> None:
+            with generated_lock:
+                for hypothesis in batch:
+                    self._artifact_store.append_hypothesis_snapshot(hypothesis)
+                    generated_by_id.setdefault(hypothesis.hypothesis_id, hypothesis)
+
         self._progress_reporter.start("generation", "Generating ideas", document.target_hypotheses_generated)
+        if spawn_reflection_daemons:
+            stop_reflection_monitor = self._start_reflection_progress_monitor(
+                research_id=document.research_id,
+                tracked_hypothesis_ids=lambda: self._tracked_hypothesis_ids(generated_by_id, generated_lock),
+                phase="reflection",
+                progress_message="Reflecting on ideas",
+            )
         generated = self._generation_agent.generate(
             document,
             on_progress=lambda completed, total: self._progress_reporter.advance(
@@ -1927,6 +1975,7 @@ class CoScientistRunner:
                 completed,
                 total,
             ),
+            on_batch=persist_generated_batch,
         )
         self._progress_reporter.complete(
             "generation",
@@ -1934,16 +1983,45 @@ class CoScientistRunner:
             len(generated),
             document.target_hypotheses_generated,
         )
+        persisted_ids = {
+            hypothesis.hypothesis_id for hypothesis in self._artifact_store.latest_hypotheses(document.research_id)
+        }
         for hypothesis in generated:
-            self._artifact_store.append_hypothesis_snapshot(hypothesis)
+            with generated_lock:
+                generated_by_id.setdefault(hypothesis.hypothesis_id, hypothesis)
+            if hypothesis.hypothesis_id not in persisted_ids:
+                self._artifact_store.append_hypothesis_snapshot(hypothesis)
+                persisted_ids.add(hypothesis.hypothesis_id)
 
-        reflected_hypotheses, automatic_discovery_runs = self._reflect_and_append(
-            document,
-            generated,
-            concurrency=reflection_concurrency,
-            phase="reflection",
-            progress_message="Reflecting on ideas",
-        )
+        if spawn_reflection_daemons:
+            try:
+                with generated_lock:
+                    tracked_ids = set(generated_by_id.keys())
+                reflected_hypotheses = self._wait_for_reflection_completion(
+                    research_id=document.research_id,
+                    hypothesis_ids=tracked_ids,
+                    phase="reflection",
+                    progress_message="Reflecting on ideas",
+                    report_progress=False,
+                )
+                automatic_discovery_runs = self._automatic_discovery_runs_for_hypotheses(reflected_hypotheses)
+                self._progress_reporter.complete(
+                    "reflection",
+                    "Reflecting on ideas complete",
+                    len(reflected_hypotheses),
+                    len(tracked_ids),
+                )
+            finally:
+                if stop_reflection_monitor is not None:
+                    stop_reflection_monitor()
+        else:
+            reflected_hypotheses, automatic_discovery_runs = self._reflect_and_append(
+                document,
+                generated,
+                concurrency=reflection_concurrency,
+                phase="reflection",
+                progress_message="Reflecting on ideas",
+            )
 
         self._progress_reporter.start("reporting", "Writing report")
         report_path = self._artifact_store.write_report(
@@ -2234,6 +2312,11 @@ class CoScientistRunner:
         max_pages_per_search: int | None = None,
         max_hypotheses: int | None = None,
         concurrency: int = 3,
+        daemon: bool = False,
+        worker_id: str | None = None,
+        lease_seconds: int = 1800,
+        poll_interval_seconds: int = 5,
+        idle_exit_after_seconds: int | None = None,
     ) -> CoScientistRunResult:
         self._progress_reporter.start("resume_load", "Loading research run")
         document = self._artifact_store.load_research_goal(research_id)
@@ -2246,17 +2329,18 @@ class CoScientistRunner:
         )
         self._progress_reporter.complete("resume_load", "Research run loaded")
 
-        latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
-        pending_hypotheses = [hypothesis for hypothesis in latest_hypotheses if hypothesis.status == "generated"]
-        if max_hypotheses is not None:
-            pending_hypotheses = pending_hypotheses[:max_hypotheses]
-
-        _, automatic_discovery_runs = self._reflect_and_append(
+        automatic_discovery_runs = self._reflect_from_queue(
             document,
-            pending_hypotheses,
+            research_id=research_id,
             concurrency=concurrency,
+            max_hypotheses=max_hypotheses,
+            daemon=daemon,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            idle_exit_after_seconds=idle_exit_after_seconds,
             phase="resume_reflection",
-            progress_message="Reflecting on ideas",
+            progress_message="Reflecting on queued ideas",
         )
 
         refreshed_hypotheses = self._artifact_store.latest_hypotheses(research_id)
@@ -2269,13 +2353,104 @@ class CoScientistRunner:
         self._progress_reporter.complete("resume_reporting", "Report written")
         return CoScientistRunResult(
             research_id=document.research_id,
-            generated_hypotheses=len(latest_hypotheses),
+            generated_hypotheses=len(refreshed_hypotheses),
             reflected_hypotheses=len(reflected_hypotheses),
             automatic_discovery_runs=automatic_discovery_runs,
             research_goal_path=str(self._artifact_store.research_goal_path(document.research_id).resolve()),
             hypothesis_path=str(self._artifact_store.hypothesis_path(document.research_id).resolve()),
             report_path=str(report_path.resolve()),
         )
+
+    def _reflect_from_queue(
+        self,
+        document: ResearchGoalDocument,
+        research_id: str,
+        concurrency: int,
+        max_hypotheses: int | None = None,
+        daemon: bool = False,
+        worker_id: str | None = None,
+        lease_seconds: int = 1800,
+        poll_interval_seconds: int = 5,
+        idle_exit_after_seconds: int | None = None,
+        phase: str = "resume_reflection",
+        progress_message: str = "Reflecting on queued ideas",
+    ) -> int:
+        worker_count = max(1, concurrency)
+        base_worker_id = worker_id or self._default_reflection_worker_id(research_id)
+        state_lock = Lock()
+        completed = 0
+        discovery_runs = 0
+        remaining_claims = max_hypotheses
+        max_idle_window = max(1, idle_exit_after_seconds) if idle_exit_after_seconds is not None else None
+
+        self._progress_reporter.start(phase, progress_message)
+
+        def reserve_claim_slot() -> bool:
+            nonlocal remaining_claims
+            with state_lock:
+                if remaining_claims is None:
+                    return True
+                if remaining_claims <= 0:
+                    return False
+                remaining_claims -= 1
+                return True
+
+        def release_claim_slot() -> None:
+            nonlocal remaining_claims
+            with state_lock:
+                if remaining_claims is not None:
+                    remaining_claims += 1
+
+        def record_progress(run_count: int) -> None:
+            nonlocal completed, discovery_runs
+            with state_lock:
+                completed += 1
+                discovery_runs += run_count
+                current_completed = completed
+            self._progress_reporter.advance(phase, progress_message, current_completed)
+
+        def worker_loop(worker_index: int) -> None:
+            idle_started_at: float | None = None
+            while True:
+                if not reserve_claim_slot():
+                    return
+                claimed = self._artifact_store.claim_next_generated_hypothesis(
+                    research_id=research_id,
+                    worker_id=f"{base_worker_id}-t{worker_index}",
+                    lease_seconds=lease_seconds,
+                )
+                if claimed is None:
+                    release_claim_slot()
+                    if self._artifact_store.requeue_expired_reflection_claims(research_id):
+                        continue
+                    if not daemon:
+                        return
+                    now = time.monotonic()
+                    if idle_started_at is None:
+                        idle_started_at = now
+                    elif max_idle_window is not None and (now - idle_started_at) >= max_idle_window:
+                        return
+                    time.sleep(max(1, poll_interval_seconds))
+                    continue
+
+                idle_started_at = None
+                try:
+                    reflected, run_count = self._reflection_agent.reflect(document, claimed)
+                except Exception as exc:
+                    LOGGER.exception("Reflection failed for hypothesis %s", claimed.hypothesis_id)
+                    self._artifact_store.release_reflection_claim(claimed, str(exc))
+                    record_progress(0)
+                    continue
+                self._artifact_store.complete_reflection_claim(reflected)
+                record_progress(run_count)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(worker_loop, worker_index) for worker_index in range(1, worker_count + 1)]
+            for future in as_completed(futures):
+                future.result()
+
+        self._progress_reporter.complete(phase, f"{progress_message} complete", completed)
+        return discovery_runs
 
     def _reflect_and_append(
         self,
@@ -2332,6 +2507,185 @@ class CoScientistRunner:
             )
         self._progress_reporter.complete(phase, completion_message, total_hypotheses, total_hypotheses)
         return reflected_hypotheses, discovery_runs
+
+    def _spawn_reflection_daemons(
+        self,
+        research_id: str,
+        worker_count: int,
+        preferred_evidence_recency_days: int,
+        max_reflection_searches_per_hypothesis: int,
+        results_per_query: int,
+        max_pages_per_search: int,
+        lease_seconds: int = 1800,
+        poll_interval_seconds: int = 1,
+        idle_exit_after_seconds: int = 300,
+    ) -> None:
+        if worker_count <= 0:
+            return
+        project_root = Path(__file__).resolve().parents[2]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for worker_index in range(1, worker_count + 1):
+            worker_id = f"{research_id}-reflector-{worker_index}"
+            command = [
+                sys.executable,
+                "-m",
+                "app_discovery_agent.cli",
+                "coscientist-reflect",
+                "--research-id",
+                research_id,
+                "--concurrency",
+                "1",
+                "--daemon",
+                "--worker-id",
+                worker_id,
+                "--lease-seconds",
+                str(lease_seconds),
+                "--poll-interval-seconds",
+                str(poll_interval_seconds),
+                "--idle-exit-after-seconds",
+                str(idle_exit_after_seconds),
+                "--preferred-evidence-recency-days",
+                str(preferred_evidence_recency_days),
+                "--max-reflection-searches-per-hypothesis",
+                str(max_reflection_searches_per_hypothesis),
+                "--results-per-query",
+                str(results_per_query),
+                "--max-pages-per-search",
+                str(max_pages_per_search),
+            ]
+            subprocess.Popen(
+                command,
+                cwd=str(project_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+    def _wait_for_reflection_completion(
+        self,
+        research_id: str,
+        hypothesis_ids: set[str],
+        phase: str,
+        progress_message: str,
+        poll_interval_seconds: float = 1.0,
+        report_progress: bool = True,
+    ) -> list[Hypothesis]:
+        total = len(hypothesis_ids)
+        completed = -1
+        while True:
+            latest_by_id = {
+                hypothesis.hypothesis_id: hypothesis
+                for hypothesis in self._artifact_store.latest_hypotheses(research_id)
+                if hypothesis.hypothesis_id in hypothesis_ids
+            }
+            finished = [
+                hypothesis
+                for hypothesis in latest_by_id.values()
+                if hypothesis.status == "reflected" or hypothesis.status == "retired"
+            ]
+            reflected = [hypothesis for hypothesis in finished if hypothesis.status == "reflected"]
+            current_completed = len(finished)
+            if report_progress and current_completed != completed:
+                completed = current_completed
+                self._progress_reporter.advance(phase, progress_message, completed, total)
+            if current_completed >= total:
+                if report_progress:
+                    self._progress_reporter.complete(phase, f"{progress_message} complete", current_completed, total)
+                return reflected
+            time.sleep(max(0.2, poll_interval_seconds))
+
+    @staticmethod
+    def _automatic_discovery_runs_for_hypotheses(hypotheses: list[Hypothesis]) -> int:
+        return sum(
+            len((hypothesis.reflection_assessment or ReflectionAssessment()).reflection_discovery_run_ids)
+            for hypothesis in hypotheses
+        )
+
+    def _start_reflection_progress_monitor(
+        self,
+        research_id: str,
+        tracked_hypothesis_ids: Callable[[], set[str]],
+        phase: str,
+        progress_message: str,
+        poll_interval_seconds: float = 1.0,
+    ) -> Callable[[], None]:
+        stop_event = Event()
+        self._progress_reporter.start(phase, progress_message)
+
+        def monitor() -> None:
+            last_signature: tuple[int, int | None, tuple[str, ...]] | None = None
+            while not stop_event.wait(max(0.2, poll_interval_seconds)):
+                hypothesis_ids = tracked_hypothesis_ids()
+                reflected_count, total, active_worker_lines = self._reflection_progress_counts(research_id, hypothesis_ids)
+                display_total = total if total > 0 else None
+                signature = (reflected_count, display_total, tuple(active_worker_lines))
+                if signature == last_signature:
+                    continue
+                last_signature = signature
+                self._progress_reporter.advance(phase, progress_message, reflected_count, display_total)
+                self._set_progress_details(phase, active_worker_lines)
+
+        thread = Thread(target=monitor, name=f"reflection-progress-{research_id}", daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            stop_event.set()
+            thread.join(timeout=2)
+
+        return stop
+
+    def _reflection_progress_counts(self, research_id: str, hypothesis_ids: set[str]) -> tuple[int, int, list[str]]:
+        if not hypothesis_ids:
+            return 0, 0, []
+        latest_by_id = {
+            hypothesis.hypothesis_id: hypothesis
+            for hypothesis in self._artifact_store.latest_hypotheses(research_id)
+            if hypothesis.hypothesis_id in hypothesis_ids
+        }
+        reflected_count = len(
+            [
+                hypothesis
+                for hypothesis in latest_by_id.values()
+                if hypothesis.status == "reflected" or hypothesis.status == "retired"
+            ]
+        )
+        active_worker_lines = self._active_reflection_worker_lines(latest_by_id.values())
+        return reflected_count, len(hypothesis_ids), active_worker_lines
+
+    @staticmethod
+    def _active_reflection_worker_lines(hypotheses: Any) -> list[str]:
+        active = [
+            hypothesis
+            for hypothesis in hypotheses
+            if hypothesis.status == "reflecting" and hypothesis.reflection_worker_id
+        ]
+        active.sort(key=lambda hypothesis: (hypothesis.reflection_worker_id or "", hypothesis.title))
+        lines: list[str] = []
+        for hypothesis in active:
+            worker_id = hypothesis.reflection_worker_id or "worker"
+            title = " ".join(hypothesis.title.split())
+            if len(title) > 90:
+                title = f"{title[:87]}..."
+            lines.append(f"{worker_id}: {title}")
+        return lines
+
+    def _set_progress_details(self, phase: str, lines: list[str]) -> None:
+        details_method = getattr(self._progress_reporter, "details", None)
+        if callable(details_method):
+            details_method(phase, lines)
+
+    @staticmethod
+    def _tracked_hypothesis_ids(
+        generated_by_id: "OrderedDict[str, Hypothesis]",
+        generated_lock: Lock,
+    ) -> set[str]:
+        with generated_lock:
+            return set(generated_by_id.keys())
+
+    @staticmethod
+    def _default_reflection_worker_id(research_id: str) -> str:
+        return f"{research_id}-{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}"
 
     @staticmethod
     def _with_reflection_overrides(

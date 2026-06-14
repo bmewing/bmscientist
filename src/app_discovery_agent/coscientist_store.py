@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import secrets
 from pathlib import Path
+from uuid import uuid4
 
 from app_discovery_agent.coscientist_models import (
     Hypothesis,
@@ -15,7 +17,7 @@ from app_discovery_agent.coscientist_models import (
 
 
 class CoScientistStore:
-    HYPOTHESIS_STAGES = ("generated", "reflected", "evolve", "retired")
+    HYPOTHESIS_STAGES = ("generated", "reflecting", "reflected", "evolve", "retired")
     _ADJECTIVES = (
         "amber",
         "ancient",
@@ -195,7 +197,7 @@ class CoScientistStore:
     def save_hypothesis(self, hypothesis: Hypothesis) -> Path:
         self.ensure_run_directories(hypothesis.research_id)
         path = self.hypothesis_file_path(hypothesis)
-        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         tmp_path.write_text(hypothesis.model_dump_json(indent=2), encoding="utf-8")
         self._remove_hypothesis_from_other_stages(hypothesis, keep_stage=path.parent.name)
         tmp_path.replace(path)
@@ -209,6 +211,8 @@ class CoScientistStore:
             return "retired"
         if hypothesis.status == "evolve":
             return "evolve"
+        if hypothesis.status == "reflecting":
+            return "reflecting"
         if hypothesis.status == "generated":
             return "generated"
         return "reflected"
@@ -220,6 +224,100 @@ class CoScientistStore:
             path = self.hypotheses_dir(hypothesis.research_id) / stage / f"{hypothesis.hypothesis_id}.json"
             if path.exists():
                 path.unlink()
+
+    def claim_next_generated_hypothesis(
+        self,
+        research_id: str,
+        worker_id: str,
+        lease_seconds: int = 1800,
+    ) -> Hypothesis | None:
+        self.ensure_run_directories(research_id)
+        generated_dir = self.hypotheses_dir(research_id) / "generated"
+        reflecting_dir = self.hypotheses_dir(research_id) / "reflecting"
+        now = datetime.now(timezone.utc)
+        lease_window = timedelta(seconds=max(1, lease_seconds))
+
+        for source_path in sorted(generated_dir.glob("*.json")):
+            claimed_path = reflecting_dir / source_path.name
+            try:
+                source_path.rename(claimed_path)
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                if source_path.exists():
+                    raise
+                continue
+            claimed_path.touch()
+
+            hypothesis = Hypothesis.model_validate_json(claimed_path.read_text(encoding="utf-8"))
+            claimed = hypothesis.model_copy(
+                update={
+                    "status": "reflecting",
+                    "reflection_worker_id": worker_id,
+                    "reflection_claimed_at": now,
+                    "reflection_lease_expires_at": now + lease_window,
+                    "reflection_attempt_count": hypothesis.reflection_attempt_count + 1,
+                    "reflection_error": None,
+                }
+            )
+            self.save_hypothesis(claimed)
+            return claimed
+        return None
+
+    def complete_reflection_claim(self, hypothesis: Hypothesis) -> Path:
+        completed = hypothesis.model_copy(
+            update={
+                "status": "reflected",
+                "reflection_worker_id": None,
+                "reflection_claimed_at": None,
+                "reflection_lease_expires_at": None,
+                "reflection_error": None,
+            }
+        )
+        return self.save_hypothesis(completed)
+
+    def release_reflection_claim(self, hypothesis: Hypothesis, error: str | None = None) -> Path:
+        released = hypothesis.model_copy(
+            update={
+                "status": "generated",
+                "reflection_worker_id": None,
+                "reflection_claimed_at": None,
+                "reflection_lease_expires_at": None,
+                "reflection_error": error.strip()[:500] if error else None,
+            }
+        )
+        return self.save_hypothesis(released)
+
+    def requeue_expired_reflection_claims(self, research_id: str) -> int:
+        self.ensure_run_directories(research_id)
+        reclaimed = 0
+        now = datetime.now(timezone.utc)
+        grace_cutoff = now - timedelta(seconds=5)
+        reflecting_dir = self.hypotheses_dir(research_id) / "reflecting"
+
+        for path in sorted(reflecting_dir.glob("*.json")):
+            hypothesis = Hypothesis.model_validate_json(path.read_text(encoding="utf-8"))
+            lease_expiry = hypothesis.reflection_lease_expires_at
+            if lease_expiry is not None and lease_expiry > now:
+                continue
+            if lease_expiry is None:
+                modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                if modified_at > grace_cutoff:
+                    continue
+            released = hypothesis.model_copy(
+                update={
+                    "status": "generated",
+                    "reflection_worker_id": None,
+                    "reflection_claimed_at": None,
+                    "reflection_lease_expires_at": None,
+                    "reflection_error": "Reflection lease expired before completion.",
+                }
+            )
+            self.save_hypothesis(released)
+            reclaimed += 1
+        return reclaimed
 
     def load_hypothesis_snapshots(self, research_id: str) -> list[Hypothesis]:
         return [

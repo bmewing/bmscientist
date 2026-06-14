@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 
 from app_discovery_agent.config import AppConfig
 from app_discovery_agent.coscientist_agents import (
@@ -882,6 +883,7 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
         def run(self, **kwargs):
             from app_discovery_agent.coscientist_models import CoScientistRunResult
             assert kwargs["project_name"] == "calm-river-beacon"
+            assert kwargs["spawn_reflection_daemons"] is True
 
             return CoScientistRunResult(
                 research_id="research-123",
@@ -956,6 +958,9 @@ def test_coscientist_reflect_cli_smoke_writes_expected_summary(tmp_path):
             from app_discovery_agent.coscientist_models import CoScientistRunResult
 
             assert kwargs["research_id"] == "research-123"
+            assert kwargs["daemon"] is False
+            assert kwargs["lease_seconds"] == 1800
+            assert kwargs["poll_interval_seconds"] == 5
             return CoScientistRunResult(
                 research_id="research-123",
                 generated_hypotheses=8,
@@ -974,6 +979,11 @@ def test_coscientist_reflect_cli_smoke_writes_expected_summary(tmp_path):
         max_pages_per_search=None,
         max_hypotheses=None,
         concurrency=2,
+        daemon=False,
+        worker_id=None,
+        lease_seconds=1800,
+        poll_interval_seconds=5,
+        idle_exit_after_seconds=None,
     )
     config = AppConfig(
         deepseek_api_key="x",
@@ -1072,6 +1082,52 @@ def test_coscientist_store_uses_evolve_and_retired_queue_folders(tmp_path):
     assert retired_path.exists()
 
 
+def test_coscientist_store_claims_and_releases_generated_hypothesis(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    hypothesis = make_hypothesis()
+    store.append_hypothesis_snapshot(hypothesis)
+
+    claimed = store.claim_next_generated_hypothesis("research-1", worker_id="worker-a", lease_seconds=120)
+
+    assert claimed is not None
+    assert claimed.status == "reflecting"
+    assert claimed.reflection_worker_id == "worker-a"
+    assert claimed.reflection_attempt_count == 1
+    assert (
+        tmp_path / "coscientist" / "research-1" / "hypotheses" / "reflecting" / f"{hypothesis.hypothesis_id}.json"
+    ).exists()
+
+    store.release_reflection_claim(claimed, "temporary failure")
+    latest = {item.hypothesis_id: item for item in store.latest_hypotheses("research-1")}
+
+    assert latest["hyp-1"].status == "generated"
+    assert latest["hyp-1"].reflection_worker_id is None
+    assert latest["hyp-1"].reflection_error == "temporary failure"
+    assert (tmp_path / "coscientist" / "research-1" / "hypotheses" / "generated" / "hyp-1.json").exists()
+
+
+def test_coscientist_store_requeues_expired_reflection_claims(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    expired = make_hypothesis().model_copy(
+        update={
+            "status": "reflecting",
+            "reflection_worker_id": "worker-a",
+            "reflection_claimed_at": datetime(2000, 1, 1, tzinfo=timezone.utc),
+            "reflection_lease_expires_at": datetime(2000, 1, 1, 0, 5, tzinfo=timezone.utc),
+            "reflection_attempt_count": 1,
+        }
+    )
+    store.append_hypothesis_snapshot(expired)
+
+    reclaimed = store.requeue_expired_reflection_claims("research-1")
+    latest = {item.hypothesis_id: item for item in store.latest_hypotheses("research-1")}
+
+    assert reclaimed == 1
+    assert latest["hyp-1"].status == "generated"
+    assert latest["hyp-1"].reflection_worker_id is None
+    assert latest["hyp-1"].reflection_error == "Reflection lease expired before completion."
+
+
 def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
     store = CoScientistStore(tmp_path / "coscientist")
     document = make_document()
@@ -1140,6 +1196,64 @@ def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
     assert result.reflected_hypotheses == 2
     assert latest["hyp-1"].status == "reflected"
     assert latest["hyp-2"].status == "reflected"
+
+
+def test_reflect_existing_requeues_failed_claims(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    document = make_document()
+    store.save_research_goal(document)
+    store.append_hypothesis_snapshot(make_hypothesis())
+
+    class FailingReflectRunner:
+        def reflect(self, document, hypothesis):
+            raise RuntimeError("simulated reflection failure")
+
+    runner = object.__new__(CoScientistRunner)
+    runner._artifact_store = store
+    runner._reflection_agent = FailingReflectRunner()
+    runner._progress_reporter = RecordingProgressReporter()
+
+    result = runner.reflect_existing("research-1", max_hypotheses=1, concurrency=1)
+    latest = {item.hypothesis_id: item for item in store.latest_hypotheses("research-1")}
+
+    assert result.reflected_hypotheses == 0
+    assert latest["hyp-1"].status == "generated"
+    assert latest["hyp-1"].reflection_attempt_count == 1
+    assert latest["hyp-1"].reflection_error == "simulated reflection failure"
+
+
+def test_active_reflection_worker_lines_show_worker_and_hypothesis_title():
+    lines = CoScientistRunner._active_reflection_worker_lines(
+        [
+            make_hypothesis().model_copy(
+                update={
+                    "status": "reflecting",
+                    "title": "PETG for rigid medical trays",
+                    "reflection_worker_id": "reflector-a",
+                }
+            ),
+            make_hypothesis().model_copy(
+                update={
+                    "hypothesis_id": "hyp-2",
+                    "status": "reflecting",
+                    "title": "APET for food service lids",
+                    "reflection_worker_id": "reflector-b",
+                }
+            ),
+            make_hypothesis().model_copy(
+                update={
+                    "hypothesis_id": "hyp-3",
+                    "status": "generated",
+                    "title": "Should not appear",
+                }
+            ),
+        ]
+    )
+
+    assert lines == [
+        "reflector-a: PETG for rigid medical trays",
+        "reflector-b: APET for food service lids",
+    ]
 
 
 def test_reflect_and_append_reports_incremental_progress(tmp_path):
@@ -1220,8 +1334,12 @@ def test_run_reports_stage_progress(tmp_path):
             return document
 
     class FakeGenerationAgent:
-        def generate(self, doc, on_progress=None):
+        batch_size = 5
+
+        def generate(self, doc, on_progress=None, on_batch=None):
             assert doc.research_id == document.research_id
+            if on_batch is not None:
+                on_batch(generated)
             return generated
 
     class FakeArtifactStore:
@@ -1236,6 +1354,9 @@ def test_run_reports_stage_progress(tmp_path):
 
         def append_hypothesis_snapshot(self, hypothesis):
             self.saved.append(hypothesis.hypothesis_id)
+
+        def latest_hypotheses(self, research_id):
+            return []
 
         def write_report(self, research_id, report):
             return tmp_path / "report.md"
@@ -1266,3 +1387,90 @@ def test_run_reports_stage_progress(tmp_path):
         ("start", "reporting", "Writing report", None),
         ("complete", "reporting", "Report written", None, None),
     ]
+
+
+def test_run_can_spawn_reflection_daemons_and_wait_for_queue(tmp_path):
+    document = make_document().model_copy(update={"target_hypotheses_generated": 2})
+    reporter = RecordingProgressReporter()
+    generated = [
+        make_hypothesis(),
+        make_hypothesis().model_copy(update={"hypothesis_id": "hyp-2", "title": "Hypothesis 2"}),
+    ]
+    reflected = [
+        hypothesis.model_copy(
+            update={
+                "status": "reflected",
+                "reflection_assessment": ReflectionAssessment.model_validate(
+                    {
+                        "reflection_discovery_run_ids": ["run-1"],
+                    }
+                ),
+            }
+        )
+        for hypothesis in generated
+    ]
+
+    class FakePlanningAgent:
+        def create_research_goal(self, **kwargs):
+            return document
+
+    class FakeGenerationAgent:
+        batch_size = 5
+
+        def generate(self, doc, on_progress=None, on_batch=None):
+            if on_batch is not None:
+                on_batch([generated[0]])
+                on_batch([generated[1]])
+            return generated
+
+    class FakeArtifactStore:
+        def __init__(self):
+            self.saved = []
+
+        def claim_project_name(self, preferred_name=None):
+            return preferred_name or document.research_id
+
+        def save_research_goal(self, doc):
+            return tmp_path / "goal.json"
+
+        def append_hypothesis_snapshot(self, hypothesis):
+            self.saved.append(hypothesis.hypothesis_id)
+
+        def latest_hypotheses(self, research_id):
+            return generated
+
+        def write_report(self, research_id, report):
+            return tmp_path / "report.md"
+
+        def hypothesis_path(self, research_id):
+            return tmp_path / "hypotheses"
+
+    spawn_calls = []
+
+    runner = object.__new__(CoScientistRunner)
+    runner._config = AppConfig(
+        deepseek_api_key="x",
+        exa_api_key="y",
+        request_timeout_seconds=240,
+    )
+    runner._planning_agent = FakePlanningAgent()
+    runner._generation_agent = FakeGenerationAgent()
+    runner._artifact_store = FakeArtifactStore()
+    runner._progress_reporter = reporter
+    runner._spawn_reflection_daemons = lambda **kwargs: spawn_calls.append(kwargs)  # noqa: E731
+    runner._start_reflection_progress_monitor = lambda **kwargs: (lambda: None)  # noqa: E731
+    runner._wait_for_reflection_completion = lambda **kwargs: reflected  # noqa: E731
+    runner._automatic_discovery_runs_for_hypotheses = lambda hypotheses: 2  # noqa: E731
+    runner._build_report = lambda document, hypotheses: "report"
+
+    result = runner.run(
+        "Find PET opportunities",
+        1,
+        reflection_concurrency=2,
+        spawn_reflection_daemons=True,
+    )
+
+    assert result.generated_hypotheses == 2
+    assert result.reflected_hypotheses == 2
+    assert spawn_calls
+    assert spawn_calls[0]["idle_exit_after_seconds"] == 735

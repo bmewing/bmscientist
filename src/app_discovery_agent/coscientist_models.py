@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-HypothesisStatus = Literal["generated", "reflected", "evolve", "retired"]
+HypothesisStatus = Literal["generated", "reflecting", "reflected", "evolve", "retired"]
 HypothesisGenerationSource = Literal["initial", "evolved", "regenerated", "synthesized"]
 RankingAction = Literal["advance", "hold", "evolve", "reject"]
 GapShrinkageStatus = Literal["improved", "stable", "worse", "unknown"]
@@ -329,6 +329,11 @@ class Hypothesis(BaseModel):
     unknowns: list[str] = Field(default_factory=list)
     generation_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reflection_assessment: ReflectionAssessment | None = None
+    reflection_worker_id: str | None = None
+    reflection_claimed_at: datetime | None = None
+    reflection_lease_expires_at: datetime | None = None
+    reflection_attempt_count: int = Field(default=0, ge=0)
+    reflection_error: str | None = None
     round_index: int = Field(default=0, ge=0)
     generation_source: HypothesisGenerationSource = "initial"
     parent_hypothesis_ids: list[str] = Field(default_factory=list)
