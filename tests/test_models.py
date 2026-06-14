@@ -4,8 +4,9 @@ from pathlib import Path
 
 from app_discovery_agent.agent import DiscoveryAgent
 from app_discovery_agent.classify import EvidenceClassifier
+from app_discovery_agent.chunking import TextChunker
 from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, SearchResultItem
+from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
 
 
 def test_evidence_classification_parses_expected_shape():
@@ -113,6 +114,55 @@ def test_partial_page_is_built_from_search_result():
     assert page.metadata["is_partial_evidence"] is True
     assert page.metadata["partial_evidence_reason"] == "blocked_domain"
     assert "PVC applications overview" in page.text
+
+
+def test_discovery_retains_low_relevance_fetched_pages_for_reflection():
+    class LowRelevanceClassifier:
+        def heuristic_relevance(self, query, text):
+            return 0.01
+
+        def classify(self, query, page):
+            return EvidenceClassification.model_validate(
+                {
+                    "relevant": False,
+                    "relevance_score": 0.05,
+                    "confidence_score": 0.2,
+                    "application": None,
+                    "incumbent_material": None,
+                    "candidate_materials": [],
+                    "evidence_type": "market or customer need",
+                    "application_requirements": [],
+                    "substitution_drivers": [],
+                    "rationale": "Indirect market context.",
+                    "supporting_quotes": [],
+                    "metadata": {},
+                }
+            )
+
+    agent = DiscoveryAgent.__new__(DiscoveryAgent)
+    agent._config = type("Config", (), {"min_page_characters": 20, "min_snippet_characters": 20})()
+    agent._classifier = LowRelevanceClassifier()
+    agent._chunker = TextChunker(chunk_size=80, chunk_overlap=0)
+    page = PageContent(
+        title="Adjacent market report",
+        url="https://example.com/market",
+        search_query="application market size",
+        source_domain="example.com",
+        fetched_at=datetime.now(timezone.utc),
+        text="Market revenue, CAGR, application segmentation, and customer demand context for an adjacent market.",
+    )
+
+    state = {"fetched_pages": [page], "skipped_pages": [], "original_query": "PETG application evidence"}
+    state.update(agent.filter_relevance(state))
+    state.update(agent.classify_evidence(state))
+    state.update(agent.chunk_content({**state, "run_id": "run-1"}))
+
+    assert len(state["candidate_pages"]) == 1
+    assert state["candidate_pages"][0].metadata["heuristic_relevance_score"] == 0.01
+    assert len(state["classifications"]) == 1
+    assert state["skipped_pages"] == []
+    assert state["chunk_records"][0].metadata["retained_for_reflection"] is True
+    assert state["chunk_records"][0].metadata["classification_relevant"] is False
 
 
 def test_load_cached_fetched_pages_skips_pdf(tmp_path):

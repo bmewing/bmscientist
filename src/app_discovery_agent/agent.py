@@ -263,11 +263,12 @@ class DiscoveryAgent:
                 skipped.append({"url": str(page.url), "reason": "too_little_text"})
                 continue
             heuristic_score = self._classifier.heuristic_relevance(state["original_query"], page.text)
-            min_heuristic_score = 0.1 if is_partial else 0.2
-            if heuristic_score < min_heuristic_score:
-                skipped.append({"url": str(page.url), "reason": "low_heuristic_relevance", "score": heuristic_score})
-                continue
-            candidates.append(page)
+            metadata = {
+                **page.metadata,
+                "heuristic_relevance_score": heuristic_score,
+                "retention_policy": "retain_fetched_text_for_reflection",
+            }
+            candidates.append(page.model_copy(update={"metadata": metadata}))
         return {"candidate_pages": candidates, "skipped_pages": skipped}
 
     def classify_evidence(self, state: DiscoveryState) -> DiscoveryState:
@@ -282,15 +283,6 @@ class DiscoveryAgent:
                 skipped.append({"url": str(page.url), "reason": "classification_error", "error": str(exc)})
                 continue
 
-            if classification.relevance_score < self._config.min_relevance_score or not classification.relevant:
-                skipped.append(
-                    {
-                        "url": str(page.url),
-                        "reason": "below_relevance_threshold",
-                        "relevance_score": classification.relevance_score,
-                    }
-                )
-                continue
             classifications.append({"page": page, "classification": classification})
         return {"classifications": classifications, "skipped_pages": skipped}
 
@@ -325,6 +317,11 @@ class DiscoveryAgent:
                         metadata={
                             "rationale": classification.rationale,
                             "supporting_quotes": classification.supporting_quotes,
+                            "classification_relevant": classification.relevant,
+                            "classification_relevance_score": classification.relevance_score,
+                            "classification_confidence_score": classification.confidence_score,
+                            "retained_for_reflection": True,
+                            "retention_policy": page.metadata.get("retention_policy", "retain_classified_text_for_reflection"),
                             "page_metadata": page.metadata,
                         },
                     )

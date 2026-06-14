@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from app_discovery_agent.chunking import TextChunker
 from app_discovery_agent.config import AppConfig
 from app_discovery_agent.coscientist_agents import (
     CoScientistRunner,
@@ -33,6 +37,8 @@ from app_discovery_agent.coscientist_models import (
     ResearchGoalDocument,
 )
 from app_discovery_agent.coscientist_store import CoScientistStore
+from app_discovery_agent.graph_market import GraphMarketEvidence
+from app_discovery_agent.models import EvidenceClassification, PageContent
 
 
 class FakeEmbedder:
@@ -711,6 +717,172 @@ def test_reflection_applies_structured_price_cache_when_prices_are_missing():
     assert reflected.reflection_assessment is not None
     assert reflected.reflection_assessment.incumbent_price_usd_per_kg.value == 1.23
     assert reflected.reflection_assessment.nbca_price_usd_per_kg.value == 1.45
+
+
+def test_graph_market_evidence_matches_market_and_application(tmp_path):
+    graph_path = tmp_path / "graph"
+    (graph_path / "nodes").mkdir(parents=True)
+    (graph_path / "edges").mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "market_id": "market:medical-packaging",
+                    "name": "Medical Packaging",
+                    "normalized_name": "Medical Packaging",
+                    "primary_slug": "medical-packaging-market",
+                    "canonical_url": "https://example.com/market",
+                    "source_vendor": "Grand View Research",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ),
+        graph_path / "nodes" / "Market.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "application_id": "application:medical-trays",
+                    "name": "Medical Trays",
+                    "normalized_name": "Medical Trays",
+                    "node_type": "application",
+                    "url": "https://example.com/application",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ),
+        graph_path / "nodes" / "Application.parquet",
+    )
+    pq.write_table(pa.Table.from_pylist([], schema=pa.schema([("product_id", pa.string())])), graph_path / "nodes" / "Product.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "geo_id": "geo:north-america",
+                    "name": "North America",
+                    "normalized_name": "North America",
+                    "geo_type": "region",
+                    "parent_geo_id": None,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ),
+        graph_path / "nodes" / "Geography.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "edge_id": "edge-1",
+                    "market_id": "market:medical-packaging",
+                    "application_id": "application:medical-trays",
+                    "scope_type": "statistics",
+                    "source_node_type": "application",
+                    "geo_id": "geo:north-america",
+                    "page_url": "https://example.com/stats",
+                    "retrieved_at": "2026-01-01T00:00:00+00:00",
+                    "status": "fetched",
+                    "revenue_value": 1200.0,
+                    "revenue_year": 2025,
+                    "forecast_revenue_value": 1700.0,
+                    "forecast_revenue_year": 2030,
+                    "cagr_value": 5.4,
+                    "cagr_start_year": 2026,
+                    "cagr_end_year": 2030,
+                    "unit": "USD million",
+                    "currency": "USD",
+                    "unit_scale": "million",
+                    "highlights_json": '[{"text":"The North America medical trays segment is growing."}]',
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ),
+        graph_path / "edges" / "Market_HAS_APPLICATION_Application.parquet",
+    )
+    empty_edge_schema = pa.schema([("edge_id", pa.string()), ("market_id", pa.string())])
+    pq.write_table(pa.Table.from_pylist([], schema=empty_edge_schema), graph_path / "edges" / "Market_USES_Product.parquet")
+    pq.write_table(pa.Table.from_pylist([], schema=empty_edge_schema), graph_path / "edges" / "Market_IN_GEOGRAPHY_Geography.parquet")
+
+    rows = GraphMarketEvidence(graph_path).build_evidence_rows(make_document(), make_hypothesis())
+
+    assert rows
+    assert rows[0]["metadata"]["source_type"] == "offline-graph-market-data"
+    assert rows[0]["metadata"]["revenue_value"] == 1200.0
+    assert "Medical Packaging" in rows[0]["chunk_text"]
+
+
+def test_reflection_infers_missing_assessment_fields_after_review():
+    agent = ReflectionAgent(
+        ReflectionNoSearchLLM(),
+        LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder()),
+        DiscoveryEvidenceTool(FakeDiscoveryAgent()),
+    )
+
+    reflected, _ = agent.reflect(make_document(), make_hypothesis())
+
+    assessment = reflected.reflection_assessment
+    assert assessment is not None
+    assert assessment.market_size_score.value is not None
+    assert assessment.replacement_fit_score.value is not None
+    assert assessment.activation_ease_score.value is not None
+    assert assessment.replacement_driver_strength_score.value is not None
+    assert assessment.technical_success_probability.value is not None
+    assert assessment.commercial_success_probability.value is not None
+    assert assessment.market_size_score.is_inferred is True
+    assert assessment.incumbent_price_usd_per_kg.value is not None
+    assert assessment.incumbent_price_usd_per_kg.is_inferred is True
+
+
+def test_reflection_discovery_retains_low_relevance_pages_for_later_scoring():
+    class LowRelevanceClassifier:
+        def heuristic_relevance(self, query, text):
+            return 0.01
+
+        def classify(self, query, page):
+            return EvidenceClassification.model_validate(
+                {
+                    "relevant": False,
+                    "relevance_score": 0.05,
+                    "confidence_score": 0.2,
+                    "application": None,
+                    "incumbent_material": None,
+                    "candidate_materials": [],
+                    "evidence_type": "market or customer need",
+                    "application_requirements": [],
+                    "substitution_drivers": [],
+                    "rationale": "Indirect market context.",
+                    "supporting_quotes": [],
+                    "metadata": {},
+                }
+            )
+
+    tool = DiscoveryEvidenceTool.__new__(DiscoveryEvidenceTool)
+    tool._classifier = LowRelevanceClassifier()
+    tool._config = type("Config", (), {"min_page_characters": 20, "min_snippet_characters": 20})()
+    tool._chunker = TextChunker(chunk_size=80, chunk_overlap=0)
+    page = PageContent(
+        title="Adjacent market report",
+        url="https://example.com/market",
+        search_query="application market size",
+        source_domain="example.com",
+        fetched_at=datetime.now(timezone.utc),
+        text="Market revenue, CAGR, application segmentation, and customer demand context for an adjacent market.",
+    )
+    skipped_pages = []
+
+    candidates = tool._filter_pages("PETG application evidence", [page], skipped_pages)
+    records = tool._classify_and_chunk("run-1", "PETG application evidence", candidates, skipped_pages, [])
+
+    assert len(candidates) == 1
+    assert skipped_pages == []
+    assert records
+    assert records[0].metadata["retained_for_reflection"] is True
+    assert records[0].metadata["classification_relevant"] is False
 
 
 def test_reflection_leaves_unknown_fields_null_when_unresolved():

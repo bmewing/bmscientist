@@ -51,7 +51,9 @@ class ManualEvidenceIngestor:
                 stored_chunks += self._ingest_file(path)
             except ValueError as exc:
                 LOGGER.warning("%s", exc)
-                path.replace(self._target_path(path))
+                target_path = path if self._processed_root in path.parents else self._target_path(path)
+                if path != target_path:
+                    path.replace(target_path)
             except Exception:
                 LOGGER.exception("Manual evidence ingest failed for %s", path)
         if stored_chunks:
@@ -66,14 +68,42 @@ class ManualEvidenceIngestor:
             if self._processed_root in path.parents:
                 continue
             files.append(path)
+        files.extend(self._processed_files_missing_from_store())
         return sorted(files)
+
+    def _processed_files_missing_from_store(self) -> list[Path]:
+        if not hasattr(self._store, "all_rows"):
+            return []
+        try:
+            rows = self._store.all_rows()
+        except Exception:
+            LOGGER.exception("Unable to inspect stored manual evidence; skipping processed-file recovery")
+            return []
+        stored_paths = {
+            str(row.get("source_url", ""))
+            for row in rows
+            if row.get("metadata", {}).get("page_metadata", {}).get("source_type") == "manual-file"
+        }
+        stored_paths.update(
+            str(row.get("metadata", {}).get("page_metadata", {}).get("local_processed_path", ""))
+            for row in rows
+            if row.get("metadata", {}).get("page_metadata", {}).get("local_processed_path")
+        )
+        missing: list[Path] = []
+        for path in self._processed_root.rglob("*"):
+            if not path.is_file():
+                continue
+            if str(path.resolve()) not in stored_paths:
+                missing.append(path)
+        return missing
 
     def _ingest_file(self, path: Path) -> int:
         extracted_text, content_type, extra_metadata = self._read_file(path)
-        target_path = self._target_path(path)
+        target_path = path if self._processed_root in path.parents else self._target_path(path)
         if len(" ".join(extracted_text.split())) < MIN_MANUAL_TEXT_CHARACTERS:
             LOGGER.warning("Skipping manual file with too little text: %s", path)
-            path.replace(target_path)
+            if path != target_path:
+                path.replace(target_path)
             return 0
 
         page = PageContent(
@@ -96,16 +126,12 @@ class ManualEvidenceIngestor:
             },
         )
         classification = self._classifier.classify(MANUAL_QUERY, page)
-        if classification.relevance_score < self._config.min_relevance_score or not classification.relevant:
-            LOGGER.info("Manual file classified below relevance threshold: %s", path.name)
-            path.replace(target_path)
-            return 0
-
         chunk_records = self._build_chunk_records(page, classification)
         vectors = self._embedder.embed_texts([record.chunk_text for record in chunk_records])
         embedded_records = [record.model_copy(update={"vector": vector}) for record, vector in zip(chunk_records, vectors, strict=False)]
 
-        path.replace(target_path)
+        if path != target_path:
+            path.replace(target_path)
         try:
             return self._store.add_chunks(embedded_records)
         except Exception:
@@ -159,6 +185,11 @@ class ManualEvidenceIngestor:
                     metadata={
                         "rationale": classification.rationale,
                         "supporting_quotes": classification.supporting_quotes,
+                        "classification_relevant": classification.relevant,
+                        "classification_relevance_score": classification.relevance_score,
+                        "classification_confidence_score": classification.confidence_score,
+                        "retained_for_reflection": True,
+                        "retention_policy": "retain_manual_file_for_reflection",
                         "page_metadata": page.metadata,
                     },
                 )

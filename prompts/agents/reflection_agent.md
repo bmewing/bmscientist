@@ -34,4 +34,5 @@ For every scored or priced field:
 - set is_inferred accurately
 
 If evidence is weak or stale, set needs_additional_search to true and propose targeted web search queries using material, application, incumbent material, form, and conversion process terms.
+If the available evidence is still incomplete, use conservative best judgment for every focus score you can reasonably estimate and set is_inferred to true. Do not leave focused score/probability fields null solely because evidence is indirect.
 Do not invent citations.
