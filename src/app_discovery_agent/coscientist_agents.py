@@ -1389,6 +1389,7 @@ class MetaReviewAgent:
                 "concept_labels": hypothesis.concept_labels,
                 "ranking_score": hypothesis.ranking_score,
                 "ranking_status": hypothesis.ranking_status,
+                "reflection": RankingAgent._assessment_payload(hypothesis.reflection_assessment),
                 "evidence_gaps": (
                     hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []
                 ),
@@ -1403,6 +1404,9 @@ class MetaReviewAgent:
             document_json=document.model_dump_json(indent=2),
             best_patterns_json=json.dumps(ranking_round.best_patterns, indent=2),
             worst_patterns_json=json.dumps(ranking_round.worst_patterns, indent=2),
+            previous_gaps_json=json.dumps(document.whitespace_gap_notes, indent=2),
+            previous_guidance_json=json.dumps(document.meta_review_generation_guidance, indent=2),
+            gap_persistence_count=document.whitespace_gap_persistence_count,
             hypotheses_json=json.dumps(payload, indent=2),
         )
         return self._llm.complete_json(MetaReviewOutput, system_prompt, user_prompt)
@@ -2033,6 +2037,8 @@ class ReflectionAgent:
 
 
 class CoScientistRunner:
+    DEFAULT_AGENTIC_LOOP_SAFETY_CAP = 12
+
     def __init__(
         self,
         config: AppConfig,
@@ -2245,7 +2251,7 @@ class CoScientistRunner:
         self,
         research_id: str,
         target_final_hypotheses: int | None = None,
-        max_rounds: int = 1,
+        max_rounds: int | None = None,
         evolve_top_k: int = 5,
         evolved_per_round: int = 5,
         regenerated_per_round: int = 5,
@@ -2277,11 +2283,12 @@ class CoScientistRunner:
         total_synthesized = 0
         total_reflected = 0
         automatic_discovery_runs = 0
-        stop_reason = "max_rounds_reached"
+        round_limit = max_rounds if max_rounds is not None else self.DEFAULT_AGENTIC_LOOP_SAFETY_CAP
+        stop_reason = "safety_round_limit_reached" if max_rounds is None else "max_rounds_reached"
         latest_ranking: RankingRound | None = None
         latest_meta_review: MetaReviewRound | None = None
 
-        for round_index in range(1, max_rounds + 1):
+        for round_index in range(1, round_limit + 1):
             latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
             reflected = [
                 hypothesis
@@ -2291,9 +2298,10 @@ class CoScientistRunner:
             if not reflected:
                 stop_reason = "no_active_reflected_hypotheses"
                 break
+            round_label = self._loop_round_label(round_index, max_rounds)
             self._progress_reporter.start(
                 "ranking",
-                f"Ranking ideas (round {round_index}/{max_rounds})",
+                f"Ranking ideas ({round_label})",
                 len(reflected),
             )
             ranking_round, ranked_hypotheses = self._ranking_agent.rank(
@@ -2305,7 +2313,7 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "ranking",
-                f"Ideas ranked (round {round_index}/{max_rounds})",
+                f"Ideas ranked ({round_label})",
                 len(ranked_hypotheses),
                 len(reflected),
             )
@@ -2319,7 +2327,7 @@ class CoScientistRunner:
                 proximity_hypotheses = self._artifact_store.latest_hypotheses(research_id)
                 self._progress_reporter.start(
                     "proximity",
-                    f"Checking idea overlap (round {round_index}/{max_rounds})",
+                    f"Checking idea overlap ({round_label})",
                     len(proximity_hypotheses),
                 )
                 proximity_round, proximity_updates, synthesized_hypotheses = self._proximity_agent.review(
@@ -2340,7 +2348,7 @@ class CoScientistRunner:
                 )
                 self._progress_reporter.complete(
                     "proximity",
-                    f"Idea overlap checked (round {round_index}/{max_rounds})",
+                    f"Idea overlap checked ({round_label})",
                     len(proximity_hypotheses),
                     len(proximity_hypotheses),
                 )
@@ -2352,7 +2360,7 @@ class CoScientistRunner:
                     synthesized_hypotheses,
                     concurrency=reflection_concurrency,
                     phase="synthesized_reflection",
-                    progress_message=f"Reflecting on synthesized ideas (round {round_index}/{max_rounds})",
+                    progress_message=f"Reflecting on synthesized ideas ({round_label})",
                 )
                 total_reflected += len(reflected_synthesized)
                 automatic_discovery_runs += run_count
@@ -2360,7 +2368,7 @@ class CoScientistRunner:
             latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
             self._progress_reporter.start(
                 "meta_review",
-                f"Reviewing portfolio gaps (round {round_index}/{max_rounds})",
+                f"Reviewing portfolio gaps ({round_label})",
             )
             document, meta_review_round = self._meta_review_agent.review(
                 document=document,
@@ -2372,7 +2380,7 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "meta_review",
-                f"Portfolio gaps reviewed (round {round_index}/{max_rounds})",
+                f"Portfolio gaps reviewed ({round_label})",
             )
             latest_meta_review = meta_review_round
             self._artifact_store.save_research_goal(document)
@@ -2387,14 +2395,12 @@ class CoScientistRunner:
                 len(ranking_round.promoted_hypothesis_ids) >= target_final
                 and promoted_scores
                 and min(promoted_scores[:target_final]) >= promotion_score_threshold
-                and (meta_review_round.coverage_sufficient or not meta_review_round.whitespace_gaps)
+                and meta_review_round.coverage_sufficient
             ):
                 stop_reason = "target_portfolio_reached"
                 break
             if not meta_review_round.should_continue:
                 stop_reason = meta_review_round.stop_reason or "meta_review_stop"
-                break
-            if round_index >= max_rounds:
                 break
 
             parent_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in ranked_hypotheses}
@@ -2407,7 +2413,7 @@ class CoScientistRunner:
                 self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "evolve"}))
             self._progress_reporter.start(
                 "evolution",
-                f"Evolving top ideas (round {round_index}/{max_rounds})",
+                f"Evolving top ideas ({round_label})",
                 len(parents),
             )
             evolved = self._evolution_agent.evolve(
@@ -2419,13 +2425,13 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "evolution",
-                f"Top ideas evolved (round {round_index}/{max_rounds})",
+                f"Top ideas evolved ({round_label})",
                 len(evolved),
                 len(parents),
             )
             self._progress_reporter.start(
                 "regeneration",
-                f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                f"Generating replacement ideas ({round_label})",
                 regenerated_per_round,
             )
             regenerated = self._generation_agent.generate_from_meta_review(
@@ -2435,14 +2441,14 @@ class CoScientistRunner:
                 round_index=round_index,
                 on_progress=lambda completed, total, round_index=round_index: self._progress_reporter.advance(
                     "regeneration",
-                    f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                    f"Generating replacement ideas ({self._loop_round_label(round_index, max_rounds)})",
                     completed,
                     total,
                 ),
             )
             self._progress_reporter.complete(
                 "regeneration",
-                f"Replacement ideas generated (round {round_index}/{max_rounds})",
+                f"Replacement ideas generated ({round_label})",
                 len(regenerated),
                 regenerated_per_round,
             )
@@ -2466,7 +2472,7 @@ class CoScientistRunner:
                 new_hypotheses,
                 concurrency=reflection_concurrency,
                 phase="new_reflection",
-                progress_message=f"Reflecting on new ideas (round {round_index}/{max_rounds})",
+                progress_message=f"Reflecting on new ideas ({round_label})",
             )
             total_reflected += len(reflected_new)
             automatic_discovery_runs += run_count
@@ -2504,6 +2510,12 @@ class CoScientistRunner:
             report_path=str(report_path.resolve()),
             stop_reason=stop_reason,
         )
+
+    @staticmethod
+    def _loop_round_label(round_index: int, max_rounds: int | None) -> str:
+        if max_rounds is None:
+            return f"round {round_index}"
+        return f"round {round_index}/{max_rounds}"
 
     def reflect_existing(
         self,

@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+from pydantic import BaseModel
 
 from app_discovery_agent.agent import DiscoveryAgent
 from app_discovery_agent.classify import EvidenceClassifier
@@ -247,3 +250,41 @@ def test_llm_json_coercion_uses_first_balanced_object():
     payload = DeepSeekLLM._coerce_json(content)
 
     assert payload == {"ok": True}
+
+
+def test_llm_json_coercion_escapes_raw_control_characters_inside_strings():
+    content = '{\n  "coverage_assessment": "Line one\nLine two\twith tab",\n  "coverage_sufficient": false\n}'
+
+    payload = DeepSeekLLM._coerce_json(content)
+
+    assert payload["coverage_assessment"] == "Line one\nLine two\twith tab"
+    assert payload["coverage_sufficient"] is False
+
+
+def test_complete_json_repairs_malformed_model_output_with_second_pass():
+    class SimpleOutput(BaseModel):
+        title: str
+        summary: str
+
+    responses = [
+        '{\n  "title": "RPET sheet for "signage"",\n  "summary": "Clear recycled sheet for printed display applications."\n}',
+        '{\n  "title": "RPET sheet for \\"signage\\"",\n  "summary": "Clear recycled sheet for printed display applications."\n}',
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_create_completion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=responses.pop(0)))]
+        )
+
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "test-model"
+    llm._create_completion = fake_create_completion
+
+    result = llm.complete_json(SimpleOutput, "system", "user")
+
+    assert result.title == 'RPET sheet for "signage"'
+    assert len(calls) == 2
+    assert calls[1]["temperature"] == 0.0
+    assert "malformed json-like content" in str(calls[1]["messages"][1]["content"]).lower()

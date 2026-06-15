@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -977,6 +978,71 @@ def test_meta_review_tracks_gap_persistence_and_requests_one_last_loop():
     assert meta_round.stop_reason == "meta_review_gap_persistence"
 
 
+def test_meta_review_allows_one_retry_when_same_gap_reappears():
+    document = make_document().model_copy(
+        update={
+            "whitespace_gap_notes": ["Need stronger coverage in non-medical rigid clear applications."],
+            "whitespace_gap_persistence_count": 0,
+        }
+    )
+    ranking_round = RankingAgent(RankingLLM()).rank(make_document(), [make_reflected_hypothesis()], 1, 1, 1)[0]
+    agent = MetaReviewAgent(MetaReviewLLM())
+
+    updated_document, meta_round = agent.review(
+        document=document,
+        hypotheses=[make_reflected_hypothesis()],
+        ranking_round=ranking_round,
+        round_index=2,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
+    )
+
+    assert updated_document.whitespace_gap_persistence_count == 1
+    assert meta_round.should_continue is True
+    assert meta_round.stop_reason is None
+
+
+def test_meta_review_prompt_includes_previous_gaps_and_persistence_state():
+    class RecordingMetaReviewLLM:
+        def __init__(self):
+            self.user_prompt = None
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            self.user_prompt = user_prompt
+            return response_model.model_validate(
+                {
+                    "whitespace_gaps": [],
+                    "generation_guidance": [],
+                    "coverage_assessment": "Coverage is sufficient.",
+                    "gap_shrinkage_status": "improved",
+                    "coverage_sufficient": True,
+                }
+            )
+
+    llm = RecordingMetaReviewLLM()
+    document = make_document().model_copy(
+        update={
+            "whitespace_gap_notes": ["Need stronger coverage in non-medical rigid clear applications."],
+            "meta_review_generation_guidance": ["Expand into adjacent clear rigid consumer applications."],
+            "whitespace_gap_persistence_count": 1,
+        }
+    )
+    ranking_round = RankingAgent(RankingLLM()).rank(make_document(), [make_reflected_hypothesis()], 1, 1, 1)[0]
+
+    MetaReviewAgent(llm).review(
+        document=document,
+        hypotheses=[make_reflected_hypothesis()],
+        ranking_round=ranking_round,
+        round_index=2,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
+    )
+
+    assert "Previous whitespace gaps" in llm.user_prompt
+    assert "Current unresolved-gap persistence count" in llm.user_prompt
+    assert "Expand into adjacent clear rigid consumer applications." in llm.user_prompt
+
+
 def test_final_portfolio_agent_writes_conclusive_report_with_validation_gaps():
     class FinalReportLLM:
         def __init__(self):
@@ -1237,6 +1303,28 @@ def test_coscientist_store_moves_hypothesis_file_between_stage_folders(tmp_path)
     assert not generated_path.exists()
     assert reflected_path.exists()
     assert snapshots[0].status == "reflected"
+
+
+def test_coscientist_store_load_hypothesis_snapshots_tolerates_transient_missing_files(tmp_path, monkeypatch):
+    store = CoScientistStore(tmp_path / "coscientist")
+    hypothesis = make_hypothesis()
+    store.append_hypothesis_snapshot(hypothesis)
+    path = store.hypothesis_file_path(hypothesis)
+    original_read_text = Path.read_text
+    state = {"raised": False}
+
+    def flaky_read_text(self, *args, **kwargs):
+        if self == path and not state["raised"]:
+            state["raised"] = True
+            raise FileNotFoundError(path)
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    snapshots = store.load_hypothesis_snapshots(hypothesis.research_id)
+
+    assert len(snapshots) == 1
+    assert snapshots[0].hypothesis_id == hypothesis.hypothesis_id
 
 
 def test_coscientist_store_uses_evolve_and_retired_queue_folders(tmp_path):

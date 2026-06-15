@@ -42,6 +42,7 @@ class GraphMarketEvidence:
             "Market_HAS_APPLICATION_Application",
             "Market_USES_Product",
             "Market_IN_GEOGRAPHY_Geography",
+            "Product_USED_IN_Application",
         ):
             for edge in self._edges.get(edge_type, []):
                 score = self._score_edge(edge_type, edge, document, hypothesis)
@@ -85,6 +86,7 @@ class GraphMarketEvidence:
                         "Market_HAS_APPLICATION_Application",
                         "Market_USES_Product",
                         "Market_IN_GEOGRAPHY_Geography",
+                        "Product_USED_IN_Application",
                     )
                 }
             except Exception:
@@ -110,6 +112,48 @@ class GraphMarketEvidence:
         hypothesis: Hypothesis,
     ) -> float:
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
+        if edge_type == "Product_USED_IN_Application":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
+            product_tokens = self._tokens(product.get("name")) | self._tokens(edge.get("product_id"))
+            application_tokens = self._tokens(application.get("name")) | self._tokens(edge.get("application_id"))
+            material_terms = self._tokens(
+                " ".join(
+                    item
+                    for item in [
+                        hypothesis.candidate_material,
+                        hypothesis.incumbent_material,
+                        hypothesis.next_best_competitive_alternative,
+                        " ".join(document.material_scope),
+                        " ".join(document.preferred_candidate_materials),
+                        " ".join(document.target_incumbent_materials),
+                    ]
+                    if item
+                )
+            )
+            application_terms = self._tokens(
+                " ".join(
+                    item
+                    for item in [
+                        hypothesis.application,
+                        hypothesis.market_segment,
+                        hypothesis.product_type,
+                        " ".join(document.application_scope),
+                        document.raw_goal,
+                    ]
+                    if item
+                )
+            )
+            score = 0.0
+            if product_tokens & material_terms:
+                score += 4.0
+            if application_tokens & application_terms:
+                score += 4.0
+            if edge.get("critical_to_quality_json"):
+                score += 1.0
+            if self._has_market_metrics(edge) or self._number(edge.get("volume_value")) is not None:
+                score += 1.0
+            return score
         target = self._target_node(edge_type, edge)
         market_tokens = self._tokens(market.get("name")) | self._tokens(market.get("primary_slug"))
         target_tokens = self._tokens(target.get("name")) | self._tokens(target.get("node_type"))
@@ -167,41 +211,62 @@ class GraphMarketEvidence:
             return self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
         if edge_type == "Market_IN_GEOGRAPHY_Geography":
             return self._nodes.get("Geography", {}).get(str(edge.get("geo_id")), {})
+        if edge_type == "Product_USED_IN_Application":
+            return self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
         return {}
 
     def _row_from_edge(self, edge_type: str, edge: dict[str, Any], score: float) -> dict[str, Any] | None:
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         target = self._target_node(edge_type, edge)
-        if not market:
+        if not market and edge_type != "Product_USED_IN_Application":
             return None
         relationship = {
             "Market_HAS_APPLICATION_Application": "has application",
             "Market_USES_Product": "uses product",
             "Market_IN_GEOGRAPHY_Geography": "is measured in geography",
+            "Product_USED_IN_Application": "is used in application",
         }.get(edge_type, edge_type)
+        product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
         target_name = target.get("name") or edge.get("application_id") or edge.get("product_id") or edge.get("geo_id")
         metrics_text = self._metrics_text(edge)
-        notes = self._json_notes(edge, ["highlights_json", "industry_trends_json", "data_book_summary_json"], limit=4)
+        notes = self._json_notes(
+            edge,
+            ["critical_to_quality_json", "highlights_json", "industry_trends_json", "data_book_summary_json"],
+            limit=4,
+        )
+        source_url = (
+            edge.get("source_url")
+            or edge.get("page_url")
+            or edge.get("target_url")
+            or market.get("canonical_url")
+            or str(self._graph_path.resolve())
+        )
+        subject_name = product.get("name") if edge_type == "Product_USED_IN_Application" else market.get("name")
         chunk_text = " ".join(
             item
             for item in [
                 f"Graph market data from {market.get('source_vendor') or 'offline market graph'}: "
-                f"{market.get('name')} {relationship} {target_name}.",
+                f"{subject_name} {relationship} {target_name}.",
                 metrics_text,
                 " ".join(notes),
-                f"Source URL: {edge.get('page_url') or edge.get('target_url') or market.get('canonical_url')}.",
+                f"Source URL: {source_url}.",
             ]
             if item
         )
-        source_url = edge.get("page_url") or edge.get("target_url") or market.get("canonical_url") or str(self._graph_path.resolve())
         row_id = f"graph:{edge_type}:{edge.get('edge_id')}"
         return {
             "id": row_id,
             "source_url": source_url,
             "source_title": "Offline graph market data",
-            "application": target_name if edge_type == "Market_HAS_APPLICATION_Application" else None,
+            "application": target_name if edge_type in ("Market_HAS_APPLICATION_Application", "Product_USED_IN_Application") else None,
             "incumbent_material": None,
-            "candidate_materials": [target_name] if edge_type == "Market_USES_Product" and target_name else [],
+            "candidate_materials": (
+                [target_name]
+                if edge_type == "Market_USES_Product" and target_name
+                else [product.get("name")]
+                if edge_type == "Product_USED_IN_Application" and product.get("name")
+                else []
+            ),
             "relevance_score": min(0.98, 0.55 + (score * 0.04)),
             "retrieved_at": edge.get("retrieved_at") or edge.get("updated_at") or edge.get("created_at"),
             "chunk_text": chunk_text[:1800],
@@ -210,6 +275,8 @@ class GraphMarketEvidence:
                 "edge_type": edge_type,
                 "market_id": edge.get("market_id"),
                 "market_name": market.get("name"),
+                "product_id": edge.get("product_id"),
+                "application_id": edge.get("application_id"),
                 "target_name": target_name,
                 "geo_id": edge.get("geo_id"),
                 "revenue_value": self._number(edge.get("revenue_value")),
@@ -217,6 +284,15 @@ class GraphMarketEvidence:
                 "forecast_revenue_value": self._number(edge.get("forecast_revenue_value")),
                 "forecast_revenue_year": self._number(edge.get("forecast_revenue_year")),
                 "cagr_value": self._number(edge.get("cagr_value")),
+                "volume_value": self._number(edge.get("volume_value")),
+                "volume_unit": edge.get("volume_unit"),
+                "volume_year": self._number(edge.get("volume_year")),
+                "price_value": self._number(edge.get("price_value")),
+                "price_currency": edge.get("price_currency"),
+                "price_unit": edge.get("price_unit"),
+                "price_year": self._number(edge.get("price_year")),
+                "evidence_hash": edge.get("evidence_hash"),
+                "source_chunk_id": edge.get("source_chunk_id"),
                 "unit": edge.get("unit"),
                 "currency": edge.get("currency"),
                 "unit_scale": edge.get("unit_scale"),
@@ -241,6 +317,14 @@ class GraphMarketEvidence:
                 f"CAGR is {cagr:g}% from {GraphMarketEvidence._year(edge.get('cagr_start_year'))} "
                 f"to {GraphMarketEvidence._year(edge.get('cagr_end_year'))}."
             )
+        volume = GraphMarketEvidence._number(edge.get("volume_value"))
+        if volume is not None:
+            pieces.append(f"Volume was {volume:g} {edge.get('volume_unit') or 'reported units'} in {GraphMarketEvidence._year(edge.get('volume_year'))}.")
+        price = GraphMarketEvidence._number(edge.get("price_value"))
+        if price is not None:
+            unit_text = edge.get("price_unit") or "reported unit"
+            currency = edge.get("price_currency") or ""
+            pieces.append(f"Price was {price:g} {currency}/{unit_text} in {GraphMarketEvidence._year(edge.get('price_year'))}.")
         return " ".join(pieces)
 
     @staticmethod
@@ -274,7 +358,10 @@ class GraphMarketEvidence:
 
     @staticmethod
     def _has_market_metrics(edge: dict[str, Any]) -> bool:
-        return any(GraphMarketEvidence._number(edge.get(key)) is not None for key in ("revenue_value", "forecast_revenue_value", "cagr_value"))
+        return any(
+            GraphMarketEvidence._number(edge.get(key)) is not None
+            for key in ("revenue_value", "forecast_revenue_value", "cagr_value", "volume_value", "price_value")
+        )
 
     @staticmethod
     def _number(value: Any) -> float | None:

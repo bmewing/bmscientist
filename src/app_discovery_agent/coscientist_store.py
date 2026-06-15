@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import re
 import secrets
 from pathlib import Path
@@ -14,6 +15,9 @@ from app_discovery_agent.coscientist_models import (
     RankingRound,
     ResearchGoalDocument,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CoScientistStore:
@@ -320,10 +324,33 @@ class CoScientistStore:
         return reclaimed
 
     def load_hypothesis_snapshots(self, research_id: str) -> list[Hypothesis]:
-        return [
-            Hypothesis.model_validate_json(path.read_text(encoding="utf-8"))
-            for path in self._hypothesis_files(research_id)
-        ]
+        last_missing: FileNotFoundError | None = None
+        for attempt in range(3):
+            snapshots: list[Hypothesis] = []
+            paths = self._hypothesis_files(research_id)
+            saw_missing = False
+            for path in paths:
+                try:
+                    snapshots.append(Hypothesis.model_validate_json(path.read_text(encoding="utf-8")))
+                except FileNotFoundError as exc:
+                    last_missing = exc
+                    saw_missing = True
+                    break
+            if not saw_missing:
+                return snapshots
+        if last_missing is not None:
+            LOGGER.warning(
+                "Hypothesis snapshot changed during load for %s; returning best-effort snapshot set. Last missing path: %s",
+                research_id,
+                last_missing,
+            )
+        snapshots: list[Hypothesis] = []
+        for path in self._hypothesis_files(research_id):
+            try:
+                snapshots.append(Hypothesis.model_validate_json(path.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                continue
+        return snapshots
 
     def latest_hypotheses(self, research_id: str) -> list[Hypothesis]:
         latest: dict[str, Hypothesis] = {}

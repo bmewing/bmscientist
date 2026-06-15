@@ -66,6 +66,19 @@ def test_normalize_table_name_handles_nested_shapes():
     assert LanceEvidenceStore._normalize_table_name("evidence_chunks") == "evidence_chunks"
     assert LanceEvidenceStore._normalize_table_name(["evidence_chunks", "meta"]) == "evidence_chunks"
     assert LanceEvidenceStore._normalize_table_name({"name": "evidence_chunks"}) == "evidence_chunks"
+    assert LanceEvidenceStore._normalize_table_names({"tables": ["evidence_chunks"], "page_token": None}) == ["evidence_chunks"]
+    assert LanceEvidenceStore._normalize_table_names(("tables", ["evidence_chunks"])) == ["evidence_chunks"]
+
+
+def test_table_names_handles_lancedb_dict_listing():
+    class FakeDB:
+        def list_tables(self):
+            return {"tables": ["evidence_chunks"], "page_token": None}
+
+    store = LanceEvidenceStore.__new__(LanceEvidenceStore)
+    store._db = FakeDB()
+
+    assert store._table_names() == {"evidence_chunks"}
 
 
 def test_store_reuses_existing_table_across_runs(tmp_path):

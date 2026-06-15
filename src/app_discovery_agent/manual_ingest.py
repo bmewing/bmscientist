@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app_discovery_agent.chunking import TextChunker
@@ -29,12 +30,14 @@ class ManualEvidenceIngestor:
         chunker: TextChunker,
         embedder: LocalEmbedder,
         store: LanceEvidenceStore,
+        graph_enrichment_callback: Callable[[str, list[ChunkRecord]], None] | None = None,
     ):
         self._config = config
         self._classifier = classifier
         self._chunker = chunker
         self._embedder = embedder
         self._store = store
+        self._graph_enrichment_callback = graph_enrichment_callback
         self._root = Path("data/manually-obtained")
         self._processed_root = self._root / "processed"
         self._root.mkdir(parents=True, exist_ok=True)
@@ -133,7 +136,10 @@ class ManualEvidenceIngestor:
         if path != target_path:
             path.replace(target_path)
         try:
-            return self._store.add_chunks(embedded_records)
+            stored_count = self._store.add_chunks(embedded_records)
+            if self._graph_enrichment_callback is not None:
+                self._graph_enrichment_callback(MANUAL_QUERY, embedded_records)
+            return stored_count
         except Exception:
             if target_path.exists() and not path.exists():
                 target_path.replace(path)

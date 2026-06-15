@@ -14,12 +14,15 @@ from app_discovery_agent.classify import EvidenceClassifier
 from app_discovery_agent.config import AppConfig
 from app_discovery_agent.embeddings import LocalEmbedder
 from app_discovery_agent.extract import PageFetcher, extract_domain
+from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
 from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
 from app_discovery_agent.models import (
     ChunkRecord,
     DiscoverySummary,
     EvidenceClassification,
+    GraphEnrichmentProposal,
+    GraphEnrichmentValidation,
     PageContent,
     SearchQueryPlan,
     SearchResultItem,
@@ -45,6 +48,9 @@ class DiscoveryState(TypedDict, total=False):
     candidate_pages: list[PageContent]
     classifications: list[dict[str, Any]]
     chunk_records: list[ChunkRecord]
+    graph_enrichment_proposals: list[GraphEnrichmentProposal]
+    graph_enrichment_validations: list[GraphEnrichmentValidation]
+    graph_enrichment_accepted: int
     summary: DiscoverySummary
     skipped_pages: list[dict[str, Any]]
     errors: list[str]
@@ -62,12 +68,16 @@ class DiscoveryAgent:
         self._chunker = TextChunker()
         self._embedder = LocalEmbedder(config)
         self._store = LanceEvidenceStore(config.resolved_lancedb_path())
+        self._graph_enrichment_proposer = GraphEnrichmentProposer(self._llm)
+        self._graph_enrichment_validator = GraphEnrichmentValidator(self._llm)
+        self._graph_enrichment_store = GraphEnrichmentStore()
         self._manual_ingestor = ManualEvidenceIngestor(
             config,
             self._classifier,
             self._chunker,
             self._embedder,
             self._store,
+            self._enrich_manual_records,
         )
         self._manual_ingestor.ingest_pending_files()
         self._graph = self._build_graph()
@@ -83,6 +93,9 @@ class DiscoveryAgent:
         graph.add_node("chunk_content", self.chunk_content)
         graph.add_node("embed_chunks", self.embed_chunks)
         graph.add_node("write_to_lancedb", self.write_to_lancedb)
+        graph.add_node("propose_graph_enrichments", self.propose_graph_enrichments)
+        graph.add_node("validate_graph_enrichments", self.validate_graph_enrichments)
+        graph.add_node("write_graph_enrichments", self.write_graph_enrichments)
         graph.add_node("summarize_discoveries", self.summarize_discoveries)
 
         graph.add_edge(START, "plan_search_queries")
@@ -94,7 +107,10 @@ class DiscoveryAgent:
         graph.add_edge("classify_evidence", "chunk_content")
         graph.add_edge("chunk_content", "embed_chunks")
         graph.add_edge("embed_chunks", "write_to_lancedb")
-        graph.add_edge("write_to_lancedb", "summarize_discoveries")
+        graph.add_edge("write_to_lancedb", "propose_graph_enrichments")
+        graph.add_edge("propose_graph_enrichments", "validate_graph_enrichments")
+        graph.add_edge("validate_graph_enrichments", "write_graph_enrichments")
+        graph.add_edge("write_graph_enrichments", "summarize_discoveries")
         graph.add_edge("summarize_discoveries", END)
         return graph.compile()
 
@@ -156,6 +172,9 @@ class DiscoveryAgent:
         state.update(self.chunk_content(state))
         state.update(self.embed_chunks(state))
         state.update(self.write_to_lancedb(state))
+        state.update(self.propose_graph_enrichments(state))
+        state.update(self.validate_graph_enrichments(state))
+        state.update(self.write_graph_enrichments(state))
         state.update(self.summarize_discoveries(state))
         return state["summary"]
 
@@ -339,6 +358,62 @@ class DiscoveryAgent:
         LOGGER.info("Stored %s chunks in LanceDB", stored_count)
         return state
 
+    def propose_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+        try:
+            proposals = self._graph_enrichment_proposer.propose(
+                state["original_query"],
+                state.get("chunk_records", []),
+            )
+            return {"graph_enrichment_proposals": proposals}
+        except Exception as exc:
+            LOGGER.exception("Graph enrichment proposal failed for run %s", state.get("run_id"))
+            state.setdefault("errors", []).append(f"graph_enrichment_proposal:{exc}")
+            return {"graph_enrichment_proposals": []}
+
+    def validate_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+        try:
+            validations = self._graph_enrichment_validator.validate(
+                state.get("graph_enrichment_proposals", []),
+                state.get("chunk_records", []),
+            )
+            return {"graph_enrichment_validations": validations}
+        except Exception as exc:
+            LOGGER.exception("Graph enrichment validation failed for run %s", state.get("run_id"))
+            state.setdefault("errors", []).append(f"graph_enrichment_validation:{exc}")
+            return {"graph_enrichment_validations": []}
+
+    def write_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+        try:
+            accepted = self._graph_enrichment_store.write(
+                state.get("graph_enrichment_proposals", []),
+                state.get("graph_enrichment_validations", []),
+                state["run_id"],
+                state["original_query"],
+            )
+            raw_path = Path("data/raw") / f'{state["run_id"]}_graph_enrichments.json'
+            raw_path.write_text(
+                json.dumps(
+                    {
+                        "proposals": [
+                            proposal.model_dump(mode="json")
+                            for proposal in state.get("graph_enrichment_proposals", [])
+                        ],
+                        "validations": [
+                            validation.model_dump(mode="json")
+                            for validation in state.get("graph_enrichment_validations", [])
+                        ],
+                        "accepted": accepted,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return {"graph_enrichment_accepted": accepted}
+        except Exception as exc:
+            LOGGER.exception("Graph enrichment write failed for run %s", state.get("run_id"))
+            state.setdefault("errors", []).append(f"graph_enrichment_write:{exc}")
+            return {"graph_enrichment_accepted": 0}
+
     def summarize_discoveries(self, state: DiscoveryState) -> DiscoveryState:
         notable_applications = sorted(
             {
@@ -380,6 +455,8 @@ class DiscoveryAgent:
             fetched_pages=len(state.get("fetched_pages", [])),
             relevant_pages=len(state.get("classifications", [])),
             stored_chunks=len(state.get("chunk_records", [])),
+            graph_enrichment_proposals=len(state.get("graph_enrichment_proposals", [])),
+            graph_enrichment_accepted=state.get("graph_enrichment_accepted", 0),
             opportunity_summary=narrative,
             notable_applications=notable_applications,
             evidence_gaps=[
@@ -460,6 +537,19 @@ class DiscoveryAgent:
     def _compose_partial_text(result: SearchResultItem) -> str:
         parts = [result.title.strip(), result.summary.strip(), result.snippet.strip()]
         return "\n\n".join(part for part in parts if part)
+
+    def _enrich_manual_records(self, original_query: str, records: list[ChunkRecord]) -> None:
+        try:
+            proposals = self._graph_enrichment_proposer.propose(original_query, records)
+            validations = self._graph_enrichment_validator.validate(proposals, records)
+            accepted = self._graph_enrichment_store.write(proposals, validations, records[0].run_id if records else "manual", original_query)
+            LOGGER.info(
+                "Graph enrichment from manual evidence produced %s proposals and %s accepted claims",
+                len(proposals),
+                accepted,
+            )
+        except Exception:
+            LOGGER.exception("Manual graph enrichment failed")
 
     @property
     def store(self) -> LanceEvidenceStore:
