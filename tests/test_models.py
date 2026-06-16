@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app_discovery_agent.agent import DiscoveryAgent
 from app_discovery_agent.classify import EvidenceClassifier
 from app_discovery_agent.chunking import TextChunker
+from app_discovery_agent.coscientist_models import HypothesisGenerationOutput
 from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
 
@@ -288,3 +289,24 @@ def test_complete_json_repairs_malformed_model_output_with_second_pass():
     assert len(calls) == 2
     assert calls[1]["temperature"] == 0.0
     assert "malformed json-like content" in str(calls[1]["messages"][1]["content"]).lower()
+
+
+def test_hypothesis_generation_output_coerces_list_strategic_rationale():
+    payload = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "RPET for blister packaging",
+                    "summary": "Targets rigid clear packaging.",
+                    "strategic_rationale": [
+                        "Bias for materials of commercial interest",
+                        "Rapid monetization",
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload.hypotheses[0].strategic_rationale == (
+        "Bias for materials of commercial interest; Rapid monetization"
+    )

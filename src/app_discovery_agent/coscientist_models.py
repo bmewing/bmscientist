@@ -49,6 +49,25 @@ def short_title_from_text(text: Any) -> str:
     return (first_sentence or cleaned)[:120]
 
 
+def coerce_text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, dict):
+        for key in ("value", "text", "rationale", "summary", "description"):
+            nested = value.get(key)
+            if nested is not None:
+                return coerce_text_value(nested)
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = [coerce_text_value(item) for item in value]
+        return "; ".join(part for part in parts if part)
+    return str(value).strip()
+
+
 def normalize_confidence_value(value: Any) -> float:
     if value is None:
         return 0.0
@@ -210,7 +229,6 @@ class AssessmentMetric(BaseModel):
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
 
-
 class PriceMetric(BaseModel):
     value: float | None = None
     rationale: str = Field(default="")
@@ -367,6 +385,11 @@ class Hypothesis(BaseModel):
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
 
+    @field_validator("strategic_rationale", mode="before")
+    @classmethod
+    def normalize_hypothesis_strategic_rationale(cls, value: Any) -> str:
+        return coerce_text_value(value)
+
 
 class HypothesisSeed(BaseModel):
     title: str
@@ -463,6 +486,11 @@ class HypothesisSeed(BaseModel):
     @classmethod
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
+
+    @field_validator("strategic_rationale", mode="before")
+    @classmethod
+    def normalize_seed_strategic_rationale(cls, value: Any) -> str:
+        return coerce_text_value(value)
 
 
 class HypothesisGenerationOutput(BaseModel):
