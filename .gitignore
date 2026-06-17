@@ -23,5 +23,6 @@ data/lancedb/*
 !data/lancedb/.gitkeep
 data/coscientist/*
 !data/coscientist/.gitkeep
+data/*
 AGENTS.md
 .env
