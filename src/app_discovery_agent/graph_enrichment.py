@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 import re
+import secrets
+import time
 import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -13,6 +15,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
 
 from app_discovery_agent.models import (
     ChunkRecord,
@@ -27,6 +30,47 @@ from app_discovery_agent.prompt_library import PROMPTS
 
 LOGGER = logging.getLogger(__name__)
 GRAPH_PATH = Path("data/graph")
+
+
+class FileLock:
+    def __init__(self, file_path: Path, timeout_seconds: float = 30.0, poll_interval: float = 0.1):
+        self.lock_file = file_path.with_suffix(".lock")
+        self.timeout = timeout_seconds
+        self.poll_interval = poll_interval
+        self.has_lock = False
+
+    def __enter__(self):
+        start_time = time.time()
+        lock_id = secrets.token_hex(8)
+        while True:
+            try:
+                # Try to create the lock file atomically
+                self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+                self.lock_file.touch(exist_ok=False)
+                self.lock_file.write_text(lock_id, encoding="utf-8")
+                self.has_lock = True
+                return self
+            except (FileExistsError, OSError):
+                # Clean up old stale locks (> 5 minutes)
+                try:
+                    if self.lock_file.exists():
+                        mtime = self.lock_file.stat().st_mtime
+                        if time.time() - mtime > 300:
+                            self.lock_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                if time.time() - start_time > self.timeout:
+                    LOGGER.warning("File lock timeout for %s, proceeding without lock", self.lock_file)
+                    return self
+                time.sleep(self.poll_interval + secrets.SystemRandom().uniform(0.0, 0.05))
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.has_lock:
+            try:
+                self.lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 class GraphEnrichmentProposer:
@@ -119,11 +163,11 @@ class GraphEnrichmentValidator:
 
 
 class GraphEnrichmentStore:
-    def __init__(self, graph_path: Path = GRAPH_PATH, min_promotion_confidence: float = 0.6):
-        self._graph_path = graph_path
-        self._nodes_path = graph_path / "nodes"
-        self._edges_path = graph_path / "edges"
-        self._enrichment_path = graph_path / "enrichment"
+    def __init__(self, graph_path: Path | None = None, min_promotion_confidence: float = 0.6):
+        self._graph_path = graph_path if graph_path is not None else GRAPH_PATH
+        self._nodes_path = self._graph_path / "nodes"
+        self._edges_path = self._graph_path / "edges"
+        self._enrichment_path = self._graph_path / "enrichment"
         self._min_promotion_confidence = min_promotion_confidence
 
     def write(
@@ -265,42 +309,43 @@ class GraphEnrichmentStore:
         node_id = f"{prefix}:{slugify(safe_name)}"
         schema = NODE_SCHEMAS[label]
         path = self._nodes_path / f"{label}.parquet"
-        rows = rows_by_key(path, schema, key)
-        now = now_iso()
-        if node_id not in rows:
-            row = empty_row(schema)
-            row.update(
-                {
-                    key: node_id,
-                    "name": safe_name,
-                    "normalized_name": normalized_name,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            )
-            if "node_type" in schema.names and node_type:
-                row["node_type"] = node_type
-            if "aliases_json" in schema.names:
-                row["aliases_json"] = json.dumps(sorted(set(aliases or []), key=str.lower), sort_keys=True)
-            if label == "Market":
-                row["primary_slug"] = f"{slugify(safe_name)}-market"
-                row["canonical_url"] = None
-                row["source_vendor"] = "evidence-enrichment"
-            rows[node_id] = row
-        else:
-            if "aliases_json" in schema.names:
-                existing_aliases = parse_json_list(rows[node_id].get("aliases_json"))
-                merged_aliases = sorted(
+        with FileLock(path):
+            rows = rows_by_key(path, schema, key)
+            now = now_iso()
+            if node_id not in rows:
+                row = empty_row(schema)
+                row.update(
                     {
-                        alias.strip()
-                        for alias in [*existing_aliases, *(aliases or [])]
-                        if alias and normalize_name(alias) != normalize_name(rows[node_id].get("name"))
-                    },
-                    key=str.lower,
+                        key: node_id,
+                        "name": safe_name,
+                        "normalized_name": normalized_name,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
                 )
-                rows[node_id]["aliases_json"] = json.dumps(merged_aliases, sort_keys=True)
-            rows[node_id]["updated_at"] = now
-        write_rows(path, list(rows.values()), schema)
+                if "node_type" in schema.names and node_type:
+                    row["node_type"] = node_type
+                if "aliases_json" in schema.names:
+                    row["aliases_json"] = json.dumps(sorted(set(aliases or []), key=str.lower), sort_keys=True)
+                if label == "Market":
+                    row["primary_slug"] = f"{slugify(safe_name)}-market"
+                    row["canonical_url"] = None
+                    row["source_vendor"] = "evidence-enrichment"
+                rows[node_id] = row
+            else:
+                if "aliases_json" in schema.names:
+                    existing_aliases = parse_json_list(rows[node_id].get("aliases_json"))
+                    merged_aliases = sorted(
+                        {
+                            alias.strip()
+                            for alias in [*existing_aliases, *(aliases or [])]
+                            if alias and normalize_name(alias) != normalize_name(rows[node_id].get("name"))
+                        },
+                        key=str.lower,
+                    )
+                    rows[node_id]["aliases_json"] = json.dumps(merged_aliases, sort_keys=True)
+                rows[node_id]["updated_at"] = now
+            write_rows(path, list(rows.values()), schema)
         return node_id
 
     def _append_product_application_edge(
@@ -496,22 +541,351 @@ class GraphEnrichmentStore:
         )
         return row
 
+    def promote_hypothesis(self, hypothesis: Any) -> None:
+        """
+        Promotes a reflected hypothesis directly to the knowledge graph under data/graph/.
+        This maps:
+        - Product (candidate_material)
+        - Product (incumbent_material)
+        - Application (application)
+        - Market (market_segment)
+        - Edges:
+          - Product_USED_IN_Application (candidate_material -> application)
+          - Product_USED_IN_Application (incumbent_material -> application)
+          - Market_HAS_APPLICATION_Application (market -> application)
+          - Market_USES_Product (market -> candidate_material)
+          - Market_USES_Product (market -> incumbent_material)
+        """
+        self._nodes_path.mkdir(parents=True, exist_ok=True)
+        self._edges_path.mkdir(parents=True, exist_ok=True)
+        self._enrichment_path.mkdir(parents=True, exist_ok=True)
+
+        candidate_mat = (hypothesis.candidate_material or "").strip()
+        incumbent_mat = (hypothesis.incumbent_material or "").strip()
+        app_name = (hypothesis.application or "").strip()
+        market_name = (hypothesis.market_segment or "").strip()
+
+        # We must have at least candidate and application to build displacement edges
+        if not candidate_mat or not app_name:
+            return
+
+        now = now_iso()
+        evidence_hash = hashlib.sha256(f"hypothesis:{hypothesis.hypothesis_id}".encode("utf-8")).hexdigest()
+        source_chunk_id = f"hypothesis:{hypothesis.hypothesis_id}"
+        source_title = f"Hypothesis: {hypothesis.title}"
+        source_url = f"coscientist://research/{hypothesis.research_id}/hypothesis/{hypothesis.hypothesis_id}"
+
+        # 1. Create/Ensure Nodes
+        # Candidate Product
+        candidate_slug = slugify(candidate_mat)
+        candidate_id = f"product:{candidate_slug}"
+        self._ensure_node("Product", candidate_mat, "product_id", "product")
+
+        # Incumbent Product
+        incumbent_id = None
+        if incumbent_mat:
+            incumbent_slug = slugify(incumbent_mat)
+            incumbent_id = f"product:{incumbent_slug}"
+            self._ensure_node("Product", incumbent_mat, "product_id", "product")
+
+        # Application
+        app_slug = slugify(app_name)
+        application_id = f"application:{app_slug}"
+        self._ensure_node("Application", app_name, "application_id", "application")
+
+        # Market
+        market_id = None
+        if market_name:
+            market_slug = slugify(market_name)
+            market_id = f"market:{market_slug}"
+            self._ensure_node("Market", market_name, "market_id", None)
+
+        # Retrieve reflection assessments if available
+        assessment = hypothesis.reflection_assessment
+        confidence = 0.8  # default high confidence since it was generated and reflected
+        if assessment:
+            # Derive confidence from technical & commercial success probabilities if available
+            tech_prob = getattr(assessment.technical_success_probability, "value", None)
+            comm_prob = getattr(assessment.commercial_success_probability, "value", None)
+            if tech_prob is not None and comm_prob is not None:
+                confidence = float(tech_prob + comm_prob) / 2.0
+            elif tech_prob is not None:
+                confidence = float(tech_prob)
+            elif comm_prob is not None:
+                confidence = float(comm_prob)
+
+        # 2. Candidate Material -> Application Edge
+        cand_edge_id = stable_id("Product_USED_IN_Application", candidate_id, application_id, evidence_hash)
+        
+        # Build Critical to Quality JSON from requirements
+        ctq_json = json.dumps(hypothesis.application_requirements, sort_keys=True)
+        
+        # Build pricing metrics if available
+        nbca_price = None
+        price_unit = None
+        price_currency = None
+        if assessment and assessment.nbca_price_usd_per_kg and assessment.nbca_price_usd_per_kg.value is not None:
+            nbca_price = float(assessment.nbca_price_usd_per_kg.value)
+            price_unit = "kg"
+            price_currency = "USD"
+
+        candidate_edge_row = empty_row(PRODUCT_APPLICATION_SCHEMA)
+        candidate_edge_row.update({
+            "edge_id": cand_edge_id,
+            "product_id": candidate_id,
+            "application_id": application_id,
+            "market_id": market_id,
+            "relationship_role": "candidate_replacement",
+            "volume_value": None,
+            "volume_unit": None,
+            "volume_year": None,
+            "price_value": nbca_price,
+            "price_currency": price_currency,
+            "price_unit": price_unit,
+            "price_year": datetime.now(timezone.utc).year,
+            "critical_to_quality_json": ctq_json,
+            "source_chunk_id": source_chunk_id,
+            "source_url": source_url,
+            "source_title": source_title,
+            "evidence_hash": evidence_hash,
+            "supporting_quote": hypothesis.summary,
+            "confidence": confidence,
+            "validation_status": "accepted",
+            "created_at": now,
+            "updated_at": now,
+        })
+        self._append_unique_rows(
+            self._edges_path / "Product_USED_IN_Application.parquet",
+            [candidate_edge_row],
+            PRODUCT_APPLICATION_SCHEMA,
+            "edge_id",
+        )
+
+        # 3. Incumbent Material -> Application Edge (if incumbent exists)
+        if incumbent_id:
+            inc_edge_id = stable_id("Product_USED_IN_Application", incumbent_id, application_id, evidence_hash)
+            
+            inc_price = None
+            if assessment and assessment.incumbent_price_usd_per_kg and assessment.incumbent_price_usd_per_kg.value is not None:
+                inc_price = float(assessment.incumbent_price_usd_per_kg.value)
+                price_unit = "kg"
+                price_currency = "USD"
+
+            incumbent_edge_row = empty_row(PRODUCT_APPLICATION_SCHEMA)
+            incumbent_edge_row.update({
+                "edge_id": inc_edge_id,
+                "product_id": incumbent_id,
+                "application_id": application_id,
+                "market_id": market_id,
+                "relationship_role": "incumbent",
+                "volume_value": None,
+                "volume_unit": None,
+                "volume_year": None,
+                "price_value": inc_price,
+                "price_currency": price_currency,
+                "price_unit": price_unit,
+                "price_year": datetime.now(timezone.utc).year,
+                "critical_to_quality_json": ctq_json,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": f"Displaced by {candidate_mat} in {app_name}. Rationale: {hypothesis.strategic_rationale}",
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            })
+            self._append_unique_rows(
+                self._edges_path / "Product_USED_IN_Application.parquet",
+                [incumbent_edge_row],
+                PRODUCT_APPLICATION_SCHEMA,
+                "edge_id",
+            )
+
+        # 4. Market Edges (if market exists)
+        if market_id:
+            # Market HAS APPLICATION Application
+            mkt_app_edge_id = stable_id("Market_HAS_APPLICATION_Application", market_id, application_id, evidence_hash)
+            mkt_app_row = empty_row(MARKET_APPLICATION_SCHEMA)
+            mkt_app_row.update({
+                "edge_id": mkt_app_edge_id,
+                "market_id": market_id,
+                "application_id": application_id,
+                "scope_type": "evidence",
+                "source_node_type": "hypothesis_promotion",
+                "source_path": source_chunk_id,
+                "geo_id": None,
+                "page_type": "evidence",
+                "page_url": source_url,
+                "retrieved_at": None,
+                "target_url": source_url,
+                "target_page_type": "evidence",
+                "queue_candidate": False,
+                "status": "accepted",
+                "revenue_value": None,
+                "revenue_year": None,
+                "forecast_revenue_value": None,
+                "forecast_revenue_year": None,
+                "cagr_value": None,
+                "cagr_start_year": None,
+                "cagr_end_year": None,
+                "unit": None,
+                "currency": None,
+                "unit_scale": None,
+                "summary_metrics_json": "[]",
+                "highlights_json": json.dumps([hypothesis.summary], sort_keys=True),
+                "industry_trends_json": None,
+                "data_book_summary_json": None,
+                "source_market_slug": None,
+                "critical_to_quality_json": ctq_json,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": hypothesis.summary,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            })
+            self._append_unique_rows(
+                self._edges_path / "Market_HAS_APPLICATION_Application.parquet",
+                [mkt_app_row],
+                MARKET_APPLICATION_SCHEMA,
+                "edge_id",
+            )
+
+            # Market USES Product (for Candidate)
+            mkt_cand_edge_id = stable_id("Market_USES_Product", market_id, candidate_id, evidence_hash)
+            mkt_cand_row = empty_row(MARKET_PRODUCT_SCHEMA)
+            mkt_cand_row.update({
+                "edge_id": mkt_cand_edge_id,
+                "market_id": market_id,
+                "product_id": candidate_id,
+                "scope_type": "evidence",
+                "source_node_type": "hypothesis_promotion",
+                "source_path": source_chunk_id,
+                "geo_id": None,
+                "page_type": "evidence",
+                "page_url": source_url,
+                "retrieved_at": None,
+                "target_url": source_url,
+                "target_page_type": "evidence",
+                "queue_candidate": False,
+                "status": "accepted",
+                "revenue_value": None,
+                "revenue_year": None,
+                "forecast_revenue_value": None,
+                "forecast_revenue_year": None,
+                "cagr_value": None,
+                "cagr_start_year": None,
+                "cagr_end_year": None,
+                "unit": None,
+                "currency": None,
+                "unit_scale": None,
+                "summary_metrics_json": "[]",
+                "highlights_json": json.dumps([hypothesis.summary], sort_keys=True),
+                "industry_trends_json": None,
+                "data_book_summary_json": None,
+                "source_market_slug": None,
+                "volume_value": None,
+                "volume_unit": None,
+                "volume_year": None,
+                "price_value": nbca_price,
+                "price_currency": price_currency,
+                "price_unit": price_unit,
+                "price_year": datetime.now(timezone.utc).year,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": hypothesis.summary,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            })
+            self._append_unique_rows(
+                self._edges_path / "Market_USES_Product.parquet",
+                [mkt_cand_row],
+                MARKET_PRODUCT_SCHEMA,
+                "edge_id",
+            )
+
+    def apply_edge_feedback(
+        self,
+        candidate_material: str,
+        incumbent_material: str | None,
+        application: str,
+        volume: float | None = None,
+        volume_unit: str | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+        comment: str | None = None,
+    ) -> int:
+        """
+        Updates edges in the knowledge graph matching candidate_material -> application
+        and incumbent_material -> application with human feedback.
+        Returns the number of edges updated.
+        """
+        self._nodes_path.mkdir(parents=True, exist_ok=True)
+        self._edges_path.mkdir(parents=True, exist_ok=True)
+
+        candidate_slug = slugify(candidate_material)
+        candidate_id = f"product:{candidate_slug}"
+        
+        incumbent_id = f"product:{slugify(incumbent_material)}" if incumbent_material else None
+        application_id = f"application:{slugify(application)}"
+
+        path = self._edges_path / "Product_USED_IN_Application.parquet"
+        
+        updated_count = 0
+        now = now_iso()
+        
+        with FileLock(path):
+            rows = read_rows(path, PRODUCT_APPLICATION_SCHEMA)
+            for row in rows:
+                is_candidate_match = row.get("product_id") == candidate_id and row.get("application_id") == application_id
+                is_incumbent_match = incumbent_id and row.get("product_id") == incumbent_id and row.get("application_id") == application_id
+                
+                if is_candidate_match or is_incumbent_match:
+                    if volume is not None:
+                        row["volume_value"] = float(volume)
+                        row["volume_year"] = datetime.now(timezone.utc).year
+                    if volume_unit is not None:
+                        row["volume_unit"] = volume_unit
+                    if status is not None:
+                        row["validation_status"] = status
+                    if confidence is not None:
+                        row["confidence"] = float(confidence)
+                    if comment is not None:
+                        row["supporting_quote"] = comment
+                    row["updated_at"] = now
+                    updated_count += 1
+            
+            if updated_count > 0:
+                write_rows(path, rows, PRODUCT_APPLICATION_SCHEMA)
+                
+        return updated_count
+
     @staticmethod
     def _append_unique_rows(path: Path, rows: list[dict[str, Any]], schema: pa.Schema, key: str) -> None:
         if not rows:
             return
-        merged = rows_by_key(path, schema, key)
-        for row in rows:
-            row_key = row.get(key)
-            if not row_key:
-                continue
-            existing = merged.get(str(row_key), empty_row(schema))
-            existing.update({name: row.get(name) for name in schema.names if row.get(name) is not None})
-            if existing.get("created_at") is None:
-                existing["created_at"] = row.get("created_at")
-            existing["updated_at"] = row.get("updated_at") or now_iso()
-            merged[str(row_key)] = existing
-        write_rows(path, list(merged.values()), schema)
+        with FileLock(path):
+            merged = rows_by_key(path, schema, key)
+            for row in rows:
+                row_key = row.get(key)
+                if not row_key:
+                    continue
+                existing = merged.get(str(row_key), empty_row(schema))
+                existing.update({name: row.get(name) for name in schema.names if row.get(name) is not None})
+                if existing.get("created_at") is None:
+                    existing["created_at"] = row.get("created_at")
+                existing["updated_at"] = row.get("updated_at") or now_iso()
+                merged[str(row_key)] = existing
+            write_rows(path, list(merged.values()), schema)
 
 
 def rows_by_key(path: Path, schema: pa.Schema, key: str) -> dict[str, dict[str, Any]]:

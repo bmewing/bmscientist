@@ -503,9 +503,10 @@ class ResearchPlanningAgent:
 class GenerationAgent:
     _batch_size = 5
 
-    def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever):
+    def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever, graph_evidence: GraphMarketEvidence | None = None):
         self._llm = llm
         self._retriever = retriever
+        self._graph_evidence = graph_evidence
 
     @property
     def batch_size(self) -> int:
@@ -521,6 +522,12 @@ class GenerationAgent:
             document,
             max_results=max(document.target_hypotheses_generated * 4, 12),
         )
+        if self._graph_evidence:
+            try:
+                graph_rows = self._graph_evidence.build_evidence_rows_for_goal(document)
+                evidence_rows.extend(graph_rows)
+            except Exception:
+                LOGGER.exception("Offline graph market evidence unavailable during initial generation")
         evidence_payload = [
             {
                 "chunk_id": row.get("id"),
@@ -561,6 +568,12 @@ class GenerationAgent:
         if target_count <= 0:
             return []
         evidence_rows = self._retriever.retrieve_for_goal(document, max_results=max(target_count * 5, 12))
+        if self._graph_evidence:
+            try:
+                graph_rows = self._graph_evidence.build_evidence_rows_for_goal(document)
+                evidence_rows.extend(graph_rows)
+            except Exception:
+                LOGGER.exception("Offline graph market evidence unavailable during regeneration")
         evidence_payload = [
             {
                 "chunk_id": row.get("id"),
@@ -2089,7 +2102,7 @@ class CoScientistRunner:
         except Exception:
             LOGGER.exception("Initial structured price cache refresh failed")
         self._planning_agent = ResearchPlanningAgent(self._planning_llm)
-        self._generation_agent = GenerationAgent(self._generation_llm, self._retriever)
+        self._generation_agent = GenerationAgent(self._generation_llm, self._retriever, self._graph_evidence)
         self._ranking_agent = RankingAgent(self._ranking_llm)
         self._evolution_agent = EvolutionAgent(self._evolution_llm)
         self._proximity_agent = ProximityCheckAgent(self._proximity_llm)

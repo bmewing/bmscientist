@@ -205,6 +205,15 @@ class CoScientistStore:
         tmp_path.write_text(hypothesis.model_dump_json(indent=2), encoding="utf-8")
         self._remove_hypothesis_from_other_stages(hypothesis, keep_stage=path.parent.name)
         tmp_path.replace(path)
+
+        if self.hypothesis_stage(hypothesis) == "reflected":
+            try:
+                from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+                store = GraphEnrichmentStore()
+                store.promote_hypothesis(hypothesis)
+            except Exception as exc:
+                LOGGER.warning("Failed to promote hypothesis %s to graph: %s", hypothesis.hypothesis_id, exc)
+
         return path
 
     def hypothesis_file_path(self, hypothesis: Hypothesis) -> Path:
@@ -484,3 +493,72 @@ class CoScientistStore:
     def _normalize_project_name(name: str) -> str:
         normalized = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
         return normalized or "project"
+
+    def apply_hypothesis_feedback(
+        self,
+        research_id: str,
+        hypothesis_id: str,
+        volume: float | None = None,
+        volume_unit: str | None = None,
+        status: str | None = None,
+        confidence: float | None = None,
+        comment: str | None = None,
+    ) -> Hypothesis | None:
+        """
+        Applies feedback to a specific hypothesis in the research run.
+        If status is 'retired' or 'rejected', retires the hypothesis.
+        Also propagates the feedback to the graph.
+        """
+        hypotheses = self.load_hypotheses(research_id)
+        target = None
+        for hyp in hypotheses:
+            if hyp.hypothesis_id == hypothesis_id:
+                target = hyp
+                break
+                
+        if not target:
+            return None
+            
+        assessment = target.reflection_assessment
+        if assessment:
+            if comment:
+                assessment.evidence_gap_notes.append(f"Human feedback: {comment}")
+            if status:
+                assessment.evidence_gap_notes.append(f"Human feedback status: {status}")
+                
+        if status == "rejected" or status == "retired":
+            target = target.model_copy(
+                update={
+                    "is_active": False,
+                    "status": "retired",
+                    "retired_reason": comment or f"Retired by user feedback (status: {status})",
+                }
+            )
+        else:
+            notes = list(target.evolution_notes)
+            if comment:
+                notes.append(f"Feedback: {comment}")
+            target = target.model_copy(
+                update={
+                    "evolution_notes": notes,
+                }
+            )
+            
+        self.save_hypothesis(target)
+        
+        from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+        graph_store = GraphEnrichmentStore()
+        graph_status = "rejected" if status in ("rejected", "retired") else status
+        graph_store.apply_edge_feedback(
+            candidate_material=target.candidate_material or "",
+            incumbent_material=target.incumbent_material,
+            application=target.application or "",
+            volume=volume,
+            volume_unit=volume_unit,
+            status=graph_status,
+            confidence=confidence,
+            comment=comment,
+        )
+        
+        return target
+

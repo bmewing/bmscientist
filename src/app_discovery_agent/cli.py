@@ -15,6 +15,7 @@ from app_discovery_agent.coscientist_cli import (
     run_coscientist_command,
     run_coscientist_loop_command,
     run_coscientist_reflect_command,
+    run_coscientist_feedback_command,
 )
 from app_discovery_agent.graph_backfill import LanceGraphBackfiller
 from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
@@ -268,6 +269,8 @@ def main() -> int:
         return run_coscientist_reflect_command(args, config)
     if args.command == "coscientist-loop":
         return run_coscientist_loop_command(args, config)
+    if args.command == "coscientist-feedback":
+        return run_coscientist_feedback_command(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

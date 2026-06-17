@@ -67,6 +67,45 @@ class GraphMarketEvidence:
                 break
         return list(deduped.values())
 
+    def build_evidence_rows_for_goal(
+        self,
+        document: ResearchGoalDocument,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        self._ensure_loaded()
+        if not self._edges:
+            return []
+
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for edge_type in (
+            "Market_HAS_APPLICATION_Application",
+            "Market_USES_Product",
+            "Market_IN_GEOGRAPHY_Geography",
+            "Product_USED_IN_Application",
+        ):
+            for edge in self._edges.get(edge_type, []):
+                score = self._score_edge_for_goal(edge_type, edge, document)
+                if score <= 0:
+                    continue
+                row = self._row_from_edge(edge_type, edge, score)
+                if row is not None:
+                    scored.append((score, row))
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1]["metadata"].get("revenue_value") or 0,
+                item[1]["metadata"].get("forecast_revenue_value") or 0,
+            ),
+            reverse=True,
+        )
+        deduped: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        for _, row in scored:
+            deduped.setdefault(row["id"], row)
+            if len(deduped) >= limit:
+                break
+        return list(deduped.values())
+
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
@@ -111,6 +150,8 @@ class GraphMarketEvidence:
         document: ResearchGoalDocument,
         hypothesis: Hypothesis,
     ) -> float:
+        if str(edge.get("validation_status")).lower() == "rejected":
+            return 0.0
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         if edge_type == "Product_USED_IN_Application":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
@@ -181,6 +222,93 @@ class GraphMarketEvidence:
                     hypothesis.application,
                     hypothesis.market_segment,
                     hypothesis.product_type,
+                    " ".join(document.application_scope),
+                    document.raw_goal,
+                ]
+                if item
+            )
+        )
+        region_terms = self._tokens(" ".join(document.regions))
+
+        score = 0.0
+        if market_tokens & material_terms:
+            score += 3.0
+        if market_tokens & application_terms:
+            score += 2.0
+        if target_tokens & application_terms:
+            score += 4.0
+        if target_tokens & material_terms:
+            score += 3.0
+        if geo_tokens and (geo_tokens & region_terms or "global" in geo_tokens):
+            score += 1.0
+        if self._has_market_metrics(edge):
+            score += 1.0
+        return score
+
+    def _score_edge_for_goal(
+        self,
+        edge_type: str,
+        edge: dict[str, Any],
+        document: ResearchGoalDocument,
+    ) -> float:
+        if str(edge.get("validation_status")).lower() == "rejected":
+            return 0.0
+        market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
+        if edge_type == "Product_USED_IN_Application":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
+            product_tokens = self._tokens(product.get("name")) | self._tokens(edge.get("product_id"))
+            application_tokens = self._tokens(application.get("name")) | self._tokens(edge.get("application_id"))
+            material_terms = self._tokens(
+                " ".join(
+                    item
+                    for item in [
+                        " ".join(document.material_scope),
+                        " ".join(document.preferred_candidate_materials),
+                        " ".join(document.target_incumbent_materials),
+                    ]
+                    if item
+                )
+            )
+            application_terms = self._tokens(
+                " ".join(
+                    item
+                    for item in [
+                        " ".join(document.application_scope),
+                        document.raw_goal,
+                    ]
+                    if item
+                )
+            )
+            score = 0.0
+            if product_tokens & material_terms:
+                score += 4.0
+            if application_tokens & application_terms:
+                score += 4.0
+            if self._has_market_metrics(edge) or self._number(edge.get("volume_value")) is not None:
+                score += 1.0
+            return score
+        target = self._target_node(edge_type, edge)
+        market_tokens = self._tokens(market.get("name")) | self._tokens(market.get("primary_slug"))
+        target_tokens = self._tokens(target.get("name")) | self._tokens(target.get("node_type"))
+        geo = self._nodes.get("Geography", {}).get(str(edge.get("geo_id")), {})
+        geo_tokens = self._tokens(geo.get("name"))
+
+        material_terms = self._tokens(
+            " ".join(
+                item
+                for item in [
+                    " ".join(document.material_scope),
+                    " ".join(document.preferred_candidate_materials),
+                    " ".join(document.target_incumbent_materials),
+                ]
+                if item
+            )
+        )
+        application_terms = self._tokens(
+            " ".join(
+                item
+                for item in [
                     " ".join(document.application_scope),
                     document.raw_goal,
                 ]

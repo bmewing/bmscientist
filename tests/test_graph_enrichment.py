@@ -209,3 +209,116 @@ def test_graph_enrichment_merges_product_aliases_without_collapsing_master_data(
 
     claim_rows = pq.read_table(graph_path / "enrichment" / "GraphEnrichmentClaim.parquet").to_pylist()
     assert json.loads(claim_rows[0]["product_aliases_json"]) == ["polystyrene"]
+
+
+def test_promote_hypothesis_writes_to_graph(tmp_path):
+    from tests.test_coscientist import make_reflected_hypothesis
+
+    hypothesis = make_reflected_hypothesis()
+    graph_path = tmp_path / "graph"
+    store = GraphEnrichmentStore(graph_path)
+
+    store.promote_hypothesis(hypothesis)
+
+    # Verify nodes
+    products = pq.read_table(graph_path / "nodes" / "Product.parquet").to_pylist()
+    # Should have candidate (PETG) and incumbent (PVC)
+    product_names = {p["name"] for p in products}
+    assert "PETG" in product_names
+    assert "PVC" in product_names
+
+    applications = pq.read_table(graph_path / "nodes" / "Application.parquet").to_pylist()
+    assert applications[0]["name"] == "medical trays"
+
+    markets = pq.read_table(graph_path / "nodes" / "Market.parquet").to_pylist()
+    assert markets[0]["name"] == "medical packaging"
+
+    # Verify edges
+    edges = pq.read_table(graph_path / "edges" / "Product_USED_IN_Application.parquet").to_pylist()
+    # There should be 2 edges: PETG -> medical trays and PVC -> medical trays
+    assert len(edges) == 2
+    roles = {e["relationship_role"] for e in edges}
+    assert "candidate_replacement" in roles
+    assert "incumbent" in roles
+
+    mkt_app_edges = pq.read_table(graph_path / "edges" / "Market_HAS_APPLICATION_Application.parquet").to_pylist()
+    assert len(mkt_app_edges) == 1
+    assert mkt_app_edges[0]["market_id"] == "market:medical-packaging"
+    assert mkt_app_edges[0]["application_id"] == "application:medical-trays"
+
+    mkt_prod_edges = pq.read_table(graph_path / "edges" / "Market_USES_Product.parquet").to_pylist()
+    assert len(mkt_prod_edges) == 1
+    assert mkt_prod_edges[0]["market_id"] == "market:medical-packaging"
+    assert mkt_prod_edges[0]["product_id"] == "product:petg"
+
+
+def test_apply_edge_feedback_updates_graph(tmp_path):
+    from tests.test_coscientist import make_reflected_hypothesis
+
+    hypothesis = make_reflected_hypothesis()
+    graph_path = tmp_path / "graph"
+    store = GraphEnrichmentStore(graph_path)
+
+    store.promote_hypothesis(hypothesis)
+
+    updated_count = store.apply_edge_feedback(
+        candidate_material="PETG",
+        incumbent_material="PVC",
+        application="medical trays",
+        volume=0.0,
+        status="rejected",
+        comment="absurdly low volume",
+    )
+
+    assert updated_count == 2
+
+    edges = pq.read_table(graph_path / "edges" / "Product_USED_IN_Application.parquet").to_pylist()
+    for edge in edges:
+        assert edge["volume_value"] == 0.0
+        assert edge["validation_status"] == "rejected"
+        assert edge["supporting_quote"] == "absurdly low volume"
+
+
+def test_apply_hypothesis_feedback_updates_hypothesis_and_graph(tmp_path):
+    from tests.test_coscientist import make_reflected_hypothesis
+    from app_discovery_agent.coscientist_store import CoScientistStore
+
+    coscientist_path = tmp_path / "coscientist"
+    graph_path = tmp_path / "graph"
+
+    import app_discovery_agent.graph_enrichment as ge
+    original_graph_path = ge.GRAPH_PATH
+    ge.GRAPH_PATH = graph_path
+
+    try:
+        cosc_store = CoScientistStore(coscientist_path)
+        hypothesis = make_reflected_hypothesis()
+
+        cosc_store.save_hypothesis(hypothesis)
+
+        updated = cosc_store.apply_hypothesis_feedback(
+            research_id=hypothesis.research_id,
+            hypothesis_id=hypothesis.hypothesis_id,
+            volume=0.01,
+            status="rejected",
+            comment="obsolete application",
+        )
+
+        assert updated is not None
+        assert updated.is_active is False
+        assert updated.status == "retired"
+        assert updated.retired_reason == "obsolete application"
+
+        saved = cosc_store.load_hypotheses(hypothesis.research_id, stages={"retired"})
+        assert len(saved) == 1
+        assert saved[0].is_active is False
+
+        edges = pq.read_table(graph_path / "edges" / "Product_USED_IN_Application.parquet").to_pylist()
+        assert len(edges) == 2
+        for edge in edges:
+            assert edge["volume_value"] == 0.01
+            assert edge["validation_status"] == "rejected"
+    finally:
+        ge.GRAPH_PATH = original_graph_path
+
+

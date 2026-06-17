@@ -142,6 +142,19 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     coscientist.add_argument("--results-per-query", type=int, default=5)
     coscientist.add_argument("--max-pages-per-search", type=int, default=8)
     coscientist.add_argument("--reflection-concurrency", type=int, default=3)
+
+    feedback = subparsers.add_parser("coscientist-feedback", help="Provide human feedback on hypotheses or graph edges after a run.")
+    feedback.add_argument("--research-id", "--project-name", dest="research_id", required=True)
+    feedback.add_argument("--hypothesis-id")
+    feedback.add_argument("--candidate", help="Candidate material (optional if --hypothesis-id is specified)")
+    feedback.add_argument("--incumbent", help="Incumbent material (optional)")
+    feedback.add_argument("--application", help="Application name (optional if --hypothesis-id is specified)")
+    feedback.add_argument("--volume", type=float, help="Corrected volume value (e.g. 0.0 for near-zero volume)")
+    feedback.add_argument("--volume-unit", default="tonnes", help="Volume unit")
+    feedback.add_argument("--status", choices=["accepted", "rejected", "retired", "low_volume"], default="rejected", help="Feedback status")
+    feedback.add_argument("--confidence", type=float, help="Feedback confidence score (0.0 to 1.0)")
+    feedback.add_argument("--comment", help="Feedback comment or retired reason")
+
     coscientist.add_argument("--skip-loop", action="store_true")
     coscientist.add_argument("--target-final-hypotheses", type=int)
     coscientist.add_argument("--max-rounds", type=int, help="Optional safety cap for loop rounds; omit to let meta-review control stopping.")
@@ -330,3 +343,51 @@ def run_coscientist_loop_command(
     console.print(f"[bold]Hypotheses:[/bold] {result.hypothesis_path}")
     console.print(f"[bold]Report:[/bold] {result.report_path}")
     return 0
+
+
+def run_coscientist_feedback_command(
+    args: argparse.Namespace,
+    config: AppConfig,
+) -> int:
+    from app_discovery_agent.coscientist_store import CoScientistStore
+    from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+
+    store = CoScientistStore()
+
+    if args.hypothesis_id:
+        console.print(f"[bold]Applying feedback to hypothesis {args.hypothesis_id} in run {args.research_id}...[/bold]")
+        updated = store.apply_hypothesis_feedback(
+            research_id=args.research_id,
+            hypothesis_id=args.hypothesis_id,
+            volume=args.volume,
+            volume_unit=args.volume_unit,
+            status=args.status,
+            confidence=args.confidence,
+            comment=args.comment,
+        )
+        if not updated:
+            console.print(f"[bold red]Hypothesis {args.hypothesis_id} not found in run {args.research_id}.[/bold red]")
+            return 1
+        console.print(f"[bold green]Successfully updated hypothesis {args.hypothesis_id} (new status: {updated.status}).[/bold green]")
+    else:
+        if not args.candidate or not args.application:
+            console.print("[bold red]Error: --candidate and --application must be specified if --hypothesis-id is omitted.[/bold red]")
+            return 1
+
+        console.print(f"[bold]Applying direct graph feedback for {args.candidate} replacing {args.incumbent} in {args.application}...[/bold]")
+        graph_store = GraphEnrichmentStore()
+        graph_status = "rejected" if args.status in ("rejected", "retired") else args.status
+        updated_count = graph_store.apply_edge_feedback(
+            candidate_material=args.candidate,
+            incumbent_material=args.incumbent,
+            application=args.application,
+            volume=args.volume,
+            volume_unit=args.volume_unit,
+            status=graph_status,
+            confidence=args.confidence,
+            comment=args.comment,
+        )
+        console.print(f"[bold green]Successfully updated {updated_count} edges in the knowledge graph.[/bold green]")
+
+    return 0
+
