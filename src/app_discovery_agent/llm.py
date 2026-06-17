@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import TypeVar
@@ -13,6 +14,7 @@ from app_discovery_agent.config import AppConfig
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+LOGGER = logging.getLogger(__name__)
 
 
 class DeepSeekLLM:
@@ -68,8 +70,43 @@ class DeepSeekLLM:
             ],
         )
         content = response.choices[0].message.content or "{}"
-        payload = self._coerce_json(content)
+        try:
+            payload = self._coerce_json(content)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "Malformed JSON from %s; attempting repair. Error: %s",
+                response_model.__name__,
+                exc,
+            )
+            repaired_content = self._repair_json_content(response_model, content)
+            payload = self._coerce_json(repaired_content)
         return response_model.model_validate(payload)
+
+    def _repair_json_content(self, response_model: type[ModelT], content: str) -> str:
+        schema = json.dumps(response_model.model_json_schema(), indent=2)
+        response = self._create_completion(
+            model=self._model,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You repair malformed JSON. "
+                        "Return strict JSON only, preserve the original meaning, and do not add commentary."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Repair the malformed JSON-like content below so it matches the target schema.\n\n"
+                        f"Target schema:\n{schema}\n\n"
+                        f"Malformed content:\n{content}"
+                    ),
+                },
+            ],
+        )
+        return response.choices[0].message.content or "{}"
 
     @staticmethod
     def _coerce_json(content: str) -> dict:
@@ -139,15 +176,48 @@ class DeepSeekLLM:
 
     @staticmethod
     def _json_variants(candidate: str) -> list[str]:
-        no_trailing_commas = re.sub(r",\s*([}\]])", r"\1", candidate.strip())
+        stripped = candidate.strip()
+        no_trailing_commas = re.sub(r",\s*([}\]])", r"\1", stripped)
         python_literals = (
             no_trailing_commas.replace(": None", ": null")
             .replace(": True", ": true")
             .replace(": False", ": false")
         )
-        variants = [candidate.strip(), no_trailing_commas, python_literals]
+        escaped_controls = DeepSeekLLM._escape_control_chars_in_strings(python_literals)
+        variants = [stripped, no_trailing_commas, python_literals, escaped_controls]
         unique: list[str] = []
         for variant in variants:
             if variant and variant not in unique:
                 unique.append(variant)
         return unique
+
+    @staticmethod
+    def _escape_control_chars_in_strings(candidate: str) -> str:
+        escaped_parts: list[str] = []
+        in_string = False
+        escaped = False
+        for character in candidate:
+            if escaped:
+                escaped_parts.append(character)
+                escaped = False
+                continue
+            if character == "\\":
+                escaped_parts.append(character)
+                escaped = True
+                continue
+            if character == '"':
+                escaped_parts.append(character)
+                in_string = not in_string
+                continue
+            if in_string and ord(character) < 32:
+                replacements = {
+                    "\b": "\\b",
+                    "\f": "\\f",
+                    "\n": "\\n",
+                    "\r": "\\r",
+                    "\t": "\\t",
+                }
+                escaped_parts.append(replacements.get(character, f"\\u{ord(character):04x}"))
+                continue
+            escaped_parts.append(character)
+        return "".join(escaped_parts)

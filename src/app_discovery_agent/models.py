@@ -136,6 +136,101 @@ class ChunkRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+GRAPH_ENRICHMENT_EDGE_TYPES = (
+    "Product_USED_IN_Application",
+    "Market_USES_Product",
+    "Market_HAS_APPLICATION_Application",
+    "Market_HAS_COMPANY_Company",
+    "Company_PRODUCES_Product",
+)
+
+
+class GraphEnrichmentMetric(BaseModel):
+    name: Literal["volume", "price", "revenue", "forecast_revenue", "cagr"]
+    value: float | None = None
+    unit: str | None = None
+    currency: str | None = None
+    year: int | None = None
+    basis: str | None = None
+
+
+class GraphEnrichmentProposal(BaseModel):
+    proposal_id: str | None = None
+    edge_type: Literal[
+        "Product_USED_IN_Application",
+        "Market_USES_Product",
+        "Market_HAS_APPLICATION_Application",
+        "Market_HAS_COMPANY_Company",
+        "Company_PRODUCES_Product",
+    ]
+    product_name: str | None = None
+    product_aliases: list[str] = Field(default_factory=list)
+    application_name: str | None = None
+    market_name: str | None = None
+    company_name: str | None = None
+    geography_name: str | None = None
+    relationship_role: str | None = None
+    critical_to_quality: list[str] = Field(default_factory=list)
+    metrics: list[GraphEnrichmentMetric] = Field(default_factory=list)
+    source_chunk_id: str
+    source_url: str | None = None
+    source_title: str | None = None
+    supporting_quote: str = Field(default="")
+    rationale: str = Field(default="")
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_hash: str | None = None
+
+    @field_validator(
+        "critical_to_quality",
+        "product_aliases",
+        "metrics",
+        mode="before",
+    )
+    @classmethod
+    def default_graph_list_fields(cls, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return value
+
+
+class GraphEnrichmentProposalOutput(BaseModel):
+    proposals: list[GraphEnrichmentProposal] = Field(default_factory=list)
+
+
+class GraphEnrichmentValidation(BaseModel):
+    proposal_id: str
+    accepted: bool
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = Field(default="")
+    corrected_edge_type: Literal[
+        "Product_USED_IN_Application",
+        "Market_USES_Product",
+        "Market_HAS_APPLICATION_Application",
+        "Market_HAS_COMPANY_Company",
+        "Company_PRODUCES_Product",
+    ] | None = None
+    corrected_relationship_role: str | None = None
+    corrected_product_aliases: list[str] = Field(default_factory=list)
+    corrected_metrics: list[GraphEnrichmentMetric] = Field(default_factory=list)
+    corrected_critical_to_quality: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "corrected_metrics",
+        "corrected_product_aliases",
+        "corrected_critical_to_quality",
+        mode="before",
+    )
+    @classmethod
+    def default_validation_list_fields(cls, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return value
+
+
+class GraphEnrichmentValidationOutput(BaseModel):
+    validations: list[GraphEnrichmentValidation] = Field(default_factory=list)
+
+
 class DiscoverySummary(BaseModel):
     run_id: str
     original_query: str
@@ -145,6 +240,8 @@ class DiscoverySummary(BaseModel):
     fetched_pages: int
     relevant_pages: int
     stored_chunks: int
+    graph_enrichment_proposals: int = 0
+    graph_enrichment_accepted: int = 0
     opportunity_summary: str
     notable_applications: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)

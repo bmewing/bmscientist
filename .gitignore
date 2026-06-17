@@ -11,6 +11,14 @@ data/outputs/*
 !data/outputs/.gitkeep
 data/graph/*
 !data/graph/.gitkeep
+data/graph/schema/*
+!data/graph/schema/.gitkeep
+!data/graph/schema/graph_schema.json
+!data/graph/edges/
+data/graph/edges/*
+!data/graph/edges/.gitkeep
+!data/graph/enrichment/
+data/graph/enrichment/*
 data/lancedb/*
 !data/lancedb/.gitkeep
 data/coscientist/*

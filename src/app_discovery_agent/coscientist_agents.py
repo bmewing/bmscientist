@@ -47,6 +47,7 @@ from app_discovery_agent.coscientist_models import (
 )
 from app_discovery_agent.coscientist_store import CoScientistStore
 from app_discovery_agent.extract import PageFetcher, extract_domain
+from app_discovery_agent.graph_market import GraphMarketEvidence
 from app_discovery_agent.llm import DeepSeekLLM
 from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
 from app_discovery_agent.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
@@ -280,12 +281,13 @@ class DiscoveryEvidenceTool:
             if len(page.text) < min_characters:
                 skipped_pages.append({"url": str(page.url), "reason": "too_little_text"})
                 continue
-            min_score = 0.08 if is_partial else 0.15
             heuristic_score = self._classifier.heuristic_relevance(query, page.text)
-            if heuristic_score < min_score:
-                skipped_pages.append({"url": str(page.url), "reason": "low_heuristic_relevance", "score": heuristic_score})
-                continue
-            candidates.append(page)
+            metadata = {
+                **page.metadata,
+                "heuristic_relevance_score": heuristic_score,
+                "retention_policy": "retain_reflection_search_text",
+            }
+            candidates.append(page.model_copy(update={"metadata": metadata}))
         return candidates
 
     def _classify_and_chunk(
@@ -306,15 +308,6 @@ class DiscoveryEvidenceTool:
                 LOGGER.exception("Reflection classification failed for %s", page.url)
                 errors.append(f"classify:{page.url}:{exc}")
                 skipped_pages.append({"url": str(page.url), "reason": "classification_error", "error": str(exc)})
-                continue
-            if classification.relevance_score < self._config.min_relevance_score or not classification.relevant:
-                skipped_pages.append(
-                    {
-                        "url": str(page.url),
-                        "reason": "below_relevance_threshold",
-                        "relevance_score": classification.relevance_score,
-                    }
-                )
                 continue
             for index, chunk in enumerate(self._chunker.chunk_text(page.text)):
                 chunk_records.append(
@@ -340,6 +333,11 @@ class DiscoveryEvidenceTool:
                         metadata={
                             "rationale": classification.rationale,
                             "supporting_quotes": classification.supporting_quotes,
+                            "classification_relevant": classification.relevant,
+                            "classification_relevance_score": classification.relevance_score,
+                            "classification_confidence_score": classification.confidence_score,
+                            "retained_for_reflection": True,
+                            "retention_policy": page.metadata.get("retention_policy", "retain_reflection_search_text"),
                             "page_metadata": page.metadata,
                             "source": "coscientist_reflection",
                         },
@@ -505,9 +503,10 @@ class ResearchPlanningAgent:
 class GenerationAgent:
     _batch_size = 5
 
-    def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever):
+    def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever, graph_evidence: GraphMarketEvidence | None = None):
         self._llm = llm
         self._retriever = retriever
+        self._graph_evidence = graph_evidence
 
     @property
     def batch_size(self) -> int:
@@ -523,6 +522,12 @@ class GenerationAgent:
             document,
             max_results=max(document.target_hypotheses_generated * 4, 12),
         )
+        if self._graph_evidence:
+            try:
+                graph_rows = self._graph_evidence.build_evidence_rows_for_goal(document)
+                evidence_rows.extend(graph_rows)
+            except Exception:
+                LOGGER.exception("Offline graph market evidence unavailable during initial generation")
         evidence_payload = [
             {
                 "chunk_id": row.get("id"),
@@ -563,6 +568,12 @@ class GenerationAgent:
         if target_count <= 0:
             return []
         evidence_rows = self._retriever.retrieve_for_goal(document, max_results=max(target_count * 5, 12))
+        if self._graph_evidence:
+            try:
+                graph_rows = self._graph_evidence.build_evidence_rows_for_goal(document)
+                evidence_rows.extend(graph_rows)
+            except Exception:
+                LOGGER.exception("Offline graph market evidence unavailable during regeneration")
         evidence_payload = [
             {
                 "chunk_id": row.get("id"),
@@ -1391,6 +1402,7 @@ class MetaReviewAgent:
                 "concept_labels": hypothesis.concept_labels,
                 "ranking_score": hypothesis.ranking_score,
                 "ranking_status": hypothesis.ranking_status,
+                "reflection": RankingAgent._assessment_payload(hypothesis.reflection_assessment),
                 "evidence_gaps": (
                     hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []
                 ),
@@ -1405,6 +1417,9 @@ class MetaReviewAgent:
             document_json=document.model_dump_json(indent=2),
             best_patterns_json=json.dumps(ranking_round.best_patterns, indent=2),
             worst_patterns_json=json.dumps(ranking_round.worst_patterns, indent=2),
+            previous_gaps_json=json.dumps(document.whitespace_gap_notes, indent=2),
+            previous_guidance_json=json.dumps(document.meta_review_generation_guidance, indent=2),
+            gap_persistence_count=document.whitespace_gap_persistence_count,
             hypotheses_json=json.dumps(payload, indent=2),
         )
         return self._llm.complete_json(MetaReviewOutput, system_prompt, user_prompt)
@@ -1611,12 +1626,14 @@ class ReflectionAgent:
         retriever: LocalEvidenceRetriever,
         discovery_tool: DiscoveryEvidenceTool,
         price_cache: StructuredPriceCache | None = None,
+        graph_evidence: GraphMarketEvidence | None = None,
     ):
         self._llm = llm
         self._retriever = retriever
         self._discovery_tool = discovery_tool
         self._search_planner = ReflectionSearchPlanner()
         self._price_cache = price_cache
+        self._graph_evidence = graph_evidence
 
     def reflect(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> tuple[Hypothesis, int]:
         price_document = None
@@ -1626,7 +1643,7 @@ class ReflectionAgent:
             except Exception:
                 LOGGER.exception("Structured price cache unavailable during reflection for %s", hypothesis.hypothesis_id)
         local_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
-        evidence_rows = self._augment_with_price_rows(local_rows, hypothesis, price_document)
+        evidence_rows = self._augment_evidence_rows(document, hypothesis, local_rows, price_document)
         stale = self._retriever.is_stale(local_rows, document.preferred_evidence_recency_days)
         initial_review = self._review(document, hypothesis, evidence_rows)
 
@@ -1646,14 +1663,16 @@ class ReflectionAgent:
                 search_queries.append(query)
             if search_queries:
                 refreshed_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
-                evidence_rows = self._augment_with_price_rows(refreshed_rows, hypothesis, price_document)
+                evidence_rows = self._augment_evidence_rows(document, hypothesis, refreshed_rows, price_document)
 
         final_review = self._review(document, hypothesis, evidence_rows)
         assessment = self._merge_price_metrics(
             final_review.assessment,
             hypothesis,
             price_document,
-        ).model_copy(
+        )
+        assessment = self._finalize_missing_assessment_fields(document, hypothesis, assessment, evidence_rows)
+        assessment = assessment.model_copy(
             update={
                 "reflection_search_queries": search_queries,
                 "reflection_discovery_run_ids": discovery_run_ids,
@@ -1668,27 +1687,46 @@ class ReflectionAgent:
         )
         return reflected, len(discovery_run_ids)
 
-    def _augment_with_price_rows(
+    def _augment_evidence_rows(
         self,
-        evidence_rows: list[dict[str, Any]],
+        document: ResearchGoalDocument,
         hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
         price_document,
     ) -> list[dict[str, Any]]:
-        if self._price_cache is None or price_document is None:
-            return evidence_rows
         augmented: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         for row in evidence_rows:
             row_id = str(row.get("id", ""))
             if row_id:
                 augmented[row_id] = row
-        for row in self._price_cache.build_price_evidence_rows(
+        for row in self._graph_market_rows(document, hypothesis):
+            augmented[str(row["id"])] = row
+        for row in self._price_rows(hypothesis, price_document):
+            augmented[str(row["id"])] = row
+        return list(augmented.values())
+
+    def _price_rows(
+        self,
+        hypothesis: Hypothesis,
+        price_document,
+    ) -> list[dict[str, Any]]:
+        if self._price_cache is None or price_document is None:
+            return []
+        return self._price_cache.build_price_evidence_rows(
             hypothesis.incumbent_material,
             hypothesis.next_best_competitive_alternative,
             hypothesis.candidate_material,
             document=price_document,
-        ):
-            augmented[str(row["id"])] = row
-        return list(augmented.values())
+        )
+
+    def _graph_market_rows(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> list[dict[str, Any]]:
+        if self._graph_evidence is None:
+            return []
+        try:
+            return self._graph_evidence.build_evidence_rows(document, hypothesis)
+        except Exception:
+            LOGGER.exception("Offline graph market evidence unavailable during reflection for %s", hypothesis.hypothesis_id)
+            return []
 
     def _review(self, document: ResearchGoalDocument, hypothesis: Hypothesis, evidence_rows: list[dict[str, Any]]) -> ReflectionReviewOutput:
         technical = self._review_category(document, hypothesis, evidence_rows, "technical")
@@ -1781,6 +1819,185 @@ class ReflectionAgent:
             return assessment
         return assessment.model_copy(update=updates)
 
+    def _finalize_missing_assessment_fields(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        assessment: ReflectionAssessment,
+        evidence_rows: list[dict[str, Any]],
+    ) -> ReflectionAssessment:
+        updates: dict[str, Any] = {}
+        metric_fields = [
+            "strategic_fit_score",
+            "market_size_score",
+            "replacement_fit_score",
+            "activation_ease_score",
+            "replacement_driver_strength_score",
+            "technical_success_probability",
+            "commercial_success_probability",
+        ]
+        graph_rows = [row for row in evidence_rows if row.get("metadata", {}).get("source_type") == "offline-graph-market-data"]
+        working_assessment = assessment
+        for field_name in metric_fields:
+            metric = getattr(working_assessment, field_name)
+            if metric.value is None:
+                inferred_metric = self._inferred_metric(field_name, document, hypothesis, working_assessment, graph_rows)
+                updates[field_name] = inferred_metric
+                working_assessment = working_assessment.model_copy(update={field_name: inferred_metric})
+        if assessment.incumbent_price_usd_per_kg.value is None:
+            updates["incumbent_price_usd_per_kg"] = self._inferred_price_metric(hypothesis.incumbent_material)
+        if assessment.nbca_price_usd_per_kg.value is None:
+            nbca_name = assessment.nbca_material or hypothesis.next_best_competitive_alternative
+            updates["nbca_price_usd_per_kg"] = self._inferred_price_metric(nbca_name)
+        if not assessment.nbca_material and hypothesis.next_best_competitive_alternative:
+            updates["nbca_material"] = hypothesis.next_best_competitive_alternative
+        if not updates:
+            return assessment
+        return assessment.model_copy(update=updates)
+
+    @staticmethod
+    def _inferred_metric(
+        field_name: str,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        assessment: ReflectionAssessment,
+        graph_rows: list[dict[str, Any]],
+    ) -> AssessmentMetric:
+        graph_ids = [str(row.get("id")) for row in graph_rows[:4] if row.get("id")]
+        graph_urls = [str(row.get("source_url")) for row in graph_rows[:4] if row.get("source_url")]
+        graph_stats = ReflectionAgent._graph_market_stats(graph_rows)
+        confidence = 0.35 + (0.15 if graph_rows else 0.0)
+        value = 0.5
+        rationale = "Inferred from the hypothesis structure and research configuration after reflection evidence remained incomplete."
+
+        if field_name == "strategic_fit_score":
+            value = 0.5
+            if hypothesis.candidate_material and hypothesis.candidate_material in document.preferred_candidate_materials:
+                value += 0.12
+            if hypothesis.incumbent_material and hypothesis.incumbent_material in document.target_incumbent_materials:
+                value += 0.1
+            if hypothesis.substitution_drivers:
+                value += 0.08
+            if hypothesis.strategic_rationale:
+                value += 0.07
+            rationale = "Inferred from candidate/incumbent alignment, substitution drivers, and stated strategic rationale."
+        elif field_name == "market_size_score":
+            value = graph_stats["market_score"] if graph_rows else 0.45
+            rationale = (
+                "Inferred from offline graph market revenue, forecast revenue, and CAGR signals."
+                if graph_rows
+                else "Inferred conservatively because no usable market-size evidence was available after reflection search."
+            )
+        elif field_name == "replacement_fit_score":
+            value = 0.45 + (0.12 if hypothesis.application_requirements else 0.0) + (0.1 if hypothesis.conversion_process else 0.0)
+            if hypothesis.candidate_form and hypothesis.incumbent_form and hypothesis.candidate_form.lower() == hypothesis.incumbent_form.lower():
+                value += 0.1
+            rationale = "Inferred from available requirements, material forms, and conversion-process detail."
+        elif field_name == "activation_ease_score":
+            value = 0.5 + (0.12 if hypothesis.conversion_process else 0.0)
+            if document.opportunity_speed_horizon_months and document.opportunity_speed_horizon_months <= 6:
+                value += 0.1
+            if any("drop" in item.lower() for item in document.opportunity_modes):
+                value += 0.08
+            rationale = "Inferred from process specificity and the configured speed/drop-in opportunity horizon."
+        elif field_name == "replacement_driver_strength_score":
+            value = 0.45 + min(0.25, 0.07 * len(hypothesis.substitution_drivers))
+            if document.recycling_or_sustainability_angles:
+                value += 0.08
+            rationale = "Inferred from substitution drivers and sustainability or recycling angles in the research configuration."
+        elif field_name == "technical_success_probability":
+            replacement_fit = assessment.replacement_fit_score.value
+            value = replacement_fit if replacement_fit is not None else 0.55
+            rationale = "Inferred from replacement-fit signals where direct technical validation was incomplete."
+        elif field_name == "commercial_success_probability":
+            components = [
+                assessment.strategic_fit_score.value,
+                assessment.market_size_score.value,
+                assessment.replacement_driver_strength_score.value,
+                assessment.activation_ease_score.value,
+            ]
+            present = [item for item in components if item is not None]
+            value = sum(present) / len(present) if present else graph_stats["market_score"] if graph_rows else 0.5
+            rationale = "Inferred from the available strategic, market, driver, and activation signals."
+
+        return AssessmentMetric(
+            value=max(0.0, min(1.0, round(value, 3))),
+            rationale=rationale,
+            confidence=min(0.65, confidence),
+            citation_chunk_ids=graph_ids,
+            citation_urls=list(OrderedDict.fromkeys(graph_urls)),
+            is_inferred=True,
+        )
+
+    @staticmethod
+    def _graph_market_stats(graph_rows: list[dict[str, Any]]) -> dict[str, float]:
+        revenues = [
+            row.get("metadata", {}).get("revenue_value")
+            for row in graph_rows
+            if row.get("metadata", {}).get("revenue_value") is not None
+        ]
+        forecasts = [
+            row.get("metadata", {}).get("forecast_revenue_value")
+            for row in graph_rows
+            if row.get("metadata", {}).get("forecast_revenue_value") is not None
+        ]
+        cagrs = [
+            row.get("metadata", {}).get("cagr_value")
+            for row in graph_rows
+            if row.get("metadata", {}).get("cagr_value") is not None
+        ]
+        revenue = max([float(item) for item in revenues + forecasts], default=0.0)
+        cagr = max([float(item) for item in cagrs], default=0.0)
+        revenue_score = 0.35
+        if revenue >= 5000:
+            revenue_score = 0.85
+        elif revenue >= 1000:
+            revenue_score = 0.72
+        elif revenue >= 250:
+            revenue_score = 0.58
+        elif revenue > 0:
+            revenue_score = 0.45
+        cagr_bonus = 0.08 if cagr >= 8 else 0.04 if cagr >= 4 else 0.0
+        return {"market_score": min(0.92, revenue_score + cagr_bonus)}
+
+    @staticmethod
+    def _inferred_price_metric(material_name: str | None) -> PriceMetric:
+        if not material_name:
+            return PriceMetric(
+                value=2.0,
+                rationale="No material name was available for price lookup; populated with a broad polymer reference placeholder.",
+                confidence=0.05,
+                citation_chunk_ids=[],
+                citation_urls=[],
+                is_inferred=True,
+            )
+        normalized = material_name.lower()
+        reference_prices = [
+            (("petg",), 2.4),
+            (("pet", "polyethylene terephthalate", "apet", "rpet"), 1.7),
+            (("pvc", "polyvinyl chloride"), 1.35),
+            (("abs",), 2.6),
+            (("polycarbonate", " pc"), 3.2),
+            (("polypropylene", " pp"), 1.15),
+            (("hdpe", "high density polyethylene"), 1.2),
+            (("ldpe", "low density polyethylene", "lldpe"), 1.25),
+            (("polystyrene", " ps", "hips", "gpps"), 1.55),
+            (("acrylic", "pmma"), 2.5),
+            (("polyamide", "nylon", " pa"), 2.8),
+        ]
+        value = next((price for aliases, price in reference_prices if any(alias in normalized for alias in aliases)), 2.0)
+        return PriceMetric(
+            value=value,
+            rationale=(
+                f"Inferred broad USD/kg reference for {material_name} because no structured price evidence "
+                "resolved after local cache lookup and reflection search."
+            ),
+            confidence=0.25,
+            citation_chunk_ids=[],
+            citation_urls=[],
+            is_inferred=True,
+        )
+
     @staticmethod
     def _merge_assessments(assessments: list[ReflectionAssessment]) -> ReflectionAssessment:
         merged = ReflectionAssessment()
@@ -1833,6 +2050,8 @@ class ReflectionAgent:
 
 
 class CoScientistRunner:
+    DEFAULT_AGENTIC_LOOP_SAFETY_CAP = 12
+
     def __init__(
         self,
         config: AppConfig,
@@ -1869,6 +2088,7 @@ class CoScientistRunner:
         self._artifact_store = artifact_store or CoScientistStore()
         self._retriever = LocalEvidenceRetriever(self._evidence_store, self._embedder)
         self._price_cache = StructuredPriceCache(config)
+        self._graph_evidence = GraphMarketEvidence()
         self._manual_ingestor = ManualEvidenceIngestor(
             config,
             EvidenceClassifier(self._reflection_llm),
@@ -1882,7 +2102,7 @@ class CoScientistRunner:
         except Exception:
             LOGGER.exception("Initial structured price cache refresh failed")
         self._planning_agent = ResearchPlanningAgent(self._planning_llm)
-        self._generation_agent = GenerationAgent(self._generation_llm, self._retriever)
+        self._generation_agent = GenerationAgent(self._generation_llm, self._retriever, self._graph_evidence)
         self._ranking_agent = RankingAgent(self._ranking_llm)
         self._evolution_agent = EvolutionAgent(self._evolution_llm)
         self._proximity_agent = ProximityCheckAgent(self._proximity_llm)
@@ -1898,6 +2118,7 @@ class CoScientistRunner:
             self._retriever,
             discovery_tool,
             self._price_cache,
+            self._graph_evidence,
         )
 
     def set_progress_reporter(self, reporter: ProgressReporter | None) -> None:
@@ -2043,7 +2264,7 @@ class CoScientistRunner:
         self,
         research_id: str,
         target_final_hypotheses: int | None = None,
-        max_rounds: int = 1,
+        max_rounds: int | None = None,
         evolve_top_k: int = 5,
         evolved_per_round: int = 5,
         regenerated_per_round: int = 5,
@@ -2075,11 +2296,12 @@ class CoScientistRunner:
         total_synthesized = 0
         total_reflected = 0
         automatic_discovery_runs = 0
-        stop_reason = "max_rounds_reached"
+        round_limit = max_rounds if max_rounds is not None else self.DEFAULT_AGENTIC_LOOP_SAFETY_CAP
+        stop_reason = "safety_round_limit_reached" if max_rounds is None else "max_rounds_reached"
         latest_ranking: RankingRound | None = None
         latest_meta_review: MetaReviewRound | None = None
 
-        for round_index in range(1, max_rounds + 1):
+        for round_index in range(1, round_limit + 1):
             latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
             reflected = [
                 hypothesis
@@ -2089,9 +2311,10 @@ class CoScientistRunner:
             if not reflected:
                 stop_reason = "no_active_reflected_hypotheses"
                 break
+            round_label = self._loop_round_label(round_index, max_rounds)
             self._progress_reporter.start(
                 "ranking",
-                f"Ranking ideas (round {round_index}/{max_rounds})",
+                f"Ranking ideas ({round_label})",
                 len(reflected),
             )
             ranking_round, ranked_hypotheses = self._ranking_agent.rank(
@@ -2103,7 +2326,7 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "ranking",
-                f"Ideas ranked (round {round_index}/{max_rounds})",
+                f"Ideas ranked ({round_label})",
                 len(ranked_hypotheses),
                 len(reflected),
             )
@@ -2117,7 +2340,7 @@ class CoScientistRunner:
                 proximity_hypotheses = self._artifact_store.latest_hypotheses(research_id)
                 self._progress_reporter.start(
                     "proximity",
-                    f"Checking idea overlap (round {round_index}/{max_rounds})",
+                    f"Checking idea overlap ({round_label})",
                     len(proximity_hypotheses),
                 )
                 proximity_round, proximity_updates, synthesized_hypotheses = self._proximity_agent.review(
@@ -2138,7 +2361,7 @@ class CoScientistRunner:
                 )
                 self._progress_reporter.complete(
                     "proximity",
-                    f"Idea overlap checked (round {round_index}/{max_rounds})",
+                    f"Idea overlap checked ({round_label})",
                     len(proximity_hypotheses),
                     len(proximity_hypotheses),
                 )
@@ -2150,7 +2373,7 @@ class CoScientistRunner:
                     synthesized_hypotheses,
                     concurrency=reflection_concurrency,
                     phase="synthesized_reflection",
-                    progress_message=f"Reflecting on synthesized ideas (round {round_index}/{max_rounds})",
+                    progress_message=f"Reflecting on synthesized ideas ({round_label})",
                 )
                 total_reflected += len(reflected_synthesized)
                 automatic_discovery_runs += run_count
@@ -2158,7 +2381,7 @@ class CoScientistRunner:
             latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
             self._progress_reporter.start(
                 "meta_review",
-                f"Reviewing portfolio gaps (round {round_index}/{max_rounds})",
+                f"Reviewing portfolio gaps ({round_label})",
             )
             document, meta_review_round = self._meta_review_agent.review(
                 document=document,
@@ -2170,7 +2393,7 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "meta_review",
-                f"Portfolio gaps reviewed (round {round_index}/{max_rounds})",
+                f"Portfolio gaps reviewed ({round_label})",
             )
             latest_meta_review = meta_review_round
             self._artifact_store.save_research_goal(document)
@@ -2185,14 +2408,12 @@ class CoScientistRunner:
                 len(ranking_round.promoted_hypothesis_ids) >= target_final
                 and promoted_scores
                 and min(promoted_scores[:target_final]) >= promotion_score_threshold
-                and (meta_review_round.coverage_sufficient or not meta_review_round.whitespace_gaps)
+                and meta_review_round.coverage_sufficient
             ):
                 stop_reason = "target_portfolio_reached"
                 break
             if not meta_review_round.should_continue:
                 stop_reason = meta_review_round.stop_reason or "meta_review_stop"
-                break
-            if round_index >= max_rounds:
                 break
 
             parent_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in ranked_hypotheses}
@@ -2205,7 +2426,7 @@ class CoScientistRunner:
                 self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "evolve"}))
             self._progress_reporter.start(
                 "evolution",
-                f"Evolving top ideas (round {round_index}/{max_rounds})",
+                f"Evolving top ideas ({round_label})",
                 len(parents),
             )
             evolved = self._evolution_agent.evolve(
@@ -2217,13 +2438,13 @@ class CoScientistRunner:
             )
             self._progress_reporter.complete(
                 "evolution",
-                f"Top ideas evolved (round {round_index}/{max_rounds})",
+                f"Top ideas evolved ({round_label})",
                 len(evolved),
                 len(parents),
             )
             self._progress_reporter.start(
                 "regeneration",
-                f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                f"Generating replacement ideas ({round_label})",
                 regenerated_per_round,
             )
             regenerated = self._generation_agent.generate_from_meta_review(
@@ -2233,14 +2454,14 @@ class CoScientistRunner:
                 round_index=round_index,
                 on_progress=lambda completed, total, round_index=round_index: self._progress_reporter.advance(
                     "regeneration",
-                    f"Generating replacement ideas (round {round_index}/{max_rounds})",
+                    f"Generating replacement ideas ({self._loop_round_label(round_index, max_rounds)})",
                     completed,
                     total,
                 ),
             )
             self._progress_reporter.complete(
                 "regeneration",
-                f"Replacement ideas generated (round {round_index}/{max_rounds})",
+                f"Replacement ideas generated ({round_label})",
                 len(regenerated),
                 regenerated_per_round,
             )
@@ -2264,7 +2485,7 @@ class CoScientistRunner:
                 new_hypotheses,
                 concurrency=reflection_concurrency,
                 phase="new_reflection",
-                progress_message=f"Reflecting on new ideas (round {round_index}/{max_rounds})",
+                progress_message=f"Reflecting on new ideas ({round_label})",
             )
             total_reflected += len(reflected_new)
             automatic_discovery_runs += run_count
@@ -2302,6 +2523,12 @@ class CoScientistRunner:
             report_path=str(report_path.resolve()),
             stop_reason=stop_reason,
         )
+
+    @staticmethod
+    def _loop_round_label(round_index: int, max_rounds: int | None) -> str:
+        if max_rounds is None:
+            return f"round {round_index}"
+        return f"round {round_index}/{max_rounds}"
 
     def reflect_existing(
         self,

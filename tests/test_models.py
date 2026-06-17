@@ -1,11 +1,16 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+from pydantic import BaseModel
 
 from app_discovery_agent.agent import DiscoveryAgent
 from app_discovery_agent.classify import EvidenceClassifier
+from app_discovery_agent.chunking import TextChunker
+from app_discovery_agent.coscientist_models import HypothesisGenerationOutput
 from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, SearchResultItem
+from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
 
 
 def test_evidence_classification_parses_expected_shape():
@@ -115,6 +120,55 @@ def test_partial_page_is_built_from_search_result():
     assert "PVC applications overview" in page.text
 
 
+def test_discovery_retains_low_relevance_fetched_pages_for_reflection():
+    class LowRelevanceClassifier:
+        def heuristic_relevance(self, query, text):
+            return 0.01
+
+        def classify(self, query, page):
+            return EvidenceClassification.model_validate(
+                {
+                    "relevant": False,
+                    "relevance_score": 0.05,
+                    "confidence_score": 0.2,
+                    "application": None,
+                    "incumbent_material": None,
+                    "candidate_materials": [],
+                    "evidence_type": "market or customer need",
+                    "application_requirements": [],
+                    "substitution_drivers": [],
+                    "rationale": "Indirect market context.",
+                    "supporting_quotes": [],
+                    "metadata": {},
+                }
+            )
+
+    agent = DiscoveryAgent.__new__(DiscoveryAgent)
+    agent._config = type("Config", (), {"min_page_characters": 20, "min_snippet_characters": 20})()
+    agent._classifier = LowRelevanceClassifier()
+    agent._chunker = TextChunker(chunk_size=80, chunk_overlap=0)
+    page = PageContent(
+        title="Adjacent market report",
+        url="https://example.com/market",
+        search_query="application market size",
+        source_domain="example.com",
+        fetched_at=datetime.now(timezone.utc),
+        text="Market revenue, CAGR, application segmentation, and customer demand context for an adjacent market.",
+    )
+
+    state = {"fetched_pages": [page], "skipped_pages": [], "original_query": "PETG application evidence"}
+    state.update(agent.filter_relevance(state))
+    state.update(agent.classify_evidence(state))
+    state.update(agent.chunk_content({**state, "run_id": "run-1"}))
+
+    assert len(state["candidate_pages"]) == 1
+    assert state["candidate_pages"][0].metadata["heuristic_relevance_score"] == 0.01
+    assert len(state["classifications"]) == 1
+    assert state["skipped_pages"] == []
+    assert state["chunk_records"][0].metadata["retained_for_reflection"] is True
+    assert state["chunk_records"][0].metadata["classification_relevant"] is False
+
+
 def test_load_cached_fetched_pages_skips_pdf(tmp_path):
     agent = DiscoveryAgent.__new__(DiscoveryAgent)
     path = tmp_path / "fetched_pages.json"
@@ -197,3 +251,62 @@ def test_llm_json_coercion_uses_first_balanced_object():
     payload = DeepSeekLLM._coerce_json(content)
 
     assert payload == {"ok": True}
+
+
+def test_llm_json_coercion_escapes_raw_control_characters_inside_strings():
+    content = '{\n  "coverage_assessment": "Line one\nLine two\twith tab",\n  "coverage_sufficient": false\n}'
+
+    payload = DeepSeekLLM._coerce_json(content)
+
+    assert payload["coverage_assessment"] == "Line one\nLine two\twith tab"
+    assert payload["coverage_sufficient"] is False
+
+
+def test_complete_json_repairs_malformed_model_output_with_second_pass():
+    class SimpleOutput(BaseModel):
+        title: str
+        summary: str
+
+    responses = [
+        '{\n  "title": "RPET sheet for "signage"",\n  "summary": "Clear recycled sheet for printed display applications."\n}',
+        '{\n  "title": "RPET sheet for \\"signage\\"",\n  "summary": "Clear recycled sheet for printed display applications."\n}',
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_create_completion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=responses.pop(0)))]
+        )
+
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "test-model"
+    llm._create_completion = fake_create_completion
+
+    result = llm.complete_json(SimpleOutput, "system", "user")
+
+    assert result.title == 'RPET sheet for "signage"'
+    assert len(calls) == 2
+    assert calls[1]["temperature"] == 0.0
+    assert "malformed json-like content" in str(calls[1]["messages"][1]["content"]).lower()
+
+
+def test_hypothesis_generation_output_coerces_list_strategic_rationale():
+    payload = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "RPET for blister packaging",
+                    "summary": "Targets rigid clear packaging.",
+                    "strategic_rationale": [
+                        "Bias for materials of commercial interest",
+                        "Rapid monetization",
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload.hypotheses[0].strategic_rationale == (
+        "Bias for materials of commercial interest; Rapid monetization"
+    )

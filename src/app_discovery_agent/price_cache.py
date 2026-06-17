@@ -23,6 +23,7 @@ AVERAGE_URL = "https://www.plasticportal.eu/polymer-prices"
 FX_URL = "https://currencyapi.net/api/v2/rates?base=USD&output=json&key=2b75799b749c380bee772512d4dc883a9f6c"
 PRICE_EVIDENCE_SOURCE_TITLE = "PlasticPortal structured price cache"
 PRICE_CACHE_QUERY = "structured polymer price reference data from PlasticPortal"
+FALLBACK_EUR_USD_RATE = 1.08
 
 
 class PriceCacheEntry(BaseModel):
@@ -107,7 +108,14 @@ class StructuredPriceCache:
             if not material_name:
                 continue
             for entry in self.entries_for_material(material_name, document=document)[:3]:
-                usd_text = f"{entry.price_usd_per_kg:.3f} USD/kg" if entry.price_usd_per_kg is not None else "USD conversion unavailable"
+                usd_value, usd_is_inferred = self._usd_price_for_entry(entry, document)
+                usd_text = (
+                    f"{usd_value:.3f} USD/kg"
+                    if usd_value is not None and not usd_is_inferred
+                    else f"about {usd_value:.3f} USD/kg using fallback FX"
+                    if usd_value is not None
+                    else "USD conversion unavailable"
+                )
                 chunk_text = (
                     f"Structured price reference from PlasticPortal ({entry.source}, {entry.label}): "
                     f"{entry.polymer_name} = {entry.price_eur_per_kg:.3f} EUR/kg ({usd_text}). "
@@ -135,7 +143,8 @@ class StructuredPriceCache:
                             "label": entry.label,
                             "polymer_name": entry.polymer_name,
                             "price_eur_per_kg": entry.price_eur_per_kg,
-                            "price_usd_per_kg": entry.price_usd_per_kg,
+                            "price_usd_per_kg": usd_value,
+                            "price_usd_is_inferred": usd_is_inferred,
                             "cache_path": str(self._cache_path.resolve()),
                         },
                     }
@@ -154,18 +163,20 @@ class StructuredPriceCache:
         if not entries:
             return None
         entry = entries[0]
-        value = entry.price_usd_per_kg
+        value, is_inferred = self._usd_price_for_entry(entry, document)
         rationale = (
             f"Structured PlasticPortal price reference for {entry.polymer_name} "
             f"({entry.source}, {entry.label}) from {entry.raw_price_text}."
         )
+        if value is not None and is_inferred:
+            rationale += f" USD/kg converted from EUR/kg with fallback EUR/USD rate {FALLBACK_EUR_USD_RATE:.2f}."
         return PriceMetric(
             value=value,
             rationale=rationale,
-            confidence=0.8 if value is not None else 0.45,
+            confidence=0.8 if value is not None and not is_inferred else 0.62 if value is not None else 0.45,
             citation_chunk_ids=[f"price-cache:{entry.source}:{entry.normalized_polymer}:{entry.label}"],
             citation_urls=[str(self._cache_path.resolve())],
-            is_inferred=False,
+            is_inferred=is_inferred,
         )
 
     def entries_for_material(
@@ -188,13 +199,26 @@ class StructuredPriceCache:
         response.raise_for_status()
         return response.text
 
+    @staticmethod
+    def _usd_price_for_entry(
+        entry: PriceCacheEntry,
+        document: PriceCacheDocument | None,
+    ) -> tuple[float | None, bool]:
+        if entry.price_usd_per_kg is not None:
+            return entry.price_usd_per_kg, False
+        if document and document.eur_usd_rate is not None:
+            return entry.price_eur_per_kg * document.eur_usd_rate, False
+        return entry.price_eur_per_kg * FALLBACK_EUR_USD_RATE, True
+
     def _fetch_fx_rate(self, existing: PriceCacheDocument | None) -> tuple[float | None, datetime | None]:
         try:
             response = self._session.get(FX_URL, timeout=self._config.request_timeout_seconds)
             response.raise_for_status()
             payload = response.json()
             rates = payload.get("rates", {})
-            eur_rate = rates.get("eur")
+            eur_rate = rates.get("EUR")
+            if eur_rate is None:
+                eur_rate = rates.get("eur")
             if eur_rate is None:
                 raise ValueError("EUR rate missing from exchange response")
             eur_rate = float(eur_rate)
@@ -353,9 +377,15 @@ class StructuredPriceCache:
             "lldpe": ["linear low density polyethylene"],
         }
         for key, values in canonical_aliases.items():
-            if key in normalized:
+            if self._contains_alias(normalized, key):
                 aliases.update(values)
         return sorted({self._normalize_text(alias) for alias in aliases if alias})
+
+    @staticmethod
+    def _contains_alias(normalized_text: str, normalized_alias: str) -> bool:
+        if normalized_text == normalized_alias:
+            return True
+        return re.search(rf"(^|\s){re.escape(normalized_alias)}(\s|$)", normalized_text) is not None
 
     @staticmethod
     def _match_score(target_aliases: set[str], normalized_polymer: str) -> int:

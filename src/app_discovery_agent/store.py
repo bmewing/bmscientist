@@ -25,23 +25,35 @@ class LanceEvidenceStore:
         else:
             listing = self._db.table_names()
         names: set[str] = set()
-        for item in list(listing):
-            normalized = self._normalize_table_name(item)
-            if normalized:
+        listing_items = [listing] if isinstance(listing, dict) else list(listing)
+        for item in listing_items:
+            for normalized in self._normalize_table_names(item):
                 names.add(normalized)
         return names
 
     @staticmethod
     def _normalize_table_name(item: Any) -> str | None:
+        names = LanceEvidenceStore._normalize_table_names(item)
+        return names[0] if names else None
+
+    @staticmethod
+    def _normalize_table_names(item: Any) -> list[str]:
         if isinstance(item, str):
-            return item
+            return [item]
         if isinstance(item, dict):
+            table_names = item.get("tables")
+            if isinstance(table_names, list):
+                return [str(name) for name in table_names if name]
             name = item.get("name")
-            return str(name) if name else None
+            return [str(name)] if name else []
         if isinstance(item, (list, tuple)) and item:
+            if len(item) >= 2 and item[0] == "tables" and isinstance(item[1], list):
+                return [str(name) for name in item[1] if name]
+            if len(item) >= 2 and item[0] == "page_token":
+                return []
             head = item[0]
-            return str(head) if isinstance(head, str) else None
-        return None
+            return [str(head)] if isinstance(head, str) else []
+        return []
 
     def _build_schema(self, vector_dim: int) -> pa.Schema:
         return pa.schema(

@@ -15,7 +15,14 @@ from app_discovery_agent.coscientist_cli import (
     run_coscientist_command,
     run_coscientist_loop_command,
     run_coscientist_reflect_command,
+    run_coscientist_feedback_command,
 )
+from app_discovery_agent.graph_backfill import LanceGraphBackfiller
+from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from app_discovery_agent.graph_backfill import chunk_record_from_lancedb_row
+from app_discovery_agent.embeddings import LocalEmbedder
+from app_discovery_agent.llm import DeepSeekLLM
+from app_discovery_agent.store import LanceEvidenceStore
 
 
 console = Console()
@@ -59,6 +66,23 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--search-results-file")
     replay.add_argument("--fetched-pages-file")
     replay.add_argument("--max-pages", type=int, default=20)
+
+    graph_backfill = subparsers.add_parser("graph-backfill", help="Backfill governed graph enrichments from existing LanceDB evidence.")
+    graph_backfill.add_argument(
+        "--query",
+        default="backfill existing LanceDB evidence into graph enrichment proposals",
+        help="Context query to give the enrichment proposer.",
+    )
+    graph_backfill.add_argument("--batch-size", type=int, default=12)
+    graph_backfill.add_argument("--limit", type=int)
+    graph_backfill.add_argument("--include-claimed", action="store_true", help="Reprocess chunks already present in the graph claim ledger.")
+    graph_backfill.add_argument(
+        "--search-query",
+        action="append",
+        dest="search_queries",
+        help="Vector-search LanceDB first and backfill only matching chunks. May be repeated.",
+    )
+    graph_backfill.add_argument("--top-k-per-query", type=int, default=25)
     add_coscientist_parser(subparsers)
 
     return parser
@@ -154,6 +178,42 @@ def run_replay(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+def run_graph_backfill(args: argparse.Namespace, config: AppConfig) -> int:
+    llm = DeepSeekLLM(config)
+    store = LanceEvidenceStore(config.resolved_lancedb_path())
+    records = None
+    if args.search_queries:
+        embedder = LocalEmbedder(config)
+        records_by_id = {}
+        for search_query in args.search_queries:
+            vector = embedder.embed_query(search_query)
+            for row in store.search_by_vector(vector, top_k=args.top_k_per_query):
+                record = chunk_record_from_lancedb_row(row)
+                if record is not None:
+                    records_by_id.setdefault(record.id, record)
+        records = list(records_by_id.values())
+    backfiller = LanceGraphBackfiller(
+        store,
+        GraphEnrichmentProposer(llm),
+        GraphEnrichmentValidator(llm),
+        GraphEnrichmentStore(),
+    )
+    result = backfiller.run(
+        query=args.query,
+        batch_size=args.batch_size,
+        limit=args.limit,
+        skip_claimed=not args.include_claimed,
+        records=records,
+    )
+    console.print(f"[bold]Scanned chunks:[/bold] {result.scanned_chunks}")
+    console.print(f"[bold]Eligible chunks:[/bold] {result.eligible_chunks}")
+    console.print(f"[bold]Batches:[/bold] {result.batches}")
+    console.print(f"[bold]Proposed claims:[/bold] {result.proposed_claims}")
+    console.print(f"[bold]Accepted claims:[/bold] {result.accepted_claims}")
+    console.print(f"[bold]Backfill details:[/bold] {result.output_path}")
+    return 0
+
+
 def resolve_replay_paths(
     run_id: str | None,
     search_results_file: str | None,
@@ -201,12 +261,16 @@ def main() -> int:
         return run_opportunities(args, config)
     if args.command == "replay":
         return run_replay(args, config)
+    if args.command == "graph-backfill":
+        return run_graph_backfill(args, config)
     if args.command == "coscientist":
         return run_coscientist_command(args, config)
     if args.command == "coscientist-reflect":
         return run_coscientist_reflect_command(args, config)
     if args.command == "coscientist-loop":
         return run_coscientist_loop_command(args, config)
+    if args.command == "coscientist-feedback":
+        return run_coscientist_feedback_command(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

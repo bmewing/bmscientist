@@ -92,6 +92,76 @@ def test_entries_for_material_uses_alias_matching(tmp_path):
     assert petg_entries[0].polymer_name == "PET"
 
 
+def test_entries_for_material_does_not_match_pp_inside_gpps(tmp_path):
+    cache = StructuredPriceCache(
+        AppConfig(deepseek_api_key="x", exa_api_key="y"),
+        cache_path=tmp_path / "prices.json",
+    )
+    document = PriceCacheDocument(
+        fetched_at=datetime.now(timezone.utc),
+        eur_usd_rate=1.1,
+        entries=[
+            PriceCacheEntry(
+                source="average_resin",
+                page_url="https://example.com/avg",
+                label="Average resin prices",
+                polymer_name="PP homo",
+                normalized_polymer="pp homo",
+                price_eur_per_kg=2.4,
+                price_usd_per_kg=2.64,
+                raw_price_text="2.4 EUR/kg",
+                fetched_at=datetime.now(timezone.utc),
+            ),
+            PriceCacheEntry(
+                source="average_resin",
+                page_url="https://example.com/avg",
+                label="Average resin prices",
+                polymer_name="PS HIPS",
+                normalized_polymer="ps hips",
+                price_eur_per_kg=2.1,
+                price_usd_per_kg=2.31,
+                raw_price_text="2.1 EUR/kg",
+                fetched_at=datetime.now(timezone.utc),
+            ),
+        ],
+    )
+
+    entries = cache.entries_for_material("General Purpose Polystyrene (GPPS)", document=document)
+
+    assert entries[0].polymer_name == "PS HIPS"
+    assert all(entry.polymer_name != "PP homo" for entry in entries)
+
+
+def test_metric_for_material_converts_cached_eur_price_when_usd_is_missing(tmp_path):
+    cache = StructuredPriceCache(
+        AppConfig(deepseek_api_key="x", exa_api_key="y"),
+        cache_path=tmp_path / "prices.json",
+    )
+    document = PriceCacheDocument(
+        fetched_at=datetime.now(timezone.utc),
+        eur_usd_rate=None,
+        entries=[
+            PriceCacheEntry(
+                source="weekly_commodity",
+                page_url="https://example.com/weekly",
+                label="Price table 2026 / 23 week",
+                polymer_name="PVC",
+                normalized_polymer="pvc",
+                price_eur_per_kg=1.25,
+                price_usd_per_kg=None,
+                raw_price_text="1 250 EUR / t",
+                fetched_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+
+    metric = cache.metric_for_material("PVC", document=document)
+
+    assert metric is not None
+    assert metric.value == 1.35
+    assert metric.is_inferred is True
+
+
 def test_fetch_fx_rate_uses_reciprocal_of_usd_to_eur_rate(tmp_path):
     cache = StructuredPriceCache(
         AppConfig(deepseek_api_key="x", exa_api_key="y"),
@@ -104,6 +174,31 @@ def test_fetch_fx_rate_uses_reciprocal_of_usd_to_eur_rate(tmp_path):
 
         def json(self):
             return {"rates": {"eur": 0.8}}
+
+    class FakeSession:
+        def get(self, url, timeout):
+            return FakeResponse()
+
+    cache._session = FakeSession()
+
+    rate, fetched_at = cache._fetch_fx_rate(existing=None)
+
+    assert rate == 1.25
+    assert fetched_at is not None
+
+
+def test_fetch_fx_rate_accepts_uppercase_eur_key(tmp_path):
+    cache = StructuredPriceCache(
+        AppConfig(deepseek_api_key="x", exa_api_key="y"),
+        cache_path=tmp_path / "prices.json",
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"rates": {"EUR": 0.8}}
 
     class FakeSession:
         def get(self, url, timeout):
