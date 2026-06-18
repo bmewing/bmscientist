@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmscientist"
-version = "0.1.0"
+version = "0.4.2"
 description = "Agentic framework for scientific materials discovery — hypothesis generation, evidence retrieval, and knowledge graph enrichment."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [
-  { name = "Brian Mark" }
+  { name = "Mark Ewing" }
 ]
 dependencies = [
   "beautifulsoup4>=4.12.3",

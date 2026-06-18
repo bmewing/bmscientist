@@ -45,9 +45,13 @@ PROXIMITY_CHAT_MODEL=deepseek-v4-pro
 META_REVIEW_CHAT_MODEL=deepseek-v4-pro
 ```
 
-* `BMSCIENTIST_DATA_DIR`: Configures where raw data, cache files, knowledge graphs, and generated co-scientist run logs are saved.
-* `CHAT_MODEL` remains the default model. Agent-specific variables let you route expensive reasoning tasks to stronger DeepSeek models without changing the whole app.
-* `HF_TOKEN` is optional but recommended for higher Hugging Face Hub rate limits and authenticated model downloads.
+* `DEEPSEEK_API_KEY` (**Required**): Your DeepSeek API key (used for all LLM reasoning, planning, reflection, and evolution).
+* `EXA_API_KEY` (**Required**): Your Exa search API key (used for web search and page retrieval).
+* `BMSCIENTIST_DATA_DIR` (*Optional*): Configures the base directory where raw data, cache files, knowledge graphs, and generated co-scientist run logs are saved (defaults to `./data`).
+* `LANCEDB_PATH` (*Optional*): Explicit override for the LanceDB directory. If left blank or omitted, it defaults to `BMSCIENTIST_DATA_DIR/lancedb`.
+* `CHAT_MODEL` (*Optional*): Default LLM to use (defaults to `deepseek-v4-flash`). Agent-specific model overrides (e.g., `GENERATION_CHAT_MODEL`, `EVOLUTION_CHAT_MODEL`) allow routing reasoning-heavy tasks to more capable models like `deepseek-v4-pro`.
+* `HF_TOKEN` (*Optional*): Hugging Face token, recommended for avoiding rate limits when downloading embedding models.
+
 
 ## Usage
 
