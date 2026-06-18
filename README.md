@@ -29,9 +29,6 @@ HF_TOKEN=your_huggingface_token
 # Base directory for all cache and generated outputs (defaults to ./data)
 BMSCIENTIST_DATA_DIR=./data
 
-# Optional: Override LanceDB path (defaults to BMSCIENTIST_DATA_DIR/lancedb)
-LANCEDB_PATH=
-
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 REQUEST_TIMEOUT_SECONDS=60
 SKIP_FETCH_DOMAINS=sciencedirect.com
