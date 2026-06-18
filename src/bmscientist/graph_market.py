@@ -12,16 +12,18 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from app_discovery_agent.coscientist_models import Hypothesis, ResearchGoalDocument
+from bmscientist.coscientist_models import Hypothesis, ResearchGoalDocument
 
 
 LOGGER = logging.getLogger(__name__)
-GRAPH_PATH = Path("data/graph")
+DEFAULT_GRAPH_PATH = Path("data/graph")
+GRAPH_PATH = DEFAULT_GRAPH_PATH
+
 
 
 class GraphMarketEvidence:
-    def __init__(self, graph_path: Path = GRAPH_PATH):
-        self._graph_path = graph_path
+    def __init__(self, graph_path: Path | None = None):
+        self._graph_path = graph_path if graph_path is not None else GRAPH_PATH
         self._lock = Lock()
         self._loaded = False
         self._nodes: dict[str, dict[str, dict[str, Any]]] = {}

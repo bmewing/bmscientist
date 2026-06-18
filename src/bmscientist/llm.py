@@ -10,7 +10,7 @@ from openai import OpenAI
 from openai import APITimeoutError
 from pydantic import BaseModel
 
-from app_discovery_agent.config import AppConfig
+from bmscientist.config import AppConfig
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)

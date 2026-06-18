@@ -15,10 +15,10 @@ from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.classify import EvidenceClassifier
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.coscientist_models import (
+from bmscientist.chunking import TextChunker
+from bmscientist.classify import EvidenceClassifier
+from bmscientist.config import AppConfig
+from bmscientist.coscientist_models import (
     AssessmentMetric,
     CoScientistRunResult,
     CoScientistLoopResult,
@@ -45,21 +45,21 @@ from app_discovery_agent.coscientist_models import (
     ResearchPlanDraft,
     SynthesizedHypothesisSeed,
 )
-from app_discovery_agent.coscientist_store import CoScientistStore
-from app_discovery_agent.extract import PageFetcher, extract_domain
-from app_discovery_agent.graph_market import GraphMarketEvidence
-from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
-from app_discovery_agent.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
-from app_discovery_agent.price_cache import StructuredPriceCache
-from app_discovery_agent.prompt_library import PROMPTS
-from app_discovery_agent.search import ExaSearchClient, deduplicate_search_results
+from bmscientist.coscientist_store import CoScientistStore
+from bmscientist.extract import PageFetcher, extract_domain
+from bmscientist.graph_market import GraphMarketEvidence
+from bmscientist.llm import DeepSeekLLM
+from bmscientist.manual_ingest import ManualEvidenceIngestor
+from bmscientist.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
+from bmscientist.price_cache import StructuredPriceCache
+from bmscientist.prompt_library import PROMPTS
+from bmscientist.search import ExaSearchClient, deduplicate_search_results
 
 
 if TYPE_CHECKING:
-    from app_discovery_agent.agent import DiscoveryAgent
-    from app_discovery_agent.embeddings import LocalEmbedder
-    from app_discovery_agent.store import LanceEvidenceStore
+    from bmscientist.agent import DiscoveryAgent
+    from bmscientist.embeddings import LocalEmbedder
+    from bmscientist.store import LanceEvidenceStore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -2073,13 +2073,13 @@ class CoScientistRunner:
         self._proximity_llm = DeepSeekLLM(config, model=config.proximity_chat_model)
         self._meta_review_llm = DeepSeekLLM(config, model=config.meta_review_chat_model)
         if evidence_store is None:
-            from app_discovery_agent.store import LanceEvidenceStore
+            from bmscientist.store import LanceEvidenceStore
 
             self._evidence_store = LanceEvidenceStore(config.resolved_lancedb_path())
         else:
             self._evidence_store = evidence_store
         if embedder is None:
-            from app_discovery_agent.embeddings import LocalEmbedder
+            from bmscientist.embeddings import LocalEmbedder
 
             self._embedder = LocalEmbedder(config)
         else:
@@ -2749,14 +2749,14 @@ class CoScientistRunner:
     ) -> None:
         if worker_count <= 0:
             return
-        project_root = Path(__file__).resolve().parents[2]
+        project_root = self._config.data_dir.resolve().parent
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         for worker_index in range(1, worker_count + 1):
             worker_id = f"{research_id}-reflector-{worker_index}"
             command = [
                 sys.executable,
                 "-m",
-                "app_discovery_agent.cli",
+                "bmscientist.cli",
                 "coscientist-reflect",
                 "--research-id",
                 research_id,

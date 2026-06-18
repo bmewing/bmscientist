@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.price_cache import PriceCacheDocument, PriceCacheEntry, StructuredPriceCache
+from bmscientist.config import AppConfig
+from bmscientist.price_cache import PriceCacheDocument, PriceCacheEntry, StructuredPriceCache
 
 
 def test_parse_weekly_prices_converts_eur_per_ton_to_eur_per_kg(tmp_path):

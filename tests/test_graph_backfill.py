@@ -3,7 +3,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from app_discovery_agent.graph_backfill import chunk_record_from_lancedb_row, existing_claimed_chunk_ids
+from bmscientist.graph_backfill import chunk_record_from_lancedb_row, existing_claimed_chunk_ids
 
 
 def test_chunk_record_from_lancedb_row_reconstructs_model():

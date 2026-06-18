@@ -12,12 +12,12 @@ import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.coscientist_models import PriceMetric
+from bmscientist.config import AppConfig
+from bmscientist.coscientist_models import PriceMetric
 
 
 LOGGER = logging.getLogger(__name__)
-PRICE_CACHE_PATH = Path("data/pricing/plasticportal_prices.json")
+DEFAULT_PRICE_CACHE_PATH = Path("data/pricing/plasticportal_prices.json")
 WEEKLY_URL = "https://www.plasticportal.eu/price-reports"
 AVERAGE_URL = "https://www.plasticportal.eu/polymer-prices"
 FX_URL = "https://currencyapi.net/api/v2/rates?base=USD&output=json&key=2b75799b749c380bee772512d4dc883a9f6c"
@@ -48,9 +48,9 @@ class PriceCacheDocument(BaseModel):
 
 
 class StructuredPriceCache:
-    def __init__(self, config: AppConfig, cache_path: Path = PRICE_CACHE_PATH):
+    def __init__(self, config: AppConfig, cache_path: Path | None = None):
         self._config = config
-        self._cache_path = cache_path
+        self._cache_path = cache_path if cache_path is not None else DEFAULT_PRICE_CACHE_PATH
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": config.user_agent})

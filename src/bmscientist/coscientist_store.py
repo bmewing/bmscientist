@@ -8,7 +8,7 @@ import secrets
 from pathlib import Path
 from uuid import uuid4
 
-from app_discovery_agent.coscientist_models import (
+from bmscientist.coscientist_models import (
     Hypothesis,
     MetaReviewRound,
     ProximityRound,
@@ -208,7 +208,7 @@ class CoScientistStore:
 
         if self.hypothesis_stage(hypothesis) == "reflected":
             try:
-                from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+                from bmscientist.graph_enrichment import GraphEnrichmentStore
                 store = GraphEnrichmentStore()
                 store.promote_hypothesis(hypothesis)
             except Exception as exc:
@@ -546,7 +546,7 @@ class CoScientistStore:
             
         self.save_hypothesis(target)
         
-        from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+        from bmscientist.graph_enrichment import GraphEnrichmentStore
         graph_store = GraphEnrichmentStore()
         graph_status = "rejected" if status in ("rejected", "retired") else status
         graph_store.apply_edge_feedback(

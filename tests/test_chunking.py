@@ -1,4 +1,4 @@
-from app_discovery_agent.chunking import TextChunker
+from bmscientist.chunking import TextChunker
 
 
 def test_chunker_splits_long_text_with_overlap():

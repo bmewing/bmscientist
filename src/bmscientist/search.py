@@ -9,8 +9,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.models import SearchResultItem
+from bmscientist.config import AppConfig
+from bmscientist.models import SearchResultItem
 
 
 LOGGER = logging.getLogger(__name__)

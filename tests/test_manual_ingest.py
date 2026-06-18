@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
-from app_discovery_agent.models import EvidenceClassification
+from bmscientist.chunking import TextChunker
+from bmscientist.config import AppConfig
+from bmscientist.manual_ingest import ManualEvidenceIngestor
+from bmscientist.models import EvidenceClassification
 
 
 class FakeClassifier:

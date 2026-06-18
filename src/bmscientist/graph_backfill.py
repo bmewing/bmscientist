@@ -9,13 +9,14 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
-from app_discovery_agent.models import ChunkRecord
-from app_discovery_agent.store import LanceEvidenceStore
+from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.models import ChunkRecord
+from bmscientist.store import LanceEvidenceStore
 
 
 LOGGER = logging.getLogger(__name__)
-CLAIM_LEDGER_PATH = Path("data/graph/enrichment/GraphEnrichmentClaim.parquet")
+DEFAULT_DATA_DIR = Path("data")
+DEFAULT_CLAIM_LEDGER_PATH = DEFAULT_DATA_DIR / "graph" / "enrichment" / "GraphEnrichmentClaim.parquet"
 
 
 @dataclass(frozen=True)
@@ -35,11 +36,13 @@ class LanceGraphBackfiller:
         proposer: GraphEnrichmentProposer,
         validator: GraphEnrichmentValidator,
         graph_store: GraphEnrichmentStore,
+        data_dir: Path | None = None,
     ):
         self._store = store
         self._proposer = proposer
         self._validator = validator
         self._graph_store = graph_store
+        self._data_dir = data_dir if data_dir is not None else DEFAULT_DATA_DIR
 
     def run(
         self,
@@ -57,7 +60,8 @@ class LanceGraphBackfiller:
             scanned = len(records)
 
         if skip_claimed:
-            claimed_chunk_ids = existing_claimed_chunk_ids()
+            claim_ledger = self._data_dir / "graph" / "enrichment" / "GraphEnrichmentClaim.parquet"
+            claimed_chunk_ids = existing_claimed_chunk_ids(claim_ledger)
             records = [record for record in records if record.id not in claimed_chunk_ids]
         if limit is not None:
             records = records[:limit]
@@ -91,7 +95,7 @@ class LanceGraphBackfiller:
                 accepted,
             )
 
-        output_path = Path("data/raw") / f"{run_id}_graph_backfill.json"
+        output_path = self._data_dir / "raw" / f"{run_id}_graph_backfill.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(
@@ -167,7 +171,7 @@ def none_if_blank(value: Any) -> str | None:
     return text or None
 
 
-def existing_claimed_chunk_ids(path: Path = CLAIM_LEDGER_PATH) -> set[str]:
+def existing_claimed_chunk_ids(path: Path = DEFAULT_CLAIM_LEDGER_PATH) -> set[str]:
     if not path.exists():
         return set()
     try:

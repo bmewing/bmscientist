@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 
 import pyarrow.parquet as pq
 
-from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
-from app_discovery_agent.graph_market import GraphMarketEvidence
-from app_discovery_agent.models import (
+from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_market import GraphMarketEvidence
+from bmscientist.models import (
     ChunkRecord,
     GraphEnrichmentValidationOutput,
 )
@@ -281,12 +281,12 @@ def test_apply_edge_feedback_updates_graph(tmp_path):
 
 def test_apply_hypothesis_feedback_updates_hypothesis_and_graph(tmp_path):
     from tests.test_coscientist import make_reflected_hypothesis
-    from app_discovery_agent.coscientist_store import CoScientistStore
+    from bmscientist.coscientist_store import CoScientistStore
 
     coscientist_path = tmp_path / "coscientist"
     graph_path = tmp_path / "graph"
 
-    import app_discovery_agent.graph_enrichment as ge
+    import bmscientist.graph_enrichment as ge
     original_graph_path = ge.GRAPH_PATH
     ge.GRAPH_PATH = graph_path
 
