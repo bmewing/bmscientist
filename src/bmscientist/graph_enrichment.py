@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-from app_discovery_agent.models import (
+from bmscientist.models import (
     ChunkRecord,
     GraphEnrichmentMetric,
     GraphEnrichmentProposal,
@@ -25,11 +25,13 @@ from app_discovery_agent.models import (
     GraphEnrichmentValidation,
     GraphEnrichmentValidationOutput,
 )
-from app_discovery_agent.prompt_library import PROMPTS
+from bmscientist.prompt_library import PROMPTS
 
 
 LOGGER = logging.getLogger(__name__)
-GRAPH_PATH = Path("data/graph")
+DEFAULT_GRAPH_PATH = Path("data/graph")
+GRAPH_PATH = DEFAULT_GRAPH_PATH
+
 
 
 class FileLock:

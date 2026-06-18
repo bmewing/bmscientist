@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from app_discovery_agent.models import ChunkRecord
-from app_discovery_agent.store import LanceEvidenceStore
+from bmscientist.models import ChunkRecord
+from bmscientist.store import LanceEvidenceStore
 
 
 def test_lancedb_insert_and_vector_retrieval(tmp_path):

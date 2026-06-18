@@ -1,9 +1,9 @@
 import json
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.extract import PageFetcher
-from app_discovery_agent.models import SearchResultItem
-from app_discovery_agent.search import canonicalize_url, deduplicate_search_results, load_search_results_file
+from bmscientist.config import AppConfig
+from bmscientist.extract import PageFetcher
+from bmscientist.models import SearchResultItem
+from bmscientist.search import canonicalize_url, deduplicate_search_results, load_search_results_file
 
 
 def test_canonicalize_url_removes_tracking_and_www():

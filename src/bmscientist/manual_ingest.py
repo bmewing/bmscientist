@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Callable
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.classify import EvidenceClassifier
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.embeddings import LocalEmbedder
-from app_discovery_agent.extract import extract_pdf_text, extract_readable_text
-from app_discovery_agent.models import ChunkRecord, PageContent
-from app_discovery_agent.store import LanceEvidenceStore
+from bmscientist.chunking import TextChunker
+from bmscientist.classify import EvidenceClassifier
+from bmscientist.config import AppConfig
+from bmscientist.embeddings import LocalEmbedder
+from bmscientist.extract import extract_pdf_text, extract_readable_text
+from bmscientist.models import ChunkRecord, PageContent
+from bmscientist.store import LanceEvidenceStore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -23,6 +23,8 @@ MIN_MANUAL_TEXT_CHARACTERS = 40
 
 
 class ManualEvidenceIngestor:
+    DEFAULT_ROOT = Path("data/manually-obtained")
+
     def __init__(
         self,
         config: AppConfig,
@@ -31,6 +33,7 @@ class ManualEvidenceIngestor:
         embedder: LocalEmbedder,
         store: LanceEvidenceStore,
         graph_enrichment_callback: Callable[[str, list[ChunkRecord]], None] | None = None,
+        root_path: Path | None = None,
     ):
         self._config = config
         self._classifier = classifier
@@ -38,7 +41,7 @@ class ManualEvidenceIngestor:
         self._embedder = embedder
         self._store = store
         self._graph_enrichment_callback = graph_enrichment_callback
-        self._root = Path("data/manually-obtained")
+        self._root = root_path if root_path is not None else self.DEFAULT_ROOT
         self._processed_root = self._root / "processed"
         self._root.mkdir(parents=True, exist_ok=True)
         self._processed_root.mkdir(parents=True, exist_ok=True)

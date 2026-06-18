@@ -14,7 +14,7 @@ class _PromptCacheEntry:
 
 class PromptLibrary:
     def __init__(self, base_dir: Path | None = None):
-        self._base_dir = base_dir or Path(__file__).resolve().parents[2] / "prompts" / "agents"
+        self._base_dir = base_dir or Path(__file__).resolve().parent / "prompts" / "agents"
         self._cache: dict[Path, _PromptCacheEntry] = {}
         self._lock = Lock()
 

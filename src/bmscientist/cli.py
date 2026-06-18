@@ -8,21 +8,21 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from app_discovery_agent.agent import DiscoveryAgent, build_opportunity_report
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.coscientist_cli import (
+from bmscientist.agent import DiscoveryAgent, build_opportunity_report
+from bmscientist.config import AppConfig
+from bmscientist.coscientist_cli import (
     add_coscientist_parser,
     run_coscientist_command,
     run_coscientist_loop_command,
     run_coscientist_reflect_command,
     run_coscientist_feedback_command,
 )
-from app_discovery_agent.graph_backfill import LanceGraphBackfiller
-from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
-from app_discovery_agent.graph_backfill import chunk_record_from_lancedb_row
-from app_discovery_agent.embeddings import LocalEmbedder
-from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.store import LanceEvidenceStore
+from bmscientist.graph_backfill import LanceGraphBackfiller
+from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_backfill import chunk_record_from_lancedb_row
+from bmscientist.embeddings import LocalEmbedder
+from bmscientist.llm import DeepSeekLLM
+from bmscientist.store import LanceEvidenceStore
 
 
 console = Console()
@@ -37,7 +37,7 @@ def configure_logging(verbose: bool = False) -> None:
     if not verbose:
         for logger_name in ("httpx", "httpcore", "openai", "sentence_transformers", "transformers"):
             logging.getLogger(logger_name).setLevel(logging.WARNING)
-        logging.getLogger("app_discovery_agent.extract").setLevel(logging.ERROR)
+        logging.getLogger("bmscientist.extract").setLevel(logging.ERROR)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,7 +149,7 @@ def run_opportunities(args: argparse.Namespace, config: AppConfig) -> int:
         return 0
 
     report = build_opportunity_report(agent.llm, filtered, args.incumbent_material, args.candidate_material)
-    report_path = Path("data/outputs") / f'opportunities_{args.incumbent_material}_{args.candidate_material}.md'
+    report_path = config.data_dir / "outputs" / f'opportunities_{args.incumbent_material}_{args.candidate_material}.md'
     report_path.write_text(report, encoding="utf-8")
     console.print(report)
     console.print(f"\nSaved report to {report_path.resolve()}")
@@ -158,7 +158,7 @@ def run_opportunities(args: argparse.Namespace, config: AppConfig) -> int:
 
 def run_replay(args: argparse.Namespace, config: AppConfig) -> int:
     agent = DiscoveryAgent(config)
-    search_results_path, fetched_pages_path = resolve_replay_paths(args.run_id, args.search_results_file, args.fetched_pages_file)
+    search_results_path, fetched_pages_path = resolve_replay_paths(args.run_id, args.search_results_file, args.fetched_pages_file, data_dir=config.data_dir)
     query = args.query or infer_query_from_search_results(search_results_path)
 
     if not query:
@@ -218,6 +218,8 @@ def resolve_replay_paths(
     run_id: str | None,
     search_results_file: str | None,
     fetched_pages_file: str | None,
+    *,
+    data_dir: Path = Path("data"),
 ) -> tuple[Path | None, Path | None]:
     if search_results_file or fetched_pages_file:
         return (
@@ -225,7 +227,7 @@ def resolve_replay_paths(
             Path(fetched_pages_file) if fetched_pages_file else None,
         )
 
-    raw_dir = Path("data/raw")
+    raw_dir = data_dir / "raw"
     if run_id:
         return raw_dir / f"{run_id}_search_results.json", raw_dir / f"{run_id}_fetched_pages.json"
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Iterable
 
-from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.models import EVIDENCE_TYPES, EvidenceClassification, EvidenceClassificationDraft, PageContent
-from app_discovery_agent.prompt_library import PROMPTS
+from bmscientist.llm import DeepSeekLLM
+from bmscientist.models import EVIDENCE_TYPES, EvidenceClassification, EvidenceClassificationDraft, PageContent
+from bmscientist.prompt_library import PROMPTS
 
 
 LOGGER = logging.getLogger(__name__)

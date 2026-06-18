@@ -4,7 +4,7 @@ import os
 
 from sentence_transformers import SentenceTransformer
 
-from app_discovery_agent.config import AppConfig
+from bmscientist.config import AppConfig
 
 
 class LocalEmbedder:

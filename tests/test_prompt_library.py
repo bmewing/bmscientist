@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app_discovery_agent.prompt_library import PromptLibrary
+from bmscientist.prompt_library import PromptLibrary
 
 
 def test_prompt_library_parses_markdown_sections_and_substitutes_values(tmp_path):

@@ -1,6 +1,6 @@
-﻿import sys
+import sys
 
-path = "src/app_discovery_agent/extract.py"
+path = "src/bmscientist/extract.py"
 with open(path, "r", encoding="utf-8") as f:
     content = f.read()
 

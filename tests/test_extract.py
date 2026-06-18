@@ -1,4 +1,4 @@
-from app_discovery_agent.extract import PageFetcher, extract_pdf_text
+from bmscientist.extract import PageFetcher, extract_pdf_text
 
 
 def test_extract_pdf_text_joins_page_text(monkeypatch):
@@ -14,7 +14,7 @@ def test_extract_pdf_text_joins_page_text(monkeypatch):
             self.pages = [FakePage("PVC pipe requirements"), FakePage("chemical resistance and durability")]
             self.metadata = {"/Title": "PVC spec"}
 
-    monkeypatch.setattr("app_discovery_agent.extract.PdfReader", FakeReader)
+    monkeypatch.setattr("bmscientist.extract.PdfReader", FakeReader)
 
     text, metadata = extract_pdf_text(b"%PDF-1.7 fake")
 
@@ -28,7 +28,7 @@ def test_pdf_cache_entry_with_extracted_text_is_kept(tmp_path):
     from datetime import datetime, timezone
     import json
 
-    from app_discovery_agent.agent import DiscoveryAgent
+    from bmscientist.agent import DiscoveryAgent
 
     agent = DiscoveryAgent.__new__(DiscoveryAgent)
     path = tmp_path / "fetched_pages.json"

@@ -5,12 +5,12 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel
 
-from app_discovery_agent.agent import DiscoveryAgent
-from app_discovery_agent.classify import EvidenceClassifier
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.coscientist_models import HypothesisGenerationOutput
-from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
+from bmscientist.agent import DiscoveryAgent
+from bmscientist.classify import EvidenceClassifier
+from bmscientist.chunking import TextChunker
+from bmscientist.coscientist_models import HypothesisGenerationOutput
+from bmscientist.llm import DeepSeekLLM
+from bmscientist.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
 
 
 def test_evidence_classification_parses_expected_shape():

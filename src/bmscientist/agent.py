@@ -9,15 +9,15 @@ from uuid import uuid4, uuid5, NAMESPACE_URL
 
 from langgraph.graph import END, START, StateGraph
 
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.classify import EvidenceClassifier
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.embeddings import LocalEmbedder
-from app_discovery_agent.extract import PageFetcher, extract_domain
-from app_discovery_agent.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
-from app_discovery_agent.llm import DeepSeekLLM
-from app_discovery_agent.manual_ingest import ManualEvidenceIngestor
-from app_discovery_agent.models import (
+from bmscientist.chunking import TextChunker
+from bmscientist.classify import EvidenceClassifier
+from bmscientist.config import AppConfig
+from bmscientist.embeddings import LocalEmbedder
+from bmscientist.extract import PageFetcher, extract_domain
+from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.llm import DeepSeekLLM
+from bmscientist.manual_ingest import ManualEvidenceIngestor
+from bmscientist.models import (
     ChunkRecord,
     DiscoverySummary,
     EvidenceClassification,
@@ -27,9 +27,9 @@ from app_discovery_agent.models import (
     SearchQueryPlan,
     SearchResultItem,
 )
-from app_discovery_agent.prompt_library import PROMPTS
-from app_discovery_agent.search import ExaSearchClient, deduplicate_search_results, load_search_results_file
-from app_discovery_agent.store import LanceEvidenceStore
+from bmscientist.prompt_library import PROMPTS
+from bmscientist.search import ExaSearchClient, deduplicate_search_results, load_search_results_file
+from bmscientist.store import LanceEvidenceStore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -215,7 +215,7 @@ class DiscoveryAgent:
                 LOGGER.exception("Search failed for query %s", query)
                 state.setdefault("errors", []).append(f"search:{query}:{exc}")
 
-        raw_path = Path("data/raw") / f'{state["run_id"]}_search_results.json'
+        raw_path = self._config.data_dir / "raw" / f'{state["run_id"]}_search_results.json'
         raw_path.write_text(json.dumps(raw_payloads, indent=2), encoding="utf-8")
         return {"search_results": all_results}
 
@@ -249,7 +249,7 @@ class DiscoveryAgent:
                 continue
             if page:
                 fetched_pages.append(page)
-        raw_pages_path = Path("data/raw") / f'{state["run_id"]}_fetched_pages.json'
+        raw_pages_path = self._config.data_dir / "raw" / f'{state["run_id"]}_fetched_pages.json'
         raw_pages_path.write_text(
             json.dumps(
                 [
@@ -390,7 +390,7 @@ class DiscoveryAgent:
                 state["run_id"],
                 state["original_query"],
             )
-            raw_path = Path("data/raw") / f'{state["run_id"]}_graph_enrichments.json'
+            raw_path = self._config.data_dir / "raw" / f'{state["run_id"]}_graph_enrichments.json'
             raw_path.write_text(
                 json.dumps(
                     {
@@ -443,7 +443,7 @@ class DiscoveryAgent:
         )
         narrative = self._llm.complete_text(system_prompt, user_prompt)
 
-        output_path = Path("data/outputs") / f'{state["run_id"]}_summary.md'
+        output_path = self._config.data_dir / "outputs" / f'{state["run_id"]}_summary.md'
         output_path.write_text(narrative, encoding="utf-8")
 
         summary = DiscoverySummary(
@@ -469,11 +469,11 @@ class DiscoveryAgent:
             ],
             output_path=str(output_path.resolve()),
         )
-        summary_json_path = Path("data/outputs") / f'{state["run_id"]}_summary.json'
+        summary_json_path = self._config.data_dir / "outputs" / f'{state["run_id"]}_summary.json'
         summary_json_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
-        skipped_path = Path("data/raw") / f'{state["run_id"]}_skipped_pages.json'
+        skipped_path = self._config.data_dir / "raw" / f'{state["run_id"]}_skipped_pages.json'
         skipped_path.write_text(json.dumps(state.get("skipped_pages", []), indent=2), encoding="utf-8")
-        errors_path = Path("data/raw") / f'{state["run_id"]}_errors.json'
+        errors_path = self._config.data_dir / "raw" / f'{state["run_id"]}_errors.json'
         errors_path.write_text(json.dumps(state.get("errors", []), indent=2), encoding="utf-8")
         return {"summary": summary, "output_path": str(output_path.resolve())}
 

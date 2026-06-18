@@ -10,8 +10,8 @@ from rich.console import Group
 from rich.live import Live
 from rich.text import Text
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.coscientist_agents import CoScientistRunner
+from bmscientist.config import AppConfig
+from bmscientist.coscientist_agents import CoScientistRunner
 
 
 console = Console()
@@ -349,8 +349,8 @@ def run_coscientist_feedback_command(
     args: argparse.Namespace,
     config: AppConfig,
 ) -> int:
-    from app_discovery_agent.coscientist_store import CoScientistStore
-    from app_discovery_agent.graph_enrichment import GraphEnrichmentStore
+    from bmscientist.coscientist_store import CoScientistStore
+    from bmscientist.graph_enrichment import GraphEnrichmentStore
 
     store = CoScientistStore()
 

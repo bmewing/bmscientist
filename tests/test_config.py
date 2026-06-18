@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app_discovery_agent.config import AppConfig
+from bmscientist.config import AppConfig
 
 
 def test_config_loads_hf_token_from_env_file(tmp_path):

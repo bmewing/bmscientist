@@ -7,7 +7,7 @@ from typing import Any
 import lancedb
 import pyarrow as pa
 
-from app_discovery_agent.models import ChunkRecord
+from bmscientist.models import ChunkRecord
 
 
 TABLE_NAME = "evidence_chunks"

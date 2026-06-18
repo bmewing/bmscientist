@@ -12,8 +12,8 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from exa_py import Exa
 
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.models import PageContent, SearchResultItem
+from bmscientist.config import AppConfig
+from bmscientist.models import PageContent, SearchResultItem
 
 
 LOGGER = logging.getLogger(__name__)

@@ -7,9 +7,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from app_discovery_agent.chunking import TextChunker
-from app_discovery_agent.config import AppConfig
-from app_discovery_agent.coscientist_agents import (
+from bmscientist.chunking import TextChunker
+from bmscientist.config import AppConfig
+from bmscientist.coscientist_agents import (
     CoScientistRunner,
     DiscoveryEvidenceTool,
     EvolutionAgent,
@@ -22,8 +22,8 @@ from app_discovery_agent.coscientist_agents import (
     ReflectionAgent,
     ResearchPlanningAgent,
 )
-from app_discovery_agent.coscientist_cli import run_coscientist_command, run_coscientist_loop_command
-from app_discovery_agent.coscientist_models import (
+from bmscientist.coscientist_cli import run_coscientist_command, run_coscientist_loop_command
+from bmscientist.coscientist_models import (
     Hypothesis,
     HypothesisEvolutionOutput,
     HypothesisGenerationOutput,
@@ -37,9 +37,9 @@ from app_discovery_agent.coscientist_models import (
     ReflectionSearchLimits,
     ResearchGoalDocument,
 )
-from app_discovery_agent.coscientist_store import CoScientistStore
-from app_discovery_agent.graph_market import GraphMarketEvidence
-from app_discovery_agent.models import EvidenceClassification, PageContent
+from bmscientist.coscientist_store import CoScientistStore
+from bmscientist.graph_market import GraphMarketEvidence
+from bmscientist.models import EvidenceClassification, PageContent
 
 
 class FakeEmbedder:
@@ -509,7 +509,7 @@ def test_agent_specific_model_selection_from_config():
         generation_chat_model="deepseek-v4-pro",
     )
 
-    from app_discovery_agent.llm import DeepSeekLLM
+    from bmscientist.llm import DeepSeekLLM
 
     generation_llm = DeepSeekLLM(config, model=config.generation_chat_model)
     reflection_llm = DeepSeekLLM(config, model=config.reflection_chat_model)
@@ -575,7 +575,7 @@ def test_generation_from_meta_review_uses_only_meta_review_guidance():
             "coverage_sufficient": False,
         }
     )
-    from app_discovery_agent.coscientist_models import MetaReviewRound
+    from bmscientist.coscientist_models import MetaReviewRound
 
     generated = agent.generate_from_meta_review(
         make_document(),
@@ -1119,7 +1119,7 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
             return preferred_name or "calm-river-beacon"
 
         def run(self, **kwargs):
-            from app_discovery_agent.coscientist_models import CoScientistRunResult
+            from bmscientist.coscientist_models import CoScientistRunResult
             assert kwargs["project_name"] == "calm-river-beacon"
             assert kwargs["spawn_reflection_daemons"] is True
 
@@ -1134,7 +1134,7 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
             )
 
         def run_loop(self, **kwargs):
-            from app_discovery_agent.coscientist_models import CoScientistLoopResult
+            from bmscientist.coscientist_models import CoScientistLoopResult
 
             assert kwargs["research_id"] == "research-123"
             return CoScientistLoopResult(
@@ -1186,14 +1186,14 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
 
 
 def test_coscientist_reflect_cli_smoke_writes_expected_summary(tmp_path):
-    from app_discovery_agent.coscientist_cli import run_coscientist_reflect_command
+    from bmscientist.coscientist_cli import run_coscientist_reflect_command
 
     class FakeRunner:
         def __init__(self, config):
             self.config = config
 
         def reflect_existing(self, **kwargs):
-            from app_discovery_agent.coscientist_models import CoScientistRunResult
+            from bmscientist.coscientist_models import CoScientistRunResult
 
             assert kwargs["research_id"] == "research-123"
             assert kwargs["daemon"] is False
@@ -1239,7 +1239,7 @@ def test_coscientist_loop_cli_smoke_writes_expected_summary(tmp_path):
             self.config = config
 
         def run_loop(self, **kwargs):
-            from app_discovery_agent.coscientist_models import CoScientistLoopResult
+            from bmscientist.coscientist_models import CoScientistLoopResult
 
             assert kwargs["research_id"] == "research-123"
             return CoScientistLoopResult(

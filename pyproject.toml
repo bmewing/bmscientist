@@ -3,14 +3,14 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "app-discovery-agent"
-version = "0.1.0"
-description = "Local MVP for discovering application-development evidence and summarizing material substitution opportunities."
+name = "bmscientist"
+version = "0.4.2"
+description = "Agentic framework for scientific materials discovery — hypothesis generation, evidence retrieval, and knowledge graph enrichment."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [
-  { name = "OpenAI Codex" }
+  { name = "Mark Ewing" }
 ]
 dependencies = [
   "beautifulsoup4>=4.12.3",
@@ -32,8 +32,14 @@ dev = [
   "pytest>=8.3.3",
 ]
 
+[project.scripts]
+bmscientist = "bmscientist.cli:main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/app_discovery_agent"]
+packages = ["src/bmscientist"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/bmscientist/prompts" = "bmscientist/prompts"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
