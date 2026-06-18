@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,14 +64,22 @@ class ExaSearchClient:
     def __init__(self, config: AppConfig):
         self._api_key = config.exa_api_key
         self._timeout = config.request_timeout_seconds
-        self._session = requests.Session()
-        self._session.headers.update(
-            {
-                "x-api-key": self._api_key,
-                "Content-Type": "application/json",
-                "User-Agent": config.user_agent,
-            }
-        )
+        self._config = config
+        self._thread_local = threading.local()
+
+    @property
+    def session(self) -> requests.Session:
+        if not hasattr(self._thread_local, "session"):
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "x-api-key": self._api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": self._config.user_agent,
+                }
+            )
+            self._thread_local.session = session
+        return self._thread_local.session
 
     def search(self, query: str, num_results: int) -> SearchResponse:
         payload = {
@@ -78,7 +87,7 @@ class ExaSearchClient:
             "numResults": num_results,
             "moderation": True,
         }
-        response = self._session.post("https://api.exa.ai/search", json=payload, timeout=self._timeout)
+        response = self.session.post("https://api.exa.ai/search", json=payload, timeout=self._timeout)
         response.raise_for_status()
         raw_payload = response.json()
         items = [self._to_result_item(query, item) for item in raw_payload.get("results", [])]

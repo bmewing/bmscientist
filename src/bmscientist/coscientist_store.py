@@ -503,6 +503,12 @@ class CoScientistStore:
         status: str | None = None,
         confidence: float | None = None,
         comment: str | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+        candidate_material: str | None = None,
+        incumbent_material: str | None = None,
+        application: str | None = None,
+        strategic_rationale: str | None = None,
     ) -> Hypothesis | None:
         """
         Applies feedback to a specific hypothesis in the research run.
@@ -519,6 +525,10 @@ class CoScientistStore:
         if not target:
             return None
             
+        is_edited = any(v is not None for v in [title, summary, candidate_material, incumbent_material, application, strategic_rationale])
+        if is_edited and not status:
+            status = "edited"
+
         assessment = target.reflection_assessment
         if assessment:
             if comment:
@@ -526,24 +536,41 @@ class CoScientistStore:
             if status:
                 assessment.evidence_gap_notes.append(f"Human feedback status: {status}")
                 
+        update_dict = {}
+        if status:
+            update_dict["user_feedback_status"] = status
+        if comment:
+            update_dict["user_feedback_comment"] = comment
+            
+        if title is not None:
+            update_dict["title"] = title
+        if summary is not None:
+            update_dict["summary"] = summary
+        if candidate_material is not None:
+            update_dict["candidate_material"] = candidate_material
+        if incumbent_material is not None:
+            update_dict["incumbent_material"] = incumbent_material
+        if application is not None:
+            update_dict["application"] = application
+        if strategic_rationale is not None:
+            update_dict["strategic_rationale"] = strategic_rationale
+
         if status == "rejected" or status == "retired":
-            target = target.model_copy(
-                update={
-                    "is_active": False,
-                    "status": "retired",
-                    "retired_reason": comment or f"Retired by user feedback (status: {status})",
-                }
-            )
+            update_dict.update({
+                "is_active": False,
+                "status": "retired",
+                "retired_reason": comment or f"Retired by user feedback (status: {status})",
+            })
         else:
             notes = list(target.evolution_notes)
             if comment:
                 notes.append(f"Feedback: {comment}")
-            target = target.model_copy(
-                update={
-                    "evolution_notes": notes,
-                }
-            )
+            update_dict.update({
+                "evolution_notes": notes,
+                "is_active": True,
+            })
             
+        target = target.model_copy(update=update_dict)
         self.save_hypothesis(target)
         
         from bmscientist.graph_enrichment import GraphEnrichmentStore

@@ -116,6 +116,7 @@ class ReflectionSearchLimits(BaseModel):
 
 class ResearchGoalDocument(BaseModel):
     research_id: str
+    project_title: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     raw_goal: str
     target_hypotheses_final: int = Field(ge=1)
@@ -185,6 +186,48 @@ class ResearchPlanDraft(BaseModel):
     success_definition: str = Field(default="")
 
     @field_validator(
+        "strategic_fit_criteria",
+        "target_incumbent_materials",
+        "preferred_candidate_materials",
+        "candidate_material_preferences",
+        "recycling_or_sustainability_angles",
+        "material_scope",
+        "application_scope",
+        "opportunity_modes",
+        "commercialization_constraints",
+        mode="before",
+    )
+    @classmethod
+    def default_list_fields(cls, value: Any) -> list[str]:
+        return coerce_string_list(value)
+
+    @field_validator("ranking_weights", mode="before")
+    @classmethod
+    def default_weights(cls, value: Any) -> dict[str, float]:
+        if value is None:
+            return {}
+        return {str(key): float(raw_value) for key, raw_value in value.items()}
+
+
+class UpdatedResearchPlan(BaseModel):
+    raw_goal: str
+    regions: list[str] = Field(default_factory=list)
+    strategic_fit_criteria: list[str] = Field(default_factory=list)
+    target_incumbent_materials: list[str] = Field(default_factory=list)
+    preferred_candidate_materials: list[str] = Field(default_factory=list)
+    candidate_material_preferences: list[str] = Field(default_factory=list)
+    recycling_or_sustainability_angles: list[str] = Field(default_factory=list)
+    material_scope: list[str] = Field(default_factory=list)
+    application_scope: list[str] = Field(default_factory=list)
+    opportunity_modes: list[str] = Field(default_factory=list)
+    opportunity_speed_horizon_months: int | None = Field(default=None, ge=1)
+    commercialization_constraints: list[str] = Field(default_factory=list)
+    ranking_weights: dict[str, float] = Field(default_factory=dict)
+    success_definition: str = Field(default="")
+    strategic_fit_notes: str | None = None
+
+    @field_validator(
+        "regions",
         "strategic_fit_criteria",
         "target_incumbent_materials",
         "preferred_candidate_materials",
@@ -366,6 +409,8 @@ class Hypothesis(BaseModel):
     retired_reason: str | None = None
     superseded_by_hypothesis_id: str | None = None
     merged_from_hypothesis_ids: list[str] = Field(default_factory=list)
+    user_feedback_status: Literal["accepted", "rejected", "edited", None] = None
+    user_feedback_comment: str | None = None
 
     @field_validator(
         "region_scope",

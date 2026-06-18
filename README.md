@@ -115,6 +115,34 @@ Run the Ranking Agent, Proximity Check Agent, Meta-review Agent, Evolution Agent
 
 The loop ranks active reflected hypotheses, clusters concepts, synthesizes overlapping ideas, reflects on synthesized variants, and uses meta-review whitespace analysis to control loop continuation.
 
+### 4. Human Feedback & Steering
+
+Provide human feedback on hypotheses (accepting, rejecting, or editing specific fields), update project-level goals, or run explicit meta-reviews to steer generation.
+
+#### Apply feedback/edits to a hypothesis:
+```powershell
+# Accept a hypothesis with a comment
+.\.venv\Scripts\python.exe -m bmscientist coscientist-feedback --research-id YOUR_RESEARCH_ID --hypothesis-id HYPOTHESIS_ID --status accepted --comment "Highly viable regulatory path"
+
+# Reject/retire a hypothesis
+.\.venv\Scripts\python.exe -m bmscientist coscientist-feedback --research-id YOUR_RESEARCH_ID --hypothesis-id HYPOTHESIS_ID --status rejected --comment "Material too expensive"
+
+# Edit specific fields on a hypothesis (marks status as 'edited')
+.\.venv\Scripts\python.exe -m bmscientist coscientist-feedback --research-id YOUR_RESEARCH_ID --hypothesis-id HYPOTHESIS_ID --title "New Hypothesis Title" --summary "Updated summary of hypothesis"
+```
+
+#### Update project direction & auto-re-rank:
+Updating the overall project goals/criteria triggers the ranking agent to automatically re-evaluate and re-rank all active hypotheses under the new direction:
+```powershell
+.\.venv\Scripts\python.exe -m bmscientist coscientist-feedback --research-id YOUR_RESEARCH_ID --project-feedback "Shift focus to European regions and prioritize recyclability/circular economy drivers."
+```
+
+#### Explicitly trigger a meta-review round:
+Explicitly run the Meta-Review Agent to assess portfolio gaps, update whitespace guidance, and evolve high-scoring/accepted hypotheses:
+```powershell
+.\.venv\Scripts\python.exe -m bmscientist coscientist-meta-review --research-id YOUR_RESEARCH_ID --evolve-top-k 5 --evolved-per-round 5
+```
+
 ## Directory Structure
 
 Under the directory configured by `BMSCIENTIST_DATA_DIR` (defaults to `./data`):

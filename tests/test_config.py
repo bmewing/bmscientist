@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 
 from bmscientist.config import AppConfig
@@ -19,3 +20,25 @@ def test_config_loads_hf_token_from_env_file(tmp_path):
     config = AppConfig.from_env(env_path)
 
     assert config.hf_token == "hf_test_token"
+
+
+def test_config_missing_keys_throws_runtime_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "DEEPSEEK_API_KEY=",
+                "EXA_API_KEY=",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        AppConfig.from_env(env_path)
+
+    assert "Invalid or missing configuration keys" in str(exc_info.value)
+    assert "deepseek_api_key" in str(exc_info.value)

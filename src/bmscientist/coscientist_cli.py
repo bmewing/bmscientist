@@ -151,9 +151,19 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     feedback.add_argument("--application", help="Application name (optional if --hypothesis-id is specified)")
     feedback.add_argument("--volume", type=float, help="Corrected volume value (e.g. 0.0 for near-zero volume)")
     feedback.add_argument("--volume-unit", default="tonnes", help="Volume unit")
-    feedback.add_argument("--status", choices=["accepted", "rejected", "retired", "low_volume"], default="rejected", help="Feedback status")
+    feedback.add_argument("--status", choices=["accepted", "rejected", "retired", "low_volume", "edited"], help="Feedback status")
     feedback.add_argument("--confidence", type=float, help="Feedback confidence score (0.0 to 1.0)")
     feedback.add_argument("--comment", help="Feedback comment or retired reason")
+    feedback.add_argument("--title", help="Edit: new title for the hypothesis")
+    feedback.add_argument("--summary", help="Edit: new summary for the hypothesis")
+    feedback.add_argument("--strategic-rationale", help="Edit: new strategic rationale for the hypothesis")
+    feedback.add_argument("--project-feedback", help="Provide overall project-level feedback or new direction to update project goals")
+
+    meta_review = subparsers.add_parser("coscientist-meta-review", help="Explicitly run a meta-review pass to identify gaps and update project guidance.")
+    meta_review.add_argument("--research-id", "--project-name", dest="research_id", required=True)
+    meta_review.add_argument("--evolve-top-k", type=int, default=5, help="Number of top hypotheses to consider for evolution.")
+    meta_review.add_argument("--evolved-per-round", type=int, default=5, help="Number of evolved hypotheses to generate.")
+    meta_review.add_argument("--reflection-concurrency", type=int, default=3, help="Reflection concurrency.")
 
     coscientist.add_argument("--skip-loop", action="store_true")
     coscientist.add_argument("--target-final-hypotheses", type=int)
@@ -354,6 +364,52 @@ def run_coscientist_feedback_command(
 
     store = CoScientistStore()
 
+    project_feedback = getattr(args, "project_feedback", None)
+    if project_feedback:
+        document = store.load_research_goal(args.research_id)
+        if not document:
+            console.print(f"[bold red]Research project {args.research_id} not found.[/bold red]")
+            return 1
+
+        from bmscientist.coscientist_agents import ResearchPlanningAgent, RankingAgent, DeepSeekLLM
+        
+        console.print(f"[bold]Updating project goals for {args.research_id} using feedback: '{project_feedback}'...[/bold]")
+        planning_llm = DeepSeekLLM(config, model=config.planning_chat_model)
+        planning_agent = ResearchPlanningAgent(planning_llm)
+        updated_document = planning_agent.update_research_goal(document, project_feedback)
+        store.save_research_goal(updated_document)
+        console.print("[bold green]Successfully updated project goals.[/bold green]")
+
+        # Trigger ranking agent to re-rank the existing hypotheses
+        latest_hypotheses = store.latest_hypotheses(args.research_id)
+        active_reflected = [
+            h for h in latest_hypotheses
+            if h.status == "reflected" and h.is_active
+        ]
+        if active_reflected:
+            console.print(f"[bold]Re-ranking {len(active_reflected)} active reflected hypotheses...[/bold]")
+            ranking_llm = DeepSeekLLM(config, model=config.ranking_chat_model)
+            ranking_agent = RankingAgent(ranking_llm)
+            
+            rounds = store.load_ranking_rounds(args.research_id)
+            next_round_index = len(rounds) + 1
+            
+            ranking_round, ranked_hypotheses = ranking_agent.rank(
+                document=updated_document,
+                hypotheses=active_reflected,
+                round_index=next_round_index,
+                target_final_count=updated_document.target_hypotheses_final,
+                evolve_top_k=5,
+            )
+            store.append_ranking_round(ranking_round)
+            for hypothesis in ranked_hypotheses:
+                store.save_hypothesis(hypothesis)
+            console.print(f"[bold green]Successfully re-ranked hypotheses (ranking round {next_round_index} saved).[/bold green]")
+        else:
+            console.print("[yellow]No active reflected hypotheses to re-rank.[/yellow]")
+
+        return 0
+
     if args.hypothesis_id:
         console.print(f"[bold]Applying feedback to hypothesis {args.hypothesis_id} in run {args.research_id}...[/bold]")
         updated = store.apply_hypothesis_feedback(
@@ -364,6 +420,12 @@ def run_coscientist_feedback_command(
             status=args.status,
             confidence=args.confidence,
             comment=args.comment,
+            title=getattr(args, "title", None),
+            summary=getattr(args, "summary", None),
+            candidate_material=getattr(args, "candidate", None),
+            incumbent_material=getattr(args, "incumbent", None),
+            application=getattr(args, "application", None),
+            strategic_rationale=getattr(args, "strategic_rationale", None),
         )
         if not updated:
             console.print(f"[bold red]Hypothesis {args.hypothesis_id} not found in run {args.research_id}.[/bold red]")
@@ -376,7 +438,8 @@ def run_coscientist_feedback_command(
 
         console.print(f"[bold]Applying direct graph feedback for {args.candidate} replacing {args.incumbent} in {args.application}...[/bold]")
         graph_store = GraphEnrichmentStore()
-        graph_status = "rejected" if args.status in ("rejected", "retired") else args.status
+        status_val = args.status or "rejected"
+        graph_status = "rejected" if status_val in ("rejected", "retired") else status_val
         updated_count = graph_store.apply_edge_feedback(
             candidate_material=args.candidate,
             incumbent_material=args.incumbent,
@@ -389,5 +452,115 @@ def run_coscientist_feedback_command(
         )
         console.print(f"[bold green]Successfully updated {updated_count} edges in the knowledge graph.[/bold green]")
 
+    return 0
+
+
+def run_coscientist_meta_review_command(
+    args: argparse.Namespace,
+    config: AppConfig,
+) -> int:
+    from bmscientist.coscientist_store import CoScientistStore
+    from bmscientist.coscientist_agents import CoScientistRunner, DeepSeekLLM
+    
+    store = CoScientistStore()
+    document = store.load_research_goal(args.research_id)
+    if not document:
+        console.print(f"[bold red]Research project {args.research_id} not found.[/bold red]")
+        return 1
+        
+    console.print(f"[bold]Running explicit meta-review and evolution for run {args.research_id}...[/bold]")
+    
+    runner = CoScientistRunner(config, artifact_store=store)
+    
+    meta_rounds = store.load_meta_review_rounds(args.research_id)
+    round_index = len(meta_rounds) + 1
+    
+    # 1. Rank current hypotheses
+    latest_hypotheses = store.latest_hypotheses(args.research_id)
+    active_reflected = [
+        h for h in latest_hypotheses
+        if h.status == "reflected" and h.is_active
+    ]
+    
+    if not active_reflected:
+        console.print("[bold red]No active reflected hypotheses found. Cannot run meta-review.[/bold red]")
+        return 1
+        
+    console.print(f"[bold]Ranking {len(active_reflected)} active reflected hypotheses...[/bold]")
+    ranking_round, ranked_hypotheses = runner._ranking_agent.rank(
+        document=document,
+        hypotheses=active_reflected,
+        round_index=round_index,
+        target_final_count=document.target_hypotheses_final,
+        evolve_top_k=args.evolve_top_k,
+    )
+    store.append_ranking_round(ranking_round)
+    for hypothesis in ranked_hypotheses:
+        store.save_hypothesis(hypothesis)
+        
+    # 2. Run meta-review
+    console.print("[bold]Reviewing portfolio gaps...[/bold]")
+    updated_document, meta_review_round = runner._meta_review_agent.review(
+        document=document,
+        hypotheses=ranked_hypotheses,
+        ranking_round=ranking_round,
+        round_index=round_index,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
+    )
+    store.save_research_goal(updated_document)
+    store.append_meta_review_round(meta_review_round)
+    
+    console.print("[bold green]Meta-Review completed successfully![/bold green]")
+    console.print(f"[bold]Whitespace Gaps:[/bold] {meta_review_round.whitespace_gaps}")
+    console.print(f"[bold]Generation Guidance:[/bold] {meta_review_round.generation_guidance}")
+    
+    # 3. Evolve parent hypotheses
+    parent_by_id = {h.hypothesis_id: h for h in ranked_hypotheses}
+    parents = [
+        parent_by_id[h_id]
+        for h_id in ranking_round.evolved_parent_hypothesis_ids
+        if h_id in parent_by_id
+    ]
+    
+    if parents:
+        console.print(f"[bold]Evolving {len(parents)} parent hypotheses (including accepted ones)...[/bold]")
+        for parent in parents:
+            store.append_hypothesis_snapshot(parent.model_copy(update={"status": "evolve"}))
+            
+        evolved = runner._evolution_agent.evolve(
+            document=updated_document,
+            parent_hypotheses=parents,
+            ranking_round=ranking_round,
+            target_count=args.evolved_per_round,
+            round_index=round_index,
+        )
+        
+        new_hypotheses = runner._dedupe_new_hypotheses(
+            evolved,
+            existing_hypothesis_ids={h.hypothesis_id for h in store.latest_hypotheses(args.research_id)},
+        )
+        
+        for parent in parents:
+            store.append_hypothesis_snapshot(parent.model_copy(update={"status": "reflected"}))
+            
+        for h in new_hypotheses:
+            store.append_hypothesis_snapshot(h)
+            
+        if new_hypotheses:
+            console.print(f"[bold]Reflecting on {len(new_hypotheses)} new evolved hypotheses...[/bold]")
+            reflected_new, run_count = runner._reflect_and_append(
+                updated_document,
+                new_hypotheses,
+                concurrency=args.reflection_concurrency,
+                phase="new_reflection",
+                progress_message="Reflecting on new evolved ideas",
+            )
+            console.print(f"[bold green]Successfully generated and reflected {len(reflected_new)} evolved hypotheses.[/bold green]")
+        else:
+            console.print("[yellow]No new evolved hypotheses generated (all duplicates).[/yellow]")
+    else:
+        console.print("[yellow]No parent hypotheses identified for evolution.[/yellow]")
+        
     return 0
 

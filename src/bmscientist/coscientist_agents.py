@@ -44,6 +44,7 @@ from bmscientist.coscientist_models import (
     ResearchGoalDocument,
     ResearchPlanDraft,
     SynthesizedHypothesisSeed,
+    UpdatedResearchPlan,
 )
 from bmscientist.coscientist_store import CoScientistStore
 from bmscientist.extract import PageFetcher, extract_domain
@@ -78,6 +79,8 @@ class ProgressReporter(Protocol):
         total: int | None = None,
     ) -> None: ...
 
+    def details(self, phase: str, lines: list[str]) -> None: ...
+
 
 class NullProgressReporter:
     def start(self, phase: str, message: str, total: int | None = None) -> None:
@@ -93,6 +96,9 @@ class NullProgressReporter:
         completed: int | None = None,
         total: int | None = None,
     ) -> None:
+        return None
+
+    def details(self, phase: str, lines: list[str]) -> None:
         return None
 
 
@@ -499,6 +505,39 @@ class ResearchPlanningAgent:
             strategic_fit_notes=strategic_fit_notes,
         )
 
+    def update_research_goal(
+        self,
+        document: ResearchGoalDocument,
+        feedback: str,
+    ) -> ResearchGoalDocument:
+        system_prompt = PROMPTS.render("research_planning_agent", "update_research_goal.system")
+        user_prompt = PROMPTS.render(
+            "research_planning_agent",
+            "update_research_goal.user",
+            current_goal_json=document.model_dump_json(indent=2),
+            feedback=feedback,
+        )
+        updated = self._llm.complete_json(UpdatedResearchPlan, system_prompt, user_prompt)
+        return document.model_copy(
+            update={
+                "raw_goal": updated.raw_goal,
+                "regions": updated.regions,
+                "strategic_fit_criteria": updated.strategic_fit_criteria,
+                "target_incumbent_materials": updated.target_incumbent_materials,
+                "preferred_candidate_materials": updated.preferred_candidate_materials,
+                "candidate_material_preferences": updated.candidate_material_preferences,
+                "recycling_or_sustainability_angles": updated.recycling_or_sustainability_angles,
+                "material_scope": updated.material_scope,
+                "application_scope": updated.application_scope,
+                "opportunity_modes": updated.opportunity_modes,
+                "opportunity_speed_horizon_months": updated.opportunity_speed_horizon_months,
+                "commercialization_constraints": updated.commercialization_constraints,
+                "ranking_weights": updated.ranking_weights,
+                "success_definition": updated.success_definition,
+                "strategic_fit_notes": updated.strategic_fit_notes,
+            }
+        )
+
 
 class GenerationAgent:
     _batch_size = 5
@@ -781,12 +820,20 @@ class RankingAgent:
             )
             for index, item in enumerate(rankings)
         ]
+        candidates_by_id = {h.hypothesis_id: h for h in candidates}
         promoted_ids = [item.hypothesis_id for item in normalized_rankings[:target_final_count]]
-        evolved_parent_ids = [
-            item.hypothesis_id
-            for item in normalized_rankings
-            if item.recommended_action in {"advance", "evolve"}
-        ][:evolve_top_k]
+        
+        evolved_parent_ids = []
+        for item in normalized_rankings:
+            hyp = candidates_by_id.get(item.hypothesis_id)
+            is_accepted = hyp and hyp.user_feedback_status == "accepted"
+            is_high_score = item.score >= 0.5
+            
+            is_normal_evolve = (item.recommended_action in {"advance", "evolve"} and len(evolved_parent_ids) < evolve_top_k)
+            if is_normal_evolve or (is_accepted and is_high_score):
+                if item.hypothesis_id not in evolved_parent_ids:
+                    evolved_parent_ids.append(item.hypothesis_id)
+                    
         rejected_ids = [item.hypothesis_id for item in normalized_rankings if item.recommended_action == "reject"]
         scores = [item.score for item in normalized_rankings]
         ranking_round = RankingRound(
@@ -843,6 +890,8 @@ class RankingAgent:
                 "heuristic_score": round(heuristic_by_id.get(hypothesis.hypothesis_id, 0.0), 3),
                 "reflection": self._assessment_payload(hypothesis.reflection_assessment),
                 "evidence_gaps": (hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []),
+                "user_feedback_status": hypothesis.user_feedback_status,
+                "user_feedback_comment": hypothesis.user_feedback_comment,
             }
             for hypothesis in candidates
         ]
@@ -1406,6 +1455,8 @@ class MetaReviewAgent:
                 "evidence_gaps": (
                     hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []
                 ),
+                "user_feedback_status": hypothesis.user_feedback_status,
+                "user_feedback_comment": hypothesis.user_feedback_comment,
             }
             for hypothesis in hypotheses
         ]
