@@ -71,7 +71,21 @@ class AppConfig(BaseModel):
         if lancedb_env:
             values["lancedb_path"] = Path(lancedb_env)
 
-        return cls.model_validate(values)
+        from pydantic import ValidationError
+        try:
+            return cls.model_validate(values)
+        except ValidationError as e:
+            invalid_fields = []
+            for err in e.errors():
+                loc = err.get("loc", ())
+                if loc:
+                    invalid_fields.append(str(loc[0]))
+            if invalid_fields:
+                raise RuntimeError(
+                    f"Invalid or missing configuration keys: {', '.join(invalid_fields)}. "
+                    "Please check that your backend/.env file contains all required variables with valid values."
+                )
+            raise
 
     def resolved_lancedb_path(self) -> Path:
         return self.lancedb_path.expanduser().resolve()

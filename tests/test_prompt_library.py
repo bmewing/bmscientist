@@ -28,7 +28,7 @@ def test_prompt_library_parses_markdown_sections_and_substitutes_values(tmp_path
 
 
 def test_prompt_library_uses_repo_prompt_files():
-    library = PromptLibrary(base_dir=Path(__file__).resolve().parents[1] / "prompts" / "agents")
+    library = PromptLibrary(base_dir=Path(__file__).resolve().parents[1] / "src" / "bmscientist" / "prompts" / "agents")
 
     rendered = library.render(
         "generation_agent",

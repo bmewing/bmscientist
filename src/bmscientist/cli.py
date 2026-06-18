@@ -16,6 +16,7 @@ from bmscientist.coscientist_cli import (
     run_coscientist_loop_command,
     run_coscientist_reflect_command,
     run_coscientist_feedback_command,
+    run_coscientist_meta_review_command,
 )
 from bmscientist.graph_backfill import LanceGraphBackfiller
 from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
@@ -273,6 +274,8 @@ def main() -> int:
         return run_coscientist_loop_command(args, config)
     if args.command == "coscientist-feedback":
         return run_coscientist_feedback_command(args, config)
+    if args.command == "coscientist-meta-review":
+        return run_coscientist_meta_review_command(args, config)
     parser.error(f"Unknown command: {args.command}")
     return 1
 

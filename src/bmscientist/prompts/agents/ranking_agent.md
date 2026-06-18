@@ -14,6 +14,8 @@ Rank the reflected hypotheses below as a tournament judge. Strong opportunities 
 have credible technical and commercial paths, cite evidence, and avoid unresolved fatal gaps.
 Target final portfolio size: $target_final_count
 
+Note that some hypotheses contain user feedback: `user_feedback_status` (which may be 'accepted', 'rejected', 'edited') and `user_feedback_comment`. If a hypothesis has status 'rejected', you must rank it low or recommend 'reject'. If it has status 'accepted' or 'edited', take the user's positive alignment into account, typically scoring it higher or suggesting improvements based on the user's comment.
+
 Hypotheses:
 $hypotheses_json
 
