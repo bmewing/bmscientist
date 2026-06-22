@@ -304,6 +304,7 @@ class GraphEnrichmentStore:
         key: str,
         node_type: str | None,
         aliases: list[str] | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> str:
         safe_name = (name or "Unknown").strip() or "Unknown"
         normalized_name = normalize_name(safe_name)
@@ -333,6 +334,10 @@ class GraphEnrichmentStore:
                     row["primary_slug"] = f"{slugify(safe_name)}-market"
                     row["canonical_url"] = None
                     row["source_vendor"] = "evidence-enrichment"
+                if extra_fields:
+                    for field_name, field_value in extra_fields.items():
+                        if field_name in schema.names and field_value is not None:
+                            row[field_name] = field_value
                 rows[node_id] = row
             else:
                 if "aliases_json" in schema.names:
@@ -346,6 +351,10 @@ class GraphEnrichmentStore:
                         key=str.lower,
                     )
                     rows[node_id]["aliases_json"] = json.dumps(merged_aliases, sort_keys=True)
+                if extra_fields:
+                    for field_name, field_value in extra_fields.items():
+                        if field_name in schema.names and field_value is not None:
+                            rows[node_id][field_name] = field_value
                 rows[node_id]["updated_at"] = now
             write_rows(path, list(rows.values()), schema)
         return node_id
@@ -477,6 +486,156 @@ class GraphEnrichmentStore:
         )
         self._append_unique_rows(self._edges_path / "Market_HAS_COMPANY_Company.parquet", [row], MARKET_COMPANY_SCHEMA, "edge_id")
 
+    def write_ai_market_volume_estimate(self, hypothesis: Any, estimate: Any) -> list[dict[str, Any]]:
+        self._nodes_path.mkdir(parents=True, exist_ok=True)
+        self._edges_path.mkdir(parents=True, exist_ok=True)
+        self._enrichment_path.mkdir(parents=True, exist_ok=True)
+
+        app_name = (getattr(estimate, "application_name", None) or getattr(hypothesis, "application", None) or "").strip()
+        market_name = (getattr(estimate, "market_name", None) or getattr(hypothesis, "market_segment", None) or "").strip()
+        if not app_name or not market_name:
+            return []
+
+        total_volume = getattr(estimate, "total_substrate_volume_value", None)
+        material_volumes = list(getattr(estimate, "material_volumes", []) or [])
+        if total_volume is None and not any(getattr(item, "volume_value", None) is not None for item in material_volumes):
+            return []
+
+        market_id = self._ensure_market(market_name)
+        application_id = self._ensure_node("Application", app_name, "application_id", "application")
+        now = now_iso()
+        year = getattr(estimate, "volume_year", None) or datetime.now(timezone.utc).year
+        confidence = max(0.35, min(0.65, float(getattr(estimate, "confidence", 0.5) or 0.5)))
+        estimate_payload = estimate.model_dump(mode="json") if hasattr(estimate, "model_dump") else dict(estimate)
+        evidence_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "hypothesis_id": getattr(hypothesis, "hypothesis_id", None),
+                    "market": market_name,
+                    "application": app_name,
+                    "estimate": estimate_payload,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        source_chunk_id = f"ai_volume_estimate:{getattr(hypothesis, 'hypothesis_id', 'unknown')}"
+        source_url = self._estimate_source_url(hypothesis, estimate)
+        source_title = "AI generated market volume estimate"
+        rationale = str(getattr(estimate, "rationale", "") or "AI-generated market volume estimate.").strip()
+        highlights = ["AI generated estimate", rationale]
+        highlights.extend(self._estimate_citation_notes(estimate))
+
+        written_rows: list[dict[str, Any]] = []
+        if total_volume is not None:
+            market_row = empty_row(MARKET_APPLICATION_SCHEMA)
+            market_row.update(
+                {
+                    "edge_id": stable_id("Market_HAS_APPLICATION_Application", market_id, application_id, evidence_hash),
+                    "market_id": market_id,
+                    "application_id": application_id,
+                    "scope_type": "ai_estimate",
+                    "source_node_type": "ai_volume_estimate",
+                    "source_path": source_chunk_id,
+                    "geo_id": None,
+                    "page_type": "ai_estimate",
+                    "page_url": source_url,
+                    "retrieved_at": now,
+                    "target_url": source_url,
+                    "target_page_type": "ai_estimate",
+                    "queue_candidate": False,
+                    "status": "accepted",
+                    "revenue_value": getattr(estimate, "revenue_value", None),
+                    "revenue_year": getattr(estimate, "revenue_year", None),
+                    "unit": getattr(estimate, "revenue_unit", None),
+                    "summary_metrics_json": json.dumps(estimate_payload, sort_keys=True),
+                    "highlights_json": json.dumps(highlights, sort_keys=True),
+                    "volume_value": total_volume,
+                    "volume_unit": getattr(estimate, "total_substrate_volume_unit", None) or "metric_tons_per_year",
+                    "volume_year": year,
+                    "source_chunk_id": source_chunk_id,
+                    "source_url": source_url,
+                    "source_title": source_title,
+                    "evidence_hash": evidence_hash,
+                    "supporting_quote": rationale,
+                    "confidence": confidence,
+                    "validation_status": "accepted",
+                    "critical_to_quality_json": json.dumps(getattr(hypothesis, "application_requirements", []) or [], sort_keys=True),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            self._append_unique_rows(
+                self._edges_path / "Market_HAS_APPLICATION_Application.parquet",
+                [market_row],
+                MARKET_APPLICATION_SCHEMA,
+                "edge_id",
+            )
+            written_rows.append(market_row)
+
+        for material_estimate in material_volumes:
+            material_name = str(getattr(material_estimate, "material_name", "") or "").strip()
+            material_volume = getattr(material_estimate, "volume_value", None)
+            if not material_name or material_volume is None:
+                continue
+            product_id = self._ensure_node("Product", material_name, "product_id", "product")
+            material_confidence = max(0.3, min(0.65, float(getattr(material_estimate, "confidence", confidence) or confidence)))
+            role = "ai_estimated_material_share"
+            incumbent = str(getattr(hypothesis, "incumbent_material", "") or "").strip()
+            candidate = str(getattr(hypothesis, "candidate_material", "") or "").strip()
+            if incumbent and normalize_name(material_name) == normalize_name(incumbent):
+                role = "incumbent_ai_estimated_share"
+            elif candidate and normalize_name(material_name) == normalize_name(candidate):
+                role = "candidate_ai_estimated_share"
+            material_row = empty_row(PRODUCT_APPLICATION_SCHEMA)
+            material_row.update(
+                {
+                    "edge_id": stable_id("Product_USED_IN_Application", product_id, application_id, evidence_hash),
+                    "product_id": product_id,
+                    "application_id": application_id,
+                    "market_id": market_id,
+                    "relationship_role": role,
+                    "volume_value": material_volume,
+                    "volume_unit": getattr(material_estimate, "volume_unit", None) or getattr(estimate, "total_substrate_volume_unit", None) or "metric_tons_per_year",
+                    "volume_year": year,
+                    "critical_to_quality_json": json.dumps(getattr(hypothesis, "application_requirements", []) or [], sort_keys=True),
+                    "source_chunk_id": source_chunk_id,
+                    "source_url": source_url,
+                    "source_title": source_title,
+                    "evidence_hash": evidence_hash,
+                    "supporting_quote": str(getattr(material_estimate, "rationale", "") or rationale).strip(),
+                    "confidence": material_confidence,
+                    "validation_status": "accepted",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            self._append_unique_rows(
+                self._edges_path / "Product_USED_IN_Application.parquet",
+                [material_row],
+                PRODUCT_APPLICATION_SCHEMA,
+                "edge_id",
+            )
+            written_rows.append(material_row)
+        return written_rows
+
+    @staticmethod
+    def _estimate_source_url(hypothesis: Any, estimate: Any) -> str:
+        for citation in getattr(estimate, "source_citations", []) or []:
+            source_url = getattr(citation, "source_url", None)
+            if source_url:
+                return str(source_url)
+        return f"coscientist://research/{getattr(hypothesis, 'research_id', 'unknown')}/hypothesis/{getattr(hypothesis, 'hypothesis_id', 'unknown')}"
+
+    @staticmethod
+    def _estimate_citation_notes(estimate: Any) -> list[str]:
+        notes: list[str] = []
+        for citation in getattr(estimate, "source_citations", []) or []:
+            title = getattr(citation, "source_title", None)
+            url = getattr(citation, "source_url", None)
+            if title or url:
+                notes.append("Source: " + " ".join(str(item) for item in [title, url] if item))
+        return notes[:6]
+
     @staticmethod
     def _base_edge_row(
         schema: pa.Schema,
@@ -547,10 +706,12 @@ class GraphEnrichmentStore:
         """
         Promotes a reflected hypothesis directly to the knowledge graph under data/graph/.
         This maps:
-        - Product (candidate_material)
+        - Product (candidate_material or generic candidate artifact identifier)
         - Product (incumbent_material)
         - Application (application)
         - Market (market_segment)
+        - Company (manufacturer / supplier when explicit)
+        - ChemistryClass, Function, BinderSystem, Endpoint when explicit in candidate artifacts or reflection outputs
         - Edges:
           - Product_USED_IN_Application (candidate_material -> application)
           - Product_USED_IN_Application (incumbent_material -> application)
@@ -562,13 +723,13 @@ class GraphEnrichmentStore:
         self._edges_path.mkdir(parents=True, exist_ok=True)
         self._enrichment_path.mkdir(parents=True, exist_ok=True)
 
-        candidate_mat = (hypothesis.candidate_material or "").strip()
+        candidate_artifact = dict(getattr(hypothesis, "candidate_artifact", {}) or {})
+        candidate_mat = self._candidate_label(hypothesis, candidate_artifact)
         incumbent_mat = (hypothesis.incumbent_material or "").strip()
         app_name = (hypothesis.application or "").strip()
         market_name = (hypothesis.market_segment or "").strip()
 
-        # We must have at least candidate and application to build displacement edges
-        if not candidate_mat or not app_name:
+        if not candidate_mat:
             return
 
         now = now_iso()
@@ -579,28 +740,23 @@ class GraphEnrichmentStore:
 
         # 1. Create/Ensure Nodes
         # Candidate Product
-        candidate_slug = slugify(candidate_mat)
-        candidate_id = f"product:{candidate_slug}"
-        self._ensure_node("Product", candidate_mat, "product_id", "product")
+        candidate_id = self._ensure_product_node_from_hypothesis(candidate_mat, candidate_artifact)
 
         # Incumbent Product
         incumbent_id = None
         if incumbent_mat:
-            incumbent_slug = slugify(incumbent_mat)
-            incumbent_id = f"product:{incumbent_slug}"
-            self._ensure_node("Product", incumbent_mat, "product_id", "product")
+            incumbent_id = self._ensure_node("Product", incumbent_mat, "product_id", "product")
 
         # Application
-        app_slug = slugify(app_name)
-        application_id = f"application:{app_slug}"
-        self._ensure_node("Application", app_name, "application_id", "application")
+        application_id = None
+        if app_name:
+            application_id = self._ensure_node("Application", app_name, "application_id", "application")
 
         # Market
         market_id = None
         if market_name:
-            market_slug = slugify(market_name)
-            market_id = f"market:{market_slug}"
             self._ensure_node("Market", market_name, "market_id", None)
+            market_id = f"market:{slugify(market_name)}"
 
         # Retrieve reflection assessments if available
         assessment = hypothesis.reflection_assessment
@@ -616,55 +772,54 @@ class GraphEnrichmentStore:
             elif comm_prob is not None:
                 confidence = float(comm_prob)
 
-        # 2. Candidate Material -> Application Edge
-        cand_edge_id = stable_id("Product_USED_IN_Application", candidate_id, application_id, evidence_hash)
-        
-        # Build Critical to Quality JSON from requirements
         ctq_json = json.dumps(hypothesis.application_requirements, sort_keys=True)
-        
-        # Build pricing metrics if available
-        nbca_price = None
-        price_unit = None
-        price_currency = None
-        if assessment and assessment.nbca_price_usd_per_kg and assessment.nbca_price_usd_per_kg.value is not None:
-            nbca_price = float(assessment.nbca_price_usd_per_kg.value)
-            price_unit = "kg"
-            price_currency = "USD"
 
-        candidate_edge_row = empty_row(PRODUCT_APPLICATION_SCHEMA)
-        candidate_edge_row.update({
-            "edge_id": cand_edge_id,
-            "product_id": candidate_id,
-            "application_id": application_id,
-            "market_id": market_id,
-            "relationship_role": "candidate_replacement",
-            "volume_value": None,
-            "volume_unit": None,
-            "volume_year": None,
-            "price_value": nbca_price,
-            "price_currency": price_currency,
-            "price_unit": price_unit,
-            "price_year": datetime.now(timezone.utc).year,
-            "critical_to_quality_json": ctq_json,
-            "source_chunk_id": source_chunk_id,
-            "source_url": source_url,
-            "source_title": source_title,
-            "evidence_hash": evidence_hash,
-            "supporting_quote": hypothesis.summary,
-            "confidence": confidence,
-            "validation_status": "accepted",
-            "created_at": now,
-            "updated_at": now,
-        })
-        self._append_unique_rows(
-            self._edges_path / "Product_USED_IN_Application.parquet",
-            [candidate_edge_row],
-            PRODUCT_APPLICATION_SCHEMA,
-            "edge_id",
-        )
+        # 2. Candidate Material -> Application Edge
+        if application_id is not None:
+            cand_edge_id = stable_id("Product_USED_IN_Application", candidate_id, application_id, evidence_hash)
+
+            nbca_price = None
+            price_unit = None
+            price_currency = None
+            if assessment and assessment.nbca_price_usd_per_kg and assessment.nbca_price_usd_per_kg.value is not None:
+                nbca_price = float(assessment.nbca_price_usd_per_kg.value)
+                price_unit = "kg"
+                price_currency = "USD"
+
+            candidate_edge_row = empty_row(PRODUCT_APPLICATION_SCHEMA)
+            candidate_edge_row.update({
+                "edge_id": cand_edge_id,
+                "product_id": candidate_id,
+                "application_id": application_id,
+                "market_id": market_id,
+                "relationship_role": "candidate_replacement",
+                "volume_value": None,
+                "volume_unit": None,
+                "volume_year": None,
+                "price_value": nbca_price,
+                "price_currency": price_currency,
+                "price_unit": price_unit,
+                "price_year": datetime.now(timezone.utc).year,
+                "critical_to_quality_json": ctq_json,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": hypothesis.summary,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            })
+            self._append_unique_rows(
+                self._edges_path / "Product_USED_IN_Application.parquet",
+                [candidate_edge_row],
+                PRODUCT_APPLICATION_SCHEMA,
+                "edge_id",
+            )
 
         # 3. Incumbent Material -> Application Edge (if incumbent exists)
-        if incumbent_id:
+        if incumbent_id and application_id is not None:
             inc_edge_id = stable_id("Product_USED_IN_Application", incumbent_id, application_id, evidence_hash)
             
             inc_price = None
@@ -707,56 +862,57 @@ class GraphEnrichmentStore:
 
         # 4. Market Edges (if market exists)
         if market_id:
-            # Market HAS APPLICATION Application
-            mkt_app_edge_id = stable_id("Market_HAS_APPLICATION_Application", market_id, application_id, evidence_hash)
-            mkt_app_row = empty_row(MARKET_APPLICATION_SCHEMA)
-            mkt_app_row.update({
-                "edge_id": mkt_app_edge_id,
-                "market_id": market_id,
-                "application_id": application_id,
-                "scope_type": "evidence",
-                "source_node_type": "hypothesis_promotion",
-                "source_path": source_chunk_id,
-                "geo_id": None,
-                "page_type": "evidence",
-                "page_url": source_url,
-                "retrieved_at": None,
-                "target_url": source_url,
-                "target_page_type": "evidence",
-                "queue_candidate": False,
-                "status": "accepted",
-                "revenue_value": None,
-                "revenue_year": None,
-                "forecast_revenue_value": None,
-                "forecast_revenue_year": None,
-                "cagr_value": None,
-                "cagr_start_year": None,
-                "cagr_end_year": None,
-                "unit": None,
-                "currency": None,
-                "unit_scale": None,
-                "summary_metrics_json": "[]",
-                "highlights_json": json.dumps([hypothesis.summary], sort_keys=True),
-                "industry_trends_json": None,
-                "data_book_summary_json": None,
-                "source_market_slug": None,
-                "critical_to_quality_json": ctq_json,
-                "source_chunk_id": source_chunk_id,
-                "source_url": source_url,
-                "source_title": source_title,
-                "evidence_hash": evidence_hash,
-                "supporting_quote": hypothesis.summary,
-                "confidence": confidence,
-                "validation_status": "accepted",
-                "created_at": now,
-                "updated_at": now,
-            })
-            self._append_unique_rows(
-                self._edges_path / "Market_HAS_APPLICATION_Application.parquet",
-                [mkt_app_row],
-                MARKET_APPLICATION_SCHEMA,
-                "edge_id",
-            )
+            if application_id is not None:
+                # Market HAS APPLICATION Application
+                mkt_app_edge_id = stable_id("Market_HAS_APPLICATION_Application", market_id, application_id, evidence_hash)
+                mkt_app_row = empty_row(MARKET_APPLICATION_SCHEMA)
+                mkt_app_row.update({
+                    "edge_id": mkt_app_edge_id,
+                    "market_id": market_id,
+                    "application_id": application_id,
+                    "scope_type": "evidence",
+                    "source_node_type": "hypothesis_promotion",
+                    "source_path": source_chunk_id,
+                    "geo_id": None,
+                    "page_type": "evidence",
+                    "page_url": source_url,
+                    "retrieved_at": None,
+                    "target_url": source_url,
+                    "target_page_type": "evidence",
+                    "queue_candidate": False,
+                    "status": "accepted",
+                    "revenue_value": None,
+                    "revenue_year": None,
+                    "forecast_revenue_value": None,
+                    "forecast_revenue_year": None,
+                    "cagr_value": None,
+                    "cagr_start_year": None,
+                    "cagr_end_year": None,
+                    "unit": None,
+                    "currency": None,
+                    "unit_scale": None,
+                    "summary_metrics_json": "[]",
+                    "highlights_json": json.dumps([hypothesis.summary], sort_keys=True),
+                    "industry_trends_json": None,
+                    "data_book_summary_json": None,
+                    "source_market_slug": None,
+                    "critical_to_quality_json": ctq_json,
+                    "source_chunk_id": source_chunk_id,
+                    "source_url": source_url,
+                    "source_title": source_title,
+                    "evidence_hash": evidence_hash,
+                    "supporting_quote": hypothesis.summary,
+                    "confidence": confidence,
+                    "validation_status": "accepted",
+                    "created_at": now,
+                    "updated_at": now,
+                })
+                self._append_unique_rows(
+                    self._edges_path / "Market_HAS_APPLICATION_Application.parquet",
+                    [mkt_app_row],
+                    MARKET_APPLICATION_SCHEMA,
+                    "edge_id",
+                )
 
             # Market USES Product (for Candidate)
             mkt_cand_edge_id = stable_id("Market_USES_Product", market_id, candidate_id, evidence_hash)
@@ -814,6 +970,434 @@ class GraphEnrichmentStore:
                 MARKET_PRODUCT_SCHEMA,
                 "edge_id",
             )
+
+        self._promote_generic_candidate_context(
+            hypothesis=hypothesis,
+            candidate_id=candidate_id,
+            candidate_name=candidate_mat,
+            candidate_artifact=candidate_artifact,
+            source_chunk_id=source_chunk_id,
+            source_url=source_url,
+            source_title=source_title,
+            evidence_hash=evidence_hash,
+            confidence=confidence,
+            now=now,
+        )
+
+    def _promote_generic_candidate_context(
+        self,
+        hypothesis: Any,
+        candidate_id: str,
+        candidate_name: str,
+        candidate_artifact: dict[str, Any],
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        chemistry_class = self._first_artifact_value(
+            candidate_artifact,
+            "chemistry_class",
+            "chemistry_family",
+            "chemical_family",
+            "chemistry_style",
+            "scaffold",
+        )
+        if chemistry_class:
+            chemistry_class_id = self._ensure_node("ChemistryClass", chemistry_class, "chemistry_class_id", None)
+            self._append_product_chemistry_class_edge(
+                candidate_id,
+                chemistry_class_id,
+                source_chunk_id,
+                source_url,
+                source_title,
+                evidence_hash,
+                hypothesis.summary,
+                confidence,
+                now,
+            )
+
+        binder_system = self._first_artifact_value(
+            candidate_artifact,
+            "intended_binder_system",
+            "binder_system",
+            "target_binder_system",
+        )
+        if binder_system:
+            binder_system_id = self._ensure_node("BinderSystem", binder_system, "binder_system_id", None)
+            self._append_product_binder_system_edge(
+                candidate_id,
+                binder_system_id,
+                source_chunk_id,
+                source_url,
+                source_title,
+                evidence_hash,
+                hypothesis.summary,
+                confidence,
+                now,
+            )
+
+        manufacturer = self._first_artifact_value(
+            candidate_artifact,
+            "manufacturer",
+            "supplier",
+            "vendor",
+            "produced_by",
+            "company_name",
+        )
+        if manufacturer:
+            company_id = self._ensure_node("Company", manufacturer, "company_id", None)
+            self._append_company_product_edge_from_hypothesis(
+                company_id,
+                candidate_id,
+                source_chunk_id,
+                source_url,
+                source_title,
+                evidence_hash,
+                hypothesis.summary,
+                confidence,
+                now,
+            )
+
+        for function_name in self._candidate_function_names(hypothesis, candidate_artifact):
+            function_id = self._ensure_node("Function", function_name, "function_id", None)
+            self._append_product_function_edge(
+                candidate_id,
+                function_id,
+                source_chunk_id,
+                source_url,
+                source_title,
+                evidence_hash,
+                hypothesis.summary,
+                confidence,
+                now,
+            )
+
+        for result in self._candidate_endpoint_results(hypothesis):
+            endpoint_name = str(result.criterion_name or "").strip()
+            if not endpoint_name:
+                continue
+            endpoint_id = self._ensure_node(
+                "Endpoint",
+                endpoint_name,
+                "endpoint_id",
+                None,
+                extra_fields={"endpoint_category": self._endpoint_category(endpoint_name)},
+            )
+            self._append_product_endpoint_edge(
+                candidate_id,
+                endpoint_id,
+                result,
+                source_chunk_id,
+                source_url,
+                source_title,
+                evidence_hash,
+                confidence,
+                now,
+            )
+
+    def _ensure_product_node_from_hypothesis(self, candidate_name: str, candidate_artifact: dict[str, Any]) -> str:
+        aliases = [
+            value
+            for value in [
+                candidate_artifact.get("candidate_material"),
+                candidate_artifact.get("name"),
+                candidate_artifact.get("trade_name"),
+                candidate_artifact.get("common_name"),
+                candidate_artifact.get("name_or_label"),
+            ]
+            if value and str(value).strip() != candidate_name
+        ]
+        return self._ensure_node(
+            "Product",
+            candidate_name,
+            "product_id",
+            "product",
+            aliases=[str(alias).strip() for alias in aliases if str(alias).strip()],
+            extra_fields={
+                "canonical_smiles": self._first_artifact_value(candidate_artifact, "smiles", "canonical_smiles"),
+                "inchi_key": self._first_artifact_value(candidate_artifact, "inchi_key", "inchikey"),
+                "cas_number": self._first_artifact_value(candidate_artifact, "cas_number", "cas"),
+                "product_family": self._first_artifact_value(
+                    candidate_artifact,
+                    "chemistry_class",
+                    "chemistry_family",
+                    "chemical_family",
+                ),
+            },
+        )
+
+    def _append_company_product_edge_from_hypothesis(
+        self,
+        company_id: str,
+        product_id: str,
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        supporting_quote: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        row = empty_row(COMPANY_PRODUCT_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Company_PRODUCES_Product", company_id, product_id, evidence_hash),
+                "company_id": company_id,
+                "product_id": product_id,
+                "role": "producer_or_supplier",
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(self._edges_path / "Company_PRODUCES_Product.parquet", [row], COMPANY_PRODUCT_SCHEMA, "edge_id")
+
+    def _append_product_chemistry_class_edge(
+        self,
+        product_id: str,
+        chemistry_class_id: str,
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        supporting_quote: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        row = empty_row(PRODUCT_CHEMISTRY_CLASS_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Product_HAS_ChemistryClass", product_id, chemistry_class_id, evidence_hash),
+                "product_id": product_id,
+                "chemistry_class_id": chemistry_class_id,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_HAS_ChemistryClass.parquet",
+            [row],
+            PRODUCT_CHEMISTRY_CLASS_SCHEMA,
+            "edge_id",
+        )
+
+    def _append_product_function_edge(
+        self,
+        product_id: str,
+        function_id: str,
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        supporting_quote: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        row = empty_row(PRODUCT_FUNCTION_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Product_HAS_Function", product_id, function_id, evidence_hash),
+                "product_id": product_id,
+                "function_id": function_id,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_HAS_Function.parquet",
+            [row],
+            PRODUCT_FUNCTION_SCHEMA,
+            "edge_id",
+        )
+
+    def _append_product_binder_system_edge(
+        self,
+        product_id: str,
+        binder_system_id: str,
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        supporting_quote: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        row = empty_row(PRODUCT_BINDER_SYSTEM_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Product_TARGETS_BinderSystem", product_id, binder_system_id, evidence_hash),
+                "product_id": product_id,
+                "binder_system_id": binder_system_id,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_TARGETS_BinderSystem.parquet",
+            [row],
+            PRODUCT_BINDER_SYSTEM_SCHEMA,
+            "edge_id",
+        )
+
+    def _append_product_endpoint_edge(
+        self,
+        product_id: str,
+        endpoint_id: str,
+        result: Any,
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        evidence_hash: str,
+        confidence: float,
+        now: str,
+    ) -> None:
+        row = empty_row(PRODUCT_ENDPOINT_SCHEMA)
+        numeric_value = None
+        if isinstance(result.value, (int, float)):
+            numeric_value = float(result.value)
+        row.update(
+            {
+                "edge_id": stable_id("Product_HAS_Endpoint", product_id, endpoint_id, evidence_hash),
+                "product_id": product_id,
+                "endpoint_id": endpoint_id,
+                "value_text": None if numeric_value is not None else (str(result.value) if result.value is not None else None),
+                "value_numeric": numeric_value,
+                "unit": result.unit,
+                "normalized_score": result.normalized_score,
+                "evidence_mode": result.evidence_mode,
+                "tool_id": result.tool_id,
+                "is_inferred": result.is_inferred,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": result.rationale or "",
+                "confidence": max(confidence, result.confidence),
+                "validation_status": "accepted",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_HAS_Endpoint.parquet",
+            [row],
+            PRODUCT_ENDPOINT_SCHEMA,
+            "edge_id",
+        )
+
+    @staticmethod
+    def _candidate_label(hypothesis: Any, candidate_artifact: dict[str, Any]) -> str:
+        values = [
+            getattr(hypothesis, "candidate_material", None),
+            candidate_artifact.get("name_or_label"),
+            candidate_artifact.get("trade_name"),
+            candidate_artifact.get("name"),
+            candidate_artifact.get("smiles"),
+        ]
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _first_artifact_value(candidate_artifact: dict[str, Any], *keys: str) -> str | None:
+        for key in keys:
+            value = candidate_artifact.get(key)
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _candidate_function_names(hypothesis: Any, candidate_artifact: dict[str, Any]) -> list[str]:
+        explicit = [
+            GraphEnrichmentStore._first_artifact_value(
+                candidate_artifact,
+                "functional_role",
+                "function",
+                "role",
+                "product_role",
+            )
+        ]
+        inferred: list[str] = []
+        text = " ".join(
+            str(item or "")
+            for item in [
+                getattr(hypothesis, "title", ""),
+                getattr(hypothesis, "summary", ""),
+                getattr(hypothesis, "application", ""),
+            ]
+        ).lower()
+        phrase_map = {
+            "coalescing aid": "coalescing aid",
+            "coalescent": "coalescing aid",
+            "plasticizer": "plasticizer",
+            "solvent": "solvent",
+            "surfactant": "surfactant",
+        }
+        for phrase, normalized in phrase_map.items():
+            if phrase in text:
+                inferred.append(normalized)
+        deduped: "OrderedDict[str, None]" = OrderedDict()
+        for item in [*explicit, *inferred]:
+            text = str(item or "").strip()
+            if text:
+                deduped[text] = None
+        return list(deduped.keys())
+
+    @staticmethod
+    def _candidate_endpoint_results(hypothesis: Any) -> list[Any]:
+        results: "OrderedDict[str, Any]" = OrderedDict()
+        for result in getattr(hypothesis, "evaluation_results", []) or []:
+            if getattr(result, "criterion_name", None):
+                results[result.criterion_name] = result
+        assessment = getattr(hypothesis, "reflection_assessment", None)
+        for result in getattr(assessment, "criterion_results", []) or []:
+            if getattr(result, "criterion_name", None):
+                results[result.criterion_name] = result
+        return list(results.values())
+
+    @staticmethod
+    def _endpoint_category(endpoint_name: str) -> str:
+        text = endpoint_name.lower()
+        if any(token in text for token in ("tox", "ecotox", "fish", "hazard")):
+            return "toxicity"
+        if any(token in text for token in ("solubility", "logp", "vapor", "boiling")):
+            return "physicochemical"
+        if any(token in text for token in ("coales", "mfft", "tg", "film")):
+            return "performance"
+        return "general"
 
     def apply_edge_feedback(
         self,
@@ -1091,6 +1675,10 @@ PRODUCT_NODE_SCHEMA = pa.schema(
         ("node_type", pa.string()),
         ("url", pa.string()),
         ("aliases_json", pa.string()),
+        ("canonical_smiles", pa.string()),
+        ("inchi_key", pa.string()),
+        ("cas_number", pa.string()),
+        ("product_family", pa.string()),
         ("created_at", pa.string()),
         ("updated_at", pa.string()),
     ]
@@ -1134,11 +1722,52 @@ COMPANY_NODE_SCHEMA = pa.schema(
         ("updated_at", pa.string()),
     ]
 )
+CHEMISTRY_CLASS_NODE_SCHEMA = pa.schema(
+    [
+        ("chemistry_class_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+FUNCTION_NODE_SCHEMA = pa.schema(
+    [
+        ("function_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+BINDER_SYSTEM_NODE_SCHEMA = pa.schema(
+    [
+        ("binder_system_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+ENDPOINT_NODE_SCHEMA = pa.schema(
+    [
+        ("endpoint_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("endpoint_category", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
 NODE_SCHEMAS = {
     "Product": PRODUCT_NODE_SCHEMA,
     "Application": APPLICATION_NODE_SCHEMA,
     "Market": MARKET_NODE_SCHEMA,
     "Company": COMPANY_NODE_SCHEMA,
+    "ChemistryClass": CHEMISTRY_CLASS_NODE_SCHEMA,
+    "Function": FUNCTION_NODE_SCHEMA,
+    "BinderSystem": BINDER_SYSTEM_NODE_SCHEMA,
+    "Endpoint": ENDPOINT_NODE_SCHEMA,
 }
 
 MARKET_EDGE_FIELDS = [
@@ -1229,6 +1858,77 @@ COMPANY_PRODUCT_SCHEMA = pa.schema(
         ("company_id", pa.string()),
         ("product_id", pa.string()),
         ("role", pa.string()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_CHEMISTRY_CLASS_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("chemistry_class_id", pa.string()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_FUNCTION_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("function_id", pa.string()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_BINDER_SYSTEM_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("binder_system_id", pa.string()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_ENDPOINT_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("endpoint_id", pa.string()),
+        ("value_text", pa.string()),
+        ("value_numeric", pa.float64()),
+        ("unit", pa.string()),
+        ("normalized_score", pa.float64()),
+        ("evidence_mode", pa.string()),
+        ("tool_id", pa.string()),
+        ("is_inferred", pa.bool_()),
         ("source_chunk_id", pa.string()),
         ("source_url", pa.string()),
         ("source_title", pa.string()),

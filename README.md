@@ -1,5 +1,7 @@
 # bmscientist
 
+See [CHANGELOG.md](C:/Users/bmark/PycharmProjects/bmscientist/CHANGELOG.md) for release notes.
+
 Agentic framework for scientific materials discovery — hypothesis generation, evidence retrieval, and knowledge graph enrichment.
 
 ## Setup
@@ -29,9 +31,32 @@ HF_TOKEN=your_huggingface_token
 # Base directory for all cache and generated outputs (defaults to ./data)
 BMSCIENTIST_DATA_DIR=./data
 
+# Optional explicit LanceDB override. If omitted, defaults to BMSCIENTIST_DATA_DIR/lancedb.
+# LANCEDB_PATH=./data/lancedb
+
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 REQUEST_TIMEOUT_SECONDS=60
 SKIP_FETCH_DOMAINS=sciencedirect.com
+
+# Exa retrieval controls
+EXA_SEARCH_CONTENT_TEXT_CHARS=8000
+EXA_CONTENTS_INITIAL_TEXT_CHARS=12000
+EXA_CONTENTS_DEEP_TEXT_CHARS=50000
+EXA_HIGHLIGHTS_MAX_CHARS=2000
+EXA_ENABLE_SEARCH_CONTENTS=true
+EXA_ENABLE_CONTENTS_FOLLOWUP=true
+EXA_ENABLE_DIRECT_FETCH_FALLBACK=true
+EXA_DEFAULT_SEARCH_TYPE=auto
+EXA_REFLECTION_SEARCH_TYPE=fast
+EXA_DEFAULT_MAX_AGE_HOURS=168
+EXA_NEWS_MAX_AGE_HOURS=24
+EXA_DEEP_FETCH_MIN_SCORE=0.78
+EXA_DEEP_FETCH_MAX_PER_QUERY=2
+EXA_DEEP_FETCH_MAX_PER_RUN=10
+EXA_SEARCH_CATEGORY=
+EXA_NEWS_DOMAINS=polymart.info
+
+# Simple model-only configuration still works.
 CHAT_MODEL=deepseek-v4-flash
 GENERATION_CHAT_MODEL=deepseek-v4-pro
 REFLECTION_CHAT_MODEL=deepseek-v4-flash
@@ -40,14 +65,34 @@ RANKING_CHAT_MODEL=deepseek-v4-pro
 EVOLUTION_CHAT_MODEL=deepseek-v4-pro
 PROXIMITY_CHAT_MODEL=deepseek-v4-pro
 META_REVIEW_CHAT_MODEL=deepseek-v4-pro
+MARKET_VOLUME_ESTIMATION_CHAT_MODEL=deepseek-v4-pro
+
+# Optional DeepSeek thinking-mode request profiles.
+# These map to:
+#   extra_body={"thinking":{"type":"enabled|disabled"}}
+#   reasoning_effort="high|max"
+#
+# If both *_CHAT_MODEL and *_CHAT_PROFILE are present, *_CHAT_PROFILE.model wins.
+# timeout_seconds is optional per profile and overrides REQUEST_TIMEOUT_SECONDS for that role.
+REFLECTION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"high"},"timeout_seconds":120}
+MARKET_VOLUME_ESTIMATION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"max"},"timeout_seconds":180}
 ```
 
-* `DEEPSEEK_API_KEY` (**Required**): Your DeepSeek API key (used for all LLM reasoning, planning, reflection, and evolution).
-* `EXA_API_KEY` (**Required**): Your Exa search API key (used for web search and page retrieval).
-* `BMSCIENTIST_DATA_DIR` (*Optional*): Configures the base directory where raw data, cache files, knowledge graphs, and generated co-scientist run logs are saved (defaults to `./data`).
-* `LANCEDB_PATH` (*Optional*): Explicit override for the LanceDB directory. If left blank or omitted, it defaults to `BMSCIENTIST_DATA_DIR/lancedb`.
-* `CHAT_MODEL` (*Optional*): Default LLM to use (defaults to `deepseek-v4-flash`). Agent-specific model overrides (e.g., `GENERATION_CHAT_MODEL`, `EVOLUTION_CHAT_MODEL`) allow routing reasoning-heavy tasks to more capable models like `deepseek-v4-pro`.
+* `DEEPSEEK_API_KEY` (**Required**): Your DeepSeek API key for all LLM-backed reasoning.
+* `EXA_API_KEY` (**Required**): Your Exa search API key for web discovery and page retrieval.
+* `EXA_*` retrieval settings (*Optional*): Tune how much Exa text/highlight content is requested at search time, when deeper `/contents` follow-ups happen, how stale cached content can be, and how aggressively direct HTTP fetch is used as a fallback.
+* `BMSCIENTIST_DATA_DIR` (*Optional*): Base directory for raw data, caches, graphs, and co-scientist run outputs.
+* `LANCEDB_PATH` (*Optional*): Explicit LanceDB directory override. Defaults to `BMSCIENTIST_DATA_DIR/lancedb`.
+* `*_CHAT_MODEL` (*Optional*): Simple per-role model override keys. These still work and are the easiest way to route different stages to different DeepSeek models.
+* `*_CHAT_PROFILE` (*Optional*): JSON request-profile keys for DeepSeek thinking mode. Use these when you need to control both model selection and request structure such as `thinking.enabled`, `thinking.effort`, and role-specific `timeout_seconds`.
+* `MARKET_VOLUME_ESTIMATION_CHAT_PROFILE` (*Optional*): Useful for the reflection-time AI volume estimator, where a stronger reasoning model can infer tonnage from revenue and pricing signals before writing medium-confidence AI-generated graph evidence.
 * `HF_TOKEN` (*Optional*): Hugging Face token, recommended for avoiding rate limits when downloading embedding models.
+
+DeepSeek thinking-mode note:
+Use a JSON profile like `{"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"max"},"timeout_seconds":180}`. The library maps that to DeepSeek's OpenAI-format request fields (`extra_body.thinking` and `reasoning_effort`) automatically, and `timeout_seconds` overrides the global `REQUEST_TIMEOUT_SECONDS` for that specific role.
+
+Exa retrieval note:
+Discovery and reflection search now use Exa search-time extracted content first, preserve Exa highlights and request metadata, and only escalate to `/contents` follow-ups for high-value or truncated pages. Direct HTTP fetch is now a fallback path rather than the default source of truth.
 
 
 ## Usage
@@ -88,7 +133,11 @@ Create a research goal, generate hypotheses from local evidence, and reflect on 
 .\.venv\Scripts\python.exe -m bmscientist coscientist --goal "I want to find rapid drop-in/drop-out flywheel opportunities for PET against a target material of Styrenics..." --target-hypotheses 25 --regions "North America,Europe" --reflection-concurrency 4
 ```
 
-The `coscientist` command auto-starts background reflection workers per generation batch slot, so as soon as each hypothesis batch is written to the queue, reflection begins immediately.
+The `coscientist` command now defaults to in-process threaded reflection, which keeps RAM usage much lower than spawning multiple background reflector subprocesses. If you explicitly want the legacy subprocess behavior, add:
+
+```powershell
+.\.venv\Scripts\python.exe -m bmscientist coscientist ... --spawn-reflection-daemons
+```
 
 Resume reflection for generated hypotheses without regenerating:
 

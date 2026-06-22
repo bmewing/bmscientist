@@ -2,12 +2,15 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
-from pydantic import BaseModel
+import pytest
+from pydantic import BaseModel, ValidationError
 
 from bmscientist.agent import DiscoveryAgent
 from bmscientist.classify import EvidenceClassifier
 from bmscientist.chunking import TextChunker
+from bmscientist.config import AppConfig
 from bmscientist.coscientist_models import HypothesisGenerationOutput
 from bmscientist.llm import DeepSeekLLM
 from bmscientist.models import ChunkRecord, EvidenceClassification, EvidenceClassificationDraft, PageContent, SearchResultItem
@@ -289,6 +292,157 @@ def test_complete_json_repairs_malformed_model_output_with_second_pass():
     assert len(calls) == 2
     assert calls[1]["temperature"] == 0.0
     assert "malformed json-like content" in str(calls[1]["messages"][1]["content"]).lower()
+
+
+def test_complete_json_repairs_pydantic_validation_errors_with_second_pass():
+    class SimpleOutput(BaseModel):
+        title: str
+        status: Literal["ready", "blocked"]
+
+    responses = [
+        json.dumps(
+            {
+                "title": "Candidate coalescent A",
+                "status": "pending",
+            }
+        ),
+        json.dumps(
+            {
+                "title": "Candidate coalescent A",
+                "status": "ready",
+            }
+        ),
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_create_completion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=responses.pop(0)))]
+        )
+
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "test-model"
+    llm._max_validation_repairs = 2
+    llm._create_completion = fake_create_completion
+
+    result = llm.complete_json(
+        SimpleOutput,
+        "system context about candidate generation",
+        "user context about screening coalescents",
+    )
+
+    assert result.status == "ready"
+    assert len(calls) == 2
+    assert calls[1]["temperature"] == 0.0
+    repair_prompt = str(calls[1]["messages"][1]["content"]).lower()
+    assert "pydantic validation errors" in repair_prompt
+    assert "original system prompt" in repair_prompt
+    assert "original json payload" in repair_prompt
+
+
+def test_complete_json_raises_when_pydantic_validation_repair_still_fails():
+    class SimpleOutput(BaseModel):
+        title: str
+        status: Literal["ready", "blocked"]
+
+    responses = [
+        json.dumps({"title": "Broken candidate", "status": "pending"}),
+        json.dumps({"title": "Still broken", "status": "pending"}),
+        json.dumps({"title": "Still broken again", "status": "pending"}),
+    ]
+
+    def fake_create_completion(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=responses.pop(0)))]
+        )
+
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "test-model"
+    llm._max_validation_repairs = 2
+    llm._create_completion = fake_create_completion
+
+    with pytest.raises(ValidationError):
+        llm.complete_json(SimpleOutput, "system", "user")
+
+
+def test_llm_completion_kwargs_map_thinking_profile_to_deepseek_request_fields():
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "deepseek-v4-pro"
+    llm._request_profile = AppConfig.model_validate(
+        {
+            "deepseek_api_key": "x",
+            "exa_api_key": "y",
+            "chat_profile": {
+                "model": "deepseek-v4-pro",
+                "thinking": {"enabled": True, "effort": "xhigh"},
+            },
+        }
+    ).chat_profile
+
+    kwargs = llm._completion_kwargs(
+        messages=[{"role": "user", "content": "Estimate volume."}],
+        temperature=0.3,
+        response_format={"type": "json_object"},
+    )
+
+    assert kwargs["model"] == "deepseek-v4-pro"
+    assert kwargs["reasoning_effort"] == "max"
+    assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "temperature" not in kwargs
+
+
+def test_llm_completion_kwargs_keep_temperature_when_thinking_disabled():
+    llm = DeepSeekLLM.__new__(DeepSeekLLM)
+    llm._model = "deepseek-v4-pro"
+    llm._request_profile = AppConfig.model_validate(
+        {
+            "deepseek_api_key": "x",
+            "exa_api_key": "y",
+            "chat_profile": {
+                "model": "deepseek-v4-pro",
+                "thinking": {"enabled": False},
+            },
+        }
+    ).chat_profile
+
+    kwargs = llm._completion_kwargs(
+        messages=[{"role": "user", "content": "Hello"}],
+        temperature=0.25,
+    )
+
+    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert kwargs["temperature"] == 0.25
+
+
+def test_llm_uses_profile_specific_timeout_over_global_default(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("bmscientist.llm.OpenAI", FakeOpenAI)
+    config = AppConfig.model_validate(
+        {
+            "deepseek_api_key": "x",
+            "exa_api_key": "y",
+            "request_timeout_seconds": 60,
+            "reflection_chat_profile": {
+                "model": "deepseek-v4-pro",
+                "timeout_seconds": 180,
+            },
+        }
+    )
+
+    llm = DeepSeekLLM(
+        config,
+        model=config.reflection_chat_model,
+        request_profile=config.reflection_chat_profile,
+    )
+
+    assert llm._model == "deepseek-v4-pro"
+    assert captured["timeout"] == 180
 
 
 def test_hypothesis_generation_output_coerces_list_strategic_rationale():

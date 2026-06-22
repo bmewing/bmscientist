@@ -59,7 +59,7 @@ class FakeStore:
         self.records.extend(records)
         return len(records)
 
-    def all_rows(self):
+    def all_rows(self, where=None):
         return [
             {
                 "source_url": record.source_url,

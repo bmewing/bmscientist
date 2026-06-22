@@ -142,6 +142,14 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     coscientist.add_argument("--results-per-query", type=int, default=5)
     coscientist.add_argument("--max-pages-per-search", type=int, default=8)
     coscientist.add_argument("--reflection-concurrency", type=int, default=3)
+    coscientist.add_argument(
+        "--spawn-reflection-daemons",
+        action="store_true",
+        help=(
+            "Use legacy subprocess reflection workers. This can use much more RAM because each worker "
+            "loads its own embedding model."
+        ),
+    )
 
     feedback = subparsers.add_parser("coscientist-feedback", help="Provide human feedback on hypotheses or graph edges after a run.")
     feedback.add_argument("--research-id", "--project-name", dest="research_id", required=True)
@@ -235,7 +243,7 @@ def run_coscientist_command(
         results_per_query=args.results_per_query,
         max_pages_per_search=args.max_pages_per_search,
         reflection_concurrency=args.reflection_concurrency,
-        spawn_reflection_daemons=True,
+        spawn_reflection_daemons=getattr(args, "spawn_reflection_daemons", False),
     )
     loop_result = None
     if not args.skip_loop and hasattr(runner, "run_loop"):
@@ -274,11 +282,15 @@ def run_coscientist_command(
         console.print(f"[bold]Hypotheses:[/bold] {loop_result.hypothesis_path}")
         console.print(f"[bold]Rankings:[/bold] {loop_result.ranking_path}")
         console.print(f"[bold]Report:[/bold] {loop_result.report_path}")
+        if loop_result.cost_path:
+            console.print(f"[bold]Costs:[/bold] {loop_result.cost_path}")
         return 0
     console.print(f"[bold]Automatic discovery runs:[/bold] {result.automatic_discovery_runs}")
     console.print(f"[bold]Research goal:[/bold] {result.research_goal_path}")
     console.print(f"[bold]Hypotheses:[/bold] {result.hypothesis_path}")
     console.print(f"[bold]Report:[/bold] {result.report_path}")
+    if result.cost_path:
+        console.print(f"[bold]Costs:[/bold] {result.cost_path}")
     return 0
 
 
@@ -311,6 +323,8 @@ def run_coscientist_reflect_command(
     console.print(f"[bold]Research goal:[/bold] {result.research_goal_path}")
     console.print(f"[bold]Hypotheses:[/bold] {result.hypothesis_path}")
     console.print(f"[bold]Report:[/bold] {result.report_path}")
+    if result.cost_path:
+        console.print(f"[bold]Costs:[/bold] {result.cost_path}")
     return 0
 
 
@@ -352,6 +366,8 @@ def run_coscientist_loop_command(
     console.print(f"[bold]Rankings:[/bold] {result.ranking_path}")
     console.print(f"[bold]Hypotheses:[/bold] {result.hypothesis_path}")
     console.print(f"[bold]Report:[/bold] {result.report_path}")
+    if result.cost_path:
+        console.print(f"[bold]Costs:[/bold] {result.cost_path}")
     return 0
 
 
@@ -374,7 +390,11 @@ def run_coscientist_feedback_command(
         from bmscientist.coscientist_agents import ResearchPlanningAgent, RankingAgent, DeepSeekLLM
         
         console.print(f"[bold]Updating project goals for {args.research_id} using feedback: '{project_feedback}'...[/bold]")
-        planning_llm = DeepSeekLLM(config, model=config.planning_chat_model)
+        planning_llm = DeepSeekLLM(
+            config,
+            model=config.planning_chat_model,
+            request_profile=config.planning_chat_profile,
+        )
         planning_agent = ResearchPlanningAgent(planning_llm)
         updated_document = planning_agent.update_research_goal(document, project_feedback)
         store.save_research_goal(updated_document)
@@ -388,7 +408,11 @@ def run_coscientist_feedback_command(
         ]
         if active_reflected:
             console.print(f"[bold]Re-ranking {len(active_reflected)} active reflected hypotheses...[/bold]")
-            ranking_llm = DeepSeekLLM(config, model=config.ranking_chat_model)
+            ranking_llm = DeepSeekLLM(
+                config,
+                model=config.ranking_chat_model,
+                request_profile=config.ranking_chat_profile,
+            )
             ranking_agent = RankingAgent(ranking_llm)
             
             rounds = store.load_ranking_rounds(args.research_id)
@@ -563,4 +587,3 @@ def run_coscientist_meta_review_command(
         console.print("[yellow]No parent hypotheses identified for evolution.[/yellow]")
         
     return 0
-

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 import re
 import secrets
+import time
 from pathlib import Path
+from typing import Iterator
 from uuid import uuid4
 
 from bmscientist.coscientist_models import (
@@ -22,6 +26,9 @@ LOGGER = logging.getLogger(__name__)
 
 class CoScientistStore:
     HYPOTHESIS_STAGES = ("generated", "reflecting", "reflected", "evolve", "retired")
+    REFLECTION_QUEUE_LOCK_TIMEOUT_SECONDS = 30.0
+    REFLECTION_QUEUE_LOCK_POLL_SECONDS = 0.05
+    REFLECTION_FILE_RETRY_ATTEMPTS = 5
     _ADJECTIVES = (
         "amber",
         "ancient",
@@ -176,6 +183,12 @@ class CoScientistStore:
     def loop_report_path(self, research_id: str) -> Path:
         return self.reports_dir(research_id) / "loop.md"
 
+    def tool_report_path(self, research_id: str) -> Path:
+        return self.reports_dir(research_id) / "tool_requests.md"
+
+    def cost_report_path(self, research_id: str) -> Path:
+        return self.reports_dir(research_id) / "cost.json"
+
     def ranking_path(self, research_id: str) -> Path:
         return self.rounds_dir(research_id) / "rankings.jsonl"
 
@@ -250,34 +263,87 @@ class CoScientistStore:
         now = datetime.now(timezone.utc)
         lease_window = timedelta(seconds=max(1, lease_seconds))
 
-        for source_path in sorted(generated_dir.glob("*.json")):
-            claimed_path = reflecting_dir / source_path.name
+        with self._reflection_queue_lock(research_id):
+            for source_path in sorted(generated_dir.glob("*.json")):
+                claimed_path = reflecting_dir / source_path.name
+                if not self._claim_generated_file(source_path, claimed_path):
+                    continue
+                try:
+                    claimed_path.touch()
+                    hypothesis = Hypothesis.model_validate_json(claimed_path.read_text(encoding="utf-8"))
+                except (OSError, PermissionError):
+                    LOGGER.exception("Failed to read claimed hypothesis %s; releasing claim", claimed_path)
+                    try:
+                        claimed_path.rename(source_path)
+                    except OSError:
+                        LOGGER.exception("Failed to release unreadable claimed hypothesis %s", claimed_path)
+                    continue
+
+                claimed = hypothesis.model_copy(
+                    update={
+                        "status": "reflecting",
+                        "reflection_worker_id": worker_id,
+                        "reflection_claimed_at": now,
+                        "reflection_lease_expires_at": now + lease_window,
+                        "reflection_attempt_count": hypothesis.reflection_attempt_count + 1,
+                        "reflection_error": None,
+                    }
+                )
+                self.save_hypothesis(claimed)
+                return claimed
+        return None
+
+    @contextmanager
+    def _reflection_queue_lock(self, research_id: str) -> Iterator[None]:
+        lock_path = self.hypotheses_dir(research_id) / ".reflection_queue.lock"
+        deadline = time.monotonic() + self.REFLECTION_QUEUE_LOCK_TIMEOUT_SECONDS
+        fd: int | None = None
+        while fd is None:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}".encode("utf-8"))
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for reflection queue lock: {lock_path}")
+                time.sleep(self.REFLECTION_QUEUE_LOCK_POLL_SECONDS)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(self.REFLECTION_QUEUE_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                LOGGER.warning("Could not remove reflection queue lock %s", lock_path, exc_info=True)
+
+    def _claim_generated_file(self, source_path: Path, claimed_path: Path) -> bool:
+        for attempt in range(self.REFLECTION_FILE_RETRY_ATTEMPTS):
             try:
                 source_path.rename(claimed_path)
+                return True
             except FileExistsError:
-                continue
+                return False
             except FileNotFoundError:
-                continue
-            except OSError:
-                if source_path.exists():
-                    raise
-                continue
-            claimed_path.touch()
-
-            hypothesis = Hypothesis.model_validate_json(claimed_path.read_text(encoding="utf-8"))
-            claimed = hypothesis.model_copy(
-                update={
-                    "status": "reflecting",
-                    "reflection_worker_id": worker_id,
-                    "reflection_claimed_at": now,
-                    "reflection_lease_expires_at": now + lease_window,
-                    "reflection_attempt_count": hypothesis.reflection_attempt_count + 1,
-                    "reflection_error": None,
-                }
-            )
-            self.save_hypothesis(claimed)
-            return claimed
-        return None
+                return False
+            except (OSError, PermissionError) as exc:
+                if not source_path.exists():
+                    return False
+                if attempt + 1 >= self.REFLECTION_FILE_RETRY_ATTEMPTS:
+                    LOGGER.warning(
+                        "Could not claim generated hypothesis %s after %s attempts: %s",
+                        source_path,
+                        self.REFLECTION_FILE_RETRY_ATTEMPTS,
+                        exc,
+                    )
+                    return False
+                time.sleep(self.REFLECTION_QUEUE_LOCK_POLL_SECONDS * (2**attempt))
+        return False
 
     def complete_reflection_claim(self, hypothesis: Hypothesis) -> Path:
         completed = hypothesis.model_copy(
@@ -400,6 +466,24 @@ class CoScientistStore:
         path = self.loop_report_path(research_id)
         path.write_text(content, encoding="utf-8")
         return path
+
+    def write_tool_report(self, research_id: str, content: str) -> Path:
+        self.ensure_run_directories(research_id)
+        path = self.tool_report_path(research_id)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def write_cost_report(self, research_id: str, payload: dict[str, object]) -> Path:
+        self.ensure_run_directories(research_id)
+        path = self.cost_report_path(research_id)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def load_cost_report(self, research_id: str) -> dict[str, object] | None:
+        path = self.cost_report_path(research_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def append_ranking_round(self, ranking_round: RankingRound) -> Path:
         self.ensure_run_directories(ranking_round.research_id)
@@ -588,4 +672,3 @@ class CoScientistStore:
         )
         
         return target
-

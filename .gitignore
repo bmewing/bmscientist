@@ -24,4 +24,7 @@ data/coscientist/*
 !data/coscientist/.gitkeep
 data/*
 AGENTS.md
+ISSUES.txt
+PLAN.md
+MAT_PLAN.md
 .env

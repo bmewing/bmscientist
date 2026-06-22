@@ -4,6 +4,8 @@ import pytest
 from pydantic import BaseModel
 
 from bmscientist.coscientist_models import (
+    CandidateArtifactSchema,
+    EvaluationCriterion,
     Hypothesis,
     ResearchGoalDocument,
     ReflectionAssessment,
@@ -239,3 +241,72 @@ def test_update_project_goal():
     assert updated.regions == ["Europe"]
     assert updated.strategic_fit_criteria == ["recyclable"]
     assert updated.ranking_weights == {"strategic_fit": 0.8}
+
+
+def test_update_research_goal_preserves_or_updates_evaluation_criteria():
+    mock_llm = MockLLM({
+        "raw_goal": "Focus on low-toxicity coalescing aids for acrylic latex.",
+        "research_mode": "candidate_design",
+        "regions": ["North America"],
+        "strategic_fit_criteria": ["low aquatic toxicity"],
+        "target_incumbent_materials": ["traditional coalescing aids"],
+        "preferred_candidate_materials": [],
+        "candidate_material_preferences": ["small molecules"],
+        "recycling_or_sustainability_angles": ["safer chemistry"],
+        "material_scope": ["coating additives"],
+        "application_scope": ["waterborne coatings"],
+        "opportunity_modes": ["candidate_screening"],
+        "opportunity_speed_horizon_months": 12,
+        "commercialization_constraints": [],
+        "ranking_weights": {"strategic_fit": 0.6, "toxicity": 0.4},
+        "success_definition": "Identify candidates worth deeper tool-assisted screening.",
+        "candidate_artifact_schema": {
+            "artifact_type": "small_molecule",
+            "primary_identifier_field": "smiles",
+            "required_fields": ["name_or_label", "smiles"],
+        },
+        "evaluation_criteria": [
+            {
+                "name": "aquatic_toxicity_risk",
+                "description": "Avoid candidates with high aquatic toxicity concern.",
+                "direction": "avoid",
+                "required_candidate_fields": ["smiles"],
+                "suggested_tool_ids": ["opera_qsar"],
+            }
+        ],
+        "reflection_guidance": ["Ask for tool support when toxicity evidence is indirect."],
+        "tool_requests": [
+            {
+                "tool_id": "opera_qsar",
+                "purpose": "Predict toxicity-related endpoints from SMILES.",
+                "required_inputs": ["smiles"],
+                "expected_outputs": ["toxicity_endpoints"],
+            }
+        ],
+        "search_strategy_notes": ["Use SMILES and toxicity terms together."],
+        "strategic_fit_notes": "Coatings focus",
+    })
+
+    agent = ResearchPlanningAgent(mock_llm)
+    doc = make_test_document().model_copy(
+        update={
+            "research_mode": "candidate_design",
+            "candidate_artifact_schema": CandidateArtifactSchema(
+                artifact_type="small_molecule",
+                primary_identifier_field="smiles",
+            ),
+            "evaluation_criteria": [
+                EvaluationCriterion(
+                    name="water_compatibility",
+                    description="Look for waterborne suitability.",
+                )
+            ],
+        }
+    )
+
+    updated = agent.update_research_goal(doc, "Focus more explicitly on aquatic toxicity.")
+
+    assert updated.research_mode == "candidate_design"
+    assert updated.candidate_artifact_schema.primary_identifier_field == "smiles"
+    assert updated.evaluation_criteria[0].name == "aquatic_toxicity_risk"
+    assert updated.tool_requests[0].tool_id == "opera_qsar"
