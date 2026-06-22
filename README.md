@@ -76,6 +76,10 @@ MARKET_VOLUME_ESTIMATION_CHAT_MODEL=deepseek-v4-pro
 # timeout_seconds is optional per profile and overrides REQUEST_TIMEOUT_SECONDS for that role.
 REFLECTION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"high"},"timeout_seconds":120}
 MARKET_VOLUME_ESTIMATION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"max"},"timeout_seconds":180}
+
+# Optional DeepSeek per-model pricing overrides for cost tracking.
+# Values are USD per 1M tokens.
+# DEEPSEEK_MODEL_PRICING={"deepseek-v4-pro":{"input_cost_per_million_tokens":0.435,"output_cost_per_million_tokens":0.87,"cached_input_cost_per_million_tokens":0.003625}}
 ```
 
 * `DEEPSEEK_API_KEY` (**Required**): Your DeepSeek API key for all LLM-backed reasoning.
@@ -85,11 +89,15 @@ MARKET_VOLUME_ESTIMATION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"en
 * `LANCEDB_PATH` (*Optional*): Explicit LanceDB directory override. Defaults to `BMSCIENTIST_DATA_DIR/lancedb`.
 * `*_CHAT_MODEL` (*Optional*): Simple per-role model override keys. These still work and are the easiest way to route different stages to different DeepSeek models.
 * `*_CHAT_PROFILE` (*Optional*): JSON request-profile keys for DeepSeek thinking mode. Use these when you need to control both model selection and request structure such as `thinking.enabled`, `thinking.effort`, and role-specific `timeout_seconds`.
+* `DEEPSEEK_MODEL_PRICING` (*Optional*): JSON object of DeepSeek model pricing overrides used by run-level cost tracking. This is useful if provider pricing changes or you want your local `cost.json` totals to reflect a custom rate card.
 * `MARKET_VOLUME_ESTIMATION_CHAT_PROFILE` (*Optional*): Useful for the reflection-time AI volume estimator, where a stronger reasoning model can infer tonnage from revenue and pricing signals before writing medium-confidence AI-generated graph evidence.
 * `HF_TOKEN` (*Optional*): Hugging Face token, recommended for avoiding rate limits when downloading embedding models.
 
 DeepSeek thinking-mode note:
 Use a JSON profile like `{"model":"deepseek-v4-pro","thinking":{"enabled":true,"effort":"max"},"timeout_seconds":180}`. The library maps that to DeepSeek's OpenAI-format request fields (`extra_body.thinking` and `reasoning_effort`) automatically, and `timeout_seconds` overrides the global `REQUEST_TIMEOUT_SECONDS` for that specific role.
+
+Cost tracking note:
+Co-scientist runs now write `reports/cost.json` with `total_exa_usd`, `total_deepseek_usd`, and a provider breakdown. DeepSeek totals are computed from API token usage plus the configured pricing table, while Exa totals come from the provider-returned `costDollars.total` field.
 
 Exa retrieval note:
 Discovery and reflection search now use Exa search-time extracted content first, preserve Exa highlights and request metadata, and only escalate to `/contents` follow-ups for high-value or truncated pages. Direct HTTP fetch is now a fallback path rather than the default source of truth.
@@ -138,6 +146,8 @@ The `coscientist` command now defaults to in-process threaded reflection, which 
 ```powershell
 .\.venv\Scripts\python.exe -m bmscientist coscientist ... --spawn-reflection-daemons
 ```
+
+When a run completes, the CLI prints a `Costs:` path pointing to the generated `reports/cost.json` file.
 
 Resume reflection for generated hypotheses without regenerating:
 
@@ -202,8 +212,10 @@ Under the directory configured by `BMSCIENTIST_DATA_DIR` (defaults to `./data`):
   * Research goal: `research_goal.json`
   * Hypotheses: `hypotheses/{generated,reflecting,reflected,evolve,retired}/{hypothesis_id}.json`
   * Execution logs: `rounds/rankings.jsonl`, `rounds/proximity.jsonl`, `rounds/meta_reviews.jsonl`
-  * Output Reports: `reports/`
+  * Output Reports: `reports/reflection.md`, `reports/loop.md`, `reports/tool_requests.md`, `reports/cost.json`
 * Cache: `raw/`, `pricing/`
+
+For a given `research_id`, the cost report is cumulative across `coscientist`, `coscientist-loop`, and `coscientist-reflect`, so later commands update the same `reports/cost.json` instead of starting a separate spend ledger.
 
 ## Persistence & Validation Rules
 
