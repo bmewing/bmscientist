@@ -19,6 +19,19 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_GRAPH_PATH = Path("data/graph")
 GRAPH_PATH = DEFAULT_GRAPH_PATH
 
+GRAPH_EVIDENCE_EDGE_TYPES = (
+    "Market_HAS_APPLICATION_Application",
+    "Market_USES_Product",
+    "Market_IN_GEOGRAPHY_Geography",
+    "Product_USED_IN_Application",
+    "Company_PRODUCES_Product",
+    "Market_HAS_COMPANY_Company",
+    "Product_HAS_ChemistryClass",
+    "Product_HAS_Function",
+    "Product_TARGETS_BinderSystem",
+    "Product_HAS_Endpoint",
+)
+
 
 
 class GraphMarketEvidence:
@@ -40,12 +53,7 @@ class GraphMarketEvidence:
             return []
 
         scored: list[tuple[float, dict[str, Any]]] = []
-        for edge_type in (
-            "Market_HAS_APPLICATION_Application",
-            "Market_USES_Product",
-            "Market_IN_GEOGRAPHY_Geography",
-            "Product_USED_IN_Application",
-        ):
+        for edge_type in GRAPH_EVIDENCE_EDGE_TYPES:
             for edge in self._edges.get(edge_type, []):
                 score = self._score_edge(edge_type, edge, document, hypothesis)
                 if score <= 0:
@@ -79,12 +87,7 @@ class GraphMarketEvidence:
             return []
 
         scored: list[tuple[float, dict[str, Any]]] = []
-        for edge_type in (
-            "Market_HAS_APPLICATION_Application",
-            "Market_USES_Product",
-            "Market_IN_GEOGRAPHY_Geography",
-            "Product_USED_IN_Application",
-        ):
+        for edge_type in GRAPH_EVIDENCE_EDGE_TYPES:
             for edge in self._edges.get(edge_type, []):
                 score = self._score_edge_for_goal(edge_type, edge, document)
                 if score <= 0:
@@ -120,15 +123,15 @@ class GraphMarketEvidence:
                     "Application": self._load_node_map("Application", "application_id"),
                     "Product": self._load_node_map("Product", "product_id"),
                     "Geography": self._load_node_map("Geography", "geo_id"),
+                    "Company": self._load_node_map("Company", "company_id"),
+                    "ChemistryClass": self._load_node_map("ChemistryClass", "chemistry_class_id"),
+                    "Function": self._load_node_map("Function", "function_id"),
+                    "BinderSystem": self._load_node_map("BinderSystem", "binder_system_id"),
+                    "Endpoint": self._load_node_map("Endpoint", "endpoint_id"),
                 }
                 self._edges = {
                     edge_type: self._load_rows(self._graph_path / "edges" / f"{edge_type}.parquet")
-                    for edge_type in (
-                        "Market_HAS_APPLICATION_Application",
-                        "Market_USES_Product",
-                        "Market_IN_GEOGRAPHY_Geography",
-                        "Product_USED_IN_Application",
-                    )
+                    for edge_type in GRAPH_EVIDENCE_EDGE_TYPES
                 }
             except Exception:
                 LOGGER.exception("Failed to load graph market parquet evidence from %s", self._graph_path)
@@ -154,6 +157,8 @@ class GraphMarketEvidence:
     ) -> float:
         if str(edge.get("validation_status")).lower() == "rejected":
             return 0.0
+        combined_terms = self._document_terms(document) | self._hypothesis_terms(document, hypothesis)
+        criterion_terms = self._criterion_terms(document)
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         if edge_type == "Product_USED_IN_Application":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
@@ -195,6 +200,64 @@ class GraphMarketEvidence:
             if edge.get("critical_to_quality_json"):
                 score += 1.0
             if self._has_market_metrics(edge) or self._number(edge.get("volume_value")) is not None:
+                score += 1.0
+            return score
+        if edge_type == "Company_PRODUCES_Product":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            score = 0.0
+            if self._tokens(company.get("name")) & combined_terms:
+                score += 4.0
+            if self._tokens(product.get("name")) & combined_terms:
+                score += 3.0
+            return score
+        if edge_type == "Market_HAS_COMPANY_Company":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            score = 0.0
+            if self._tokens(market.get("name")) & combined_terms:
+                score += 2.0
+            if self._tokens(company.get("name")) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_ChemistryClass":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            chemistry_class = self._nodes.get("ChemistryClass", {}).get(str(edge.get("chemistry_class_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & combined_terms:
+                score += 2.0
+            if self._tokens(chemistry_class.get("name")) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_Function":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            function = self._nodes.get("Function", {}).get(str(edge.get("function_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & combined_terms:
+                score += 2.0
+            if self._tokens(function.get("name")) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_TARGETS_BinderSystem":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            binder_system = self._nodes.get("BinderSystem", {}).get(str(edge.get("binder_system_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & combined_terms:
+                score += 2.0
+            if self._tokens(binder_system.get("name")) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_Endpoint":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            endpoint_tokens = self._tokens(endpoint.get("name"))
+            if self._tokens(product.get("name")) & combined_terms:
+                score += 2.0
+            if endpoint_tokens & combined_terms:
+                score += 3.0
+            if endpoint_tokens & criterion_terms:
+                score += 3.0
+            if self._number(edge.get("normalized_score")) is not None or edge.get("value_text"):
                 score += 1.0
             return score
         target = self._target_node(edge_type, edge)
@@ -255,6 +318,8 @@ class GraphMarketEvidence:
     ) -> float:
         if str(edge.get("validation_status")).lower() == "rejected":
             return 0.0
+        goal_terms = self._document_terms(document)
+        criterion_terms = self._criterion_terms(document)
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         if edge_type == "Product_USED_IN_Application":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
@@ -288,6 +353,64 @@ class GraphMarketEvidence:
             if application_tokens & application_terms:
                 score += 4.0
             if self._has_market_metrics(edge) or self._number(edge.get("volume_value")) is not None:
+                score += 1.0
+            return score
+        if edge_type == "Company_PRODUCES_Product":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            score = 0.0
+            if self._tokens(company.get("name")) & goal_terms:
+                score += 4.0
+            if self._tokens(product.get("name")) & goal_terms:
+                score += 3.0
+            return score
+        if edge_type == "Market_HAS_COMPANY_Company":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            score = 0.0
+            if self._tokens(market.get("name")) & goal_terms:
+                score += 2.0
+            if self._tokens(company.get("name")) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_ChemistryClass":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            chemistry_class = self._nodes.get("ChemistryClass", {}).get(str(edge.get("chemistry_class_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & goal_terms:
+                score += 2.0
+            if self._tokens(chemistry_class.get("name")) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_Function":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            function = self._nodes.get("Function", {}).get(str(edge.get("function_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & goal_terms:
+                score += 2.0
+            if self._tokens(function.get("name")) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_TARGETS_BinderSystem":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            binder_system = self._nodes.get("BinderSystem", {}).get(str(edge.get("binder_system_id")), {})
+            score = 0.0
+            if self._tokens(product.get("name")) & goal_terms:
+                score += 2.0
+            if self._tokens(binder_system.get("name")) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "Product_HAS_Endpoint":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            endpoint_tokens = self._tokens(endpoint.get("name"))
+            if self._tokens(product.get("name")) & goal_terms:
+                score += 2.0
+            if endpoint_tokens & goal_terms:
+                score += 3.0
+            if endpoint_tokens & criterion_terms:
+                score += 3.0
+            if self._number(edge.get("normalized_score")) is not None or edge.get("value_text"):
                 score += 1.0
             return score
         target = self._target_node(edge_type, edge)
@@ -343,21 +466,51 @@ class GraphMarketEvidence:
             return self._nodes.get("Geography", {}).get(str(edge.get("geo_id")), {})
         if edge_type == "Product_USED_IN_Application":
             return self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
+        if edge_type == "Company_PRODUCES_Product":
+            return self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+        if edge_type == "Market_HAS_COMPANY_Company":
+            return self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+        if edge_type == "Product_HAS_ChemistryClass":
+            return self._nodes.get("ChemistryClass", {}).get(str(edge.get("chemistry_class_id")), {})
+        if edge_type == "Product_HAS_Function":
+            return self._nodes.get("Function", {}).get(str(edge.get("function_id")), {})
+        if edge_type == "Product_TARGETS_BinderSystem":
+            return self._nodes.get("BinderSystem", {}).get(str(edge.get("binder_system_id")), {})
+        if edge_type == "Product_HAS_Endpoint":
+            return self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
         return {}
 
     def _row_from_edge(self, edge_type: str, edge: dict[str, Any], score: float) -> dict[str, Any] | None:
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         target = self._target_node(edge_type, edge)
-        if not market and edge_type != "Product_USED_IN_Application":
+        if not market and edge_type in (
+            "Market_HAS_APPLICATION_Application",
+            "Market_USES_Product",
+            "Market_IN_GEOGRAPHY_Geography",
+            "Market_HAS_COMPANY_Company",
+        ):
             return None
         relationship = {
             "Market_HAS_APPLICATION_Application": "has application",
             "Market_USES_Product": "uses product",
             "Market_IN_GEOGRAPHY_Geography": "is measured in geography",
             "Product_USED_IN_Application": "is used in application",
+            "Company_PRODUCES_Product": "produces product",
+            "Market_HAS_COMPANY_Company": "includes company",
+            "Product_HAS_ChemistryClass": "belongs to chemistry class",
+            "Product_HAS_Function": "has function",
+            "Product_TARGETS_BinderSystem": "targets binder system",
+            "Product_HAS_Endpoint": "has endpoint",
         }.get(edge_type, edge_type)
         product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
-        target_name = target.get("name") or edge.get("application_id") or edge.get("product_id") or edge.get("geo_id")
+        company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+        target_name = (
+            target.get("name")
+            or edge.get("application_id")
+            or edge.get("product_id")
+            or edge.get("geo_id")
+            or edge.get("company_id")
+        )
         metrics_text = self._metrics_text(edge)
         notes = self._json_notes(
             edge,
@@ -371,11 +524,20 @@ class GraphMarketEvidence:
             or market.get("canonical_url")
             or str(self._graph_path.resolve())
         )
-        subject_name = product.get("name") if edge_type == "Product_USED_IN_Application" else market.get("name")
+        subject_name = self._subject_name(edge_type, market, product, company)
+        if edge_type == "Product_HAS_Endpoint":
+            endpoint_value_parts = [
+                f"value={edge.get('value_numeric')}" if edge.get("value_numeric") is not None else None,
+                f"text={edge.get('value_text')}" if edge.get("value_text") else None,
+                f"normalized_score={edge.get('normalized_score')}" if edge.get("normalized_score") is not None else None,
+                f"evidence_mode={edge.get('evidence_mode')}" if edge.get("evidence_mode") else None,
+                f"tool_id={edge.get('tool_id')}" if edge.get("tool_id") else None,
+            ]
+            notes.append("Endpoint details: " + ", ".join(part for part in endpoint_value_parts if part))
         chunk_text = " ".join(
             item
             for item in [
-                f"Graph market data from {market.get('source_vendor') or 'offline market graph'}: "
+                f"Graph evidence from {market.get('source_vendor') or 'offline graph'}: "
                 f"{subject_name} {relationship} {target_name}.",
                 metrics_text,
                 " ".join(notes),
@@ -394,7 +556,8 @@ class GraphMarketEvidence:
                 [target_name]
                 if edge_type == "Market_USES_Product" and target_name
                 else [product.get("name")]
-                if edge_type == "Product_USED_IN_Application" and product.get("name")
+                if edge_type in ("Product_USED_IN_Application", "Product_HAS_ChemistryClass", "Product_HAS_Function", "Product_TARGETS_BinderSystem", "Product_HAS_Endpoint")
+                and product.get("name")
                 else []
             ),
             "relevance_score": min(0.98, 0.55 + (score * 0.04)),
@@ -421,6 +584,17 @@ class GraphMarketEvidence:
                 "price_currency": edge.get("price_currency"),
                 "price_unit": edge.get("price_unit"),
                 "price_year": self._number(edge.get("price_year")),
+                "company_id": edge.get("company_id"),
+                "chemistry_class_id": edge.get("chemistry_class_id"),
+                "function_id": edge.get("function_id"),
+                "binder_system_id": edge.get("binder_system_id"),
+                "endpoint_id": edge.get("endpoint_id"),
+                "value_text": edge.get("value_text"),
+                "value_numeric": self._number(edge.get("value_numeric")),
+                "normalized_score": self._number(edge.get("normalized_score")),
+                "evidence_mode": edge.get("evidence_mode"),
+                "tool_id": edge.get("tool_id"),
+                "is_inferred": edge.get("is_inferred"),
                 "evidence_hash": edge.get("evidence_hash"),
                 "source_chunk_id": edge.get("source_chunk_id"),
                 "unit": edge.get("unit"),
@@ -428,6 +602,64 @@ class GraphMarketEvidence:
                 "unit_scale": edge.get("unit_scale"),
             },
         }
+
+    @staticmethod
+    def _subject_name(
+        edge_type: str,
+        market: dict[str, Any],
+        product: dict[str, Any],
+        company: dict[str, Any],
+    ) -> str:
+        if edge_type in (
+            "Product_USED_IN_Application",
+            "Product_HAS_ChemistryClass",
+            "Product_HAS_Function",
+            "Product_TARGETS_BinderSystem",
+            "Product_HAS_Endpoint",
+        ):
+            return product.get("name")
+        if edge_type == "Company_PRODUCES_Product":
+            return company.get("name")
+        return market.get("name")
+
+    def _document_terms(self, document: ResearchGoalDocument) -> set[str]:
+        parts = [
+            document.raw_goal,
+            " ".join(document.material_scope),
+            " ".join(document.application_scope),
+            " ".join(document.preferred_candidate_materials),
+            " ".join(document.target_incumbent_materials),
+            " ".join(document.search_strategy_notes),
+            document.candidate_artifact_schema.artifact_type,
+        ]
+        parts.extend(criterion.name for criterion in document.evaluation_criteria)
+        parts.extend(criterion.description for criterion in document.evaluation_criteria)
+        return self._tokens(" ".join(part for part in parts if part))
+
+    def _hypothesis_terms(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> set[str]:
+        artifact = hypothesis.candidate_artifact or {}
+        parts = [
+            hypothesis.title,
+            hypothesis.summary,
+            hypothesis.application,
+            hypothesis.market_segment,
+            hypothesis.candidate_material,
+            hypothesis.incumbent_material,
+            hypothesis.product_type,
+            " ".join(str(value) for value in artifact.values() if value),
+            " ".join(hypothesis.application_requirements),
+            " ".join(hypothesis.substitution_drivers),
+        ]
+        if hypothesis.reflection_assessment is not None:
+            parts.extend(hypothesis.reflection_assessment.evidence_gap_notes)
+        return self._tokens(" ".join(part for part in parts if part)) | self._document_terms(document)
+
+    def _criterion_terms(self, document: ResearchGoalDocument) -> set[str]:
+        parts = []
+        for criterion in document.evaluation_criteria:
+            parts.append(criterion.name)
+            parts.append(criterion.description)
+        return self._tokens(" ".join(part for part in parts if part))
 
     @staticmethod
     def _metrics_text(edge: dict[str, Any]) -> str:

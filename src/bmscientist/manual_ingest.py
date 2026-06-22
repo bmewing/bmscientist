@@ -81,7 +81,7 @@ class ManualEvidenceIngestor:
         if not hasattr(self._store, "all_rows"):
             return []
         try:
-            rows = self._store.all_rows()
+            rows = self._store.all_rows(where=f"original_query = '{MANUAL_QUERY}'")
         except Exception:
             LOGGER.exception("Unable to inspect stored manual evidence; skipping processed-file recovery")
             return []

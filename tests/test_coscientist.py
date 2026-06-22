@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 
 from bmscientist.chunking import TextChunker
 from bmscientist.config import AppConfig
+from bmscientist.cost_tracking import CostTracker
 from bmscientist.coscientist_agents import (
     CoScientistRunner,
     DiscoveryEvidenceTool,
@@ -20,10 +21,12 @@ from bmscientist.coscientist_agents import (
     ProximityCheckAgent,
     RankingAgent,
     ReflectionAgent,
+    ReflectionSearchPlanner,
     ResearchPlanningAgent,
 )
 from bmscientist.coscientist_cli import run_coscientist_command, run_coscientist_loop_command
 from bmscientist.coscientist_models import (
+    EvaluationCriterion,
     Hypothesis,
     HypothesisEvolutionOutput,
     HypothesisGenerationOutput,
@@ -85,6 +88,56 @@ class PlanningLLM:
                 "commercialization_constraints": ["sales realization under 6 months"],
                 "ranking_weights": {"speed": 0.5, "volume": 0.3, "sustainability": 0.2},
                 "success_definition": "Find plausible near-term substitution targets.",
+            }
+        )
+
+
+class GenericPlanningLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        return response_model.model_validate(
+            {
+                "research_mode": "candidate_design",
+                "strategic_fit_criteria": ["low aquatic toxicity", "waterborne compatibility"],
+                "target_incumbent_materials": ["traditional coalescing aids"],
+                "preferred_candidate_materials": [],
+                "candidate_material_preferences": ["small molecules with plausible commercial use"],
+                "recycling_or_sustainability_angles": ["lower hazard profile"],
+                "material_scope": ["waterborne coating additives"],
+                "application_scope": ["latex coatings"],
+                "opportunity_modes": ["candidate_screening"],
+                "opportunity_speed_horizon_months": 12,
+                "commercialization_constraints": ["avoid obvious regulatory hazards"],
+                "ranking_weights": {"strategic_fit": 0.5, "toxicity": 0.5},
+                "success_definition": "Find candidate coalescing aids worth deeper screening.",
+                "candidate_artifact_schema": {
+                    "artifact_type": "small_molecule",
+                    "primary_identifier_field": "smiles",
+                    "required_fields": ["name_or_label", "smiles", "intended_binder_system"],
+                    "optional_fields": ["boiling_point_c"],
+                    "validation_rules": ["SMILES should be syntactically valid where possible"],
+                },
+                "evaluation_criteria": [
+                    {
+                        "name": "aquatic_toxicity_risk",
+                        "description": "Avoid candidates with high aquatic toxicity concern.",
+                        "direction": "avoid",
+                        "required_candidate_fields": ["smiles"],
+                        "suggested_tool_ids": ["opera_qsar"],
+                        "suggested_search_queries": ["candidate aquatic toxicity prediction"],
+                        "reflection_guidance": ["Look for toxicity signals or missing data."],
+                    }
+                ],
+                "reflection_guidance": ["Flag candidates that need a QSAR tool before proceeding."],
+                "tool_requests": [
+                    {
+                        "tool_id": "opera_qsar",
+                        "purpose": "Estimate aquatic toxicity and related properties from SMILES.",
+                        "candidate_packages": ["OPERA command-line application"],
+                        "required_inputs": ["smiles"],
+                        "expected_outputs": ["toxicity_endpoints"],
+                    }
+                ],
+                "search_strategy_notes": ["Combine molecule identity terms with toxicity/property terms."],
             }
         )
 
@@ -225,6 +278,35 @@ class ReflectionNoSearchLLM:
                 },
                 "needs_additional_search": False,
                 "follow_up_search_queries": [],
+            }
+        )
+
+
+class GenericReflectionLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        assert "Criteria to review" in user_prompt
+        return response_model.model_validate(
+            {
+                "assessment": {
+                    "criterion_results": [
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "value": "low concern from literature proxy",
+                            "normalized_score": 0.76,
+                            "confidence": 0.62,
+                            "rationale": "Indirect evidence suggests a lower hazard profile, but no direct tool output was supplied.",
+                            "evidence_mode": "literature",
+                            "tool_id": None,
+                            "citation_chunk_ids": ["chunk-1"],
+                            "citation_urls": ["https://example.com/1"],
+                            "is_inferred": True,
+                        }
+                    ],
+                    "tool_request_notes": ["Run opera_qsar before making a final toxicity call."],
+                    "evidence_gap_notes": ["No direct aquatic toxicity model output was available."],
+                },
+                "needs_additional_search": True,
+                "follow_up_search_queries": ["CCOC(=O)OCC aquatic toxicity coating additive"],
             }
         )
 
@@ -424,6 +506,43 @@ def make_document() -> ResearchGoalDocument:
         material_scope=["PETG", "PVC"],
         application_scope=["medical trays"],
         success_definition="Identify plausible substitution targets.",
+    )
+
+
+def make_generic_document() -> ResearchGoalDocument:
+    return ResearchGoalDocument(
+        research_id="generic-run-1",
+        raw_goal="Find a waterborne coalescing aid with lower aquatic toxicity risk.",
+        target_hypotheses_final=2,
+        target_hypotheses_generated=4,
+        research_mode="candidate_design",
+        regions=["North America"],
+        strategic_fit_criteria=["low aquatic toxicity", "film formation support"],
+        candidate_artifact_schema={
+            "artifact_type": "small_molecule",
+            "primary_identifier_field": "smiles",
+            "required_fields": ["name_or_label", "smiles", "intended_binder_system"],
+        },
+        evaluation_criteria=[
+            EvaluationCriterion(
+                name="aquatic_toxicity_risk",
+                description="Avoid candidates with high aquatic toxicity concern.",
+                direction="avoid",
+                required_candidate_fields=["smiles"],
+                suggested_tool_ids=["opera_qsar"],
+                suggested_search_queries=["candidate aquatic toxicity prediction"],
+            )
+        ],
+        tool_requests=[
+            {
+                "tool_id": "opera_qsar",
+                "purpose": "Estimate aquatic toxicity and related properties from SMILES.",
+                "candidate_packages": ["OPERA command-line application"],
+                "required_inputs": ["smiles"],
+                "expected_outputs": ["toxicity_endpoints"],
+            }
+        ],
+        search_strategy_notes=["Use SMILES and toxicity language in discovery queries."],
     )
 
 
@@ -669,6 +788,340 @@ def test_hypothesis_generation_output_normalizes_named_confidence_levels():
     assert output.hypotheses[1].generation_confidence == 0.8
 
 
+def test_research_planning_accepts_generic_candidate_design_contract():
+    agent = ResearchPlanningAgent(GenericPlanningLLM())
+
+    document = agent.create_research_goal(
+        research_id="screen-1",
+        raw_goal="Find a waterborne coalescing aid with lower aquatic toxicity risk.",
+        target_hypotheses_final=3,
+        regions=["North America"],
+        strategic_fit_notes=None,
+        preferred_evidence_recency_days=180,
+        reflection_search_limits=ReflectionSearchLimits(),
+    )
+
+    assert document.research_mode == "candidate_design"
+    assert document.candidate_artifact_schema.primary_identifier_field == "smiles"
+    assert document.evaluation_criteria[0].name == "aquatic_toxicity_risk"
+    assert document.tool_requests[0].tool_id == "opera_qsar"
+
+
+def test_hypothesis_seed_accepts_candidate_artifact():
+    output = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Candidate coalescent A",
+                    "summary": "A small-molecule coalescent candidate.",
+                    "candidate_artifact": {
+                        "name_or_label": "Candidate A",
+                        "smiles": "CCOC(=O)OCC",
+                        "intended_binder_system": "acrylic latex",
+                    },
+                    "evaluation_results": [
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "normalized_score": 0.6,
+                            "confidence": 0.4,
+                            "rationale": "Preliminary estimate.",
+                            "is_inferred": True,
+                        }
+                    ],
+                    "generation_confidence": 0.5,
+                }
+            ]
+        }
+    )
+
+    assert output.hypotheses[0].candidate_artifact["smiles"] == "CCOC(=O)OCC"
+    assert output.hypotheses[0].evaluation_results[0].criterion_name == "aquatic_toxicity_risk"
+
+
+def test_hypothesis_seed_normalizes_evaluation_result_aliases():
+    output = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Candidate coalescent B",
+                    "summary": "A candidate with aliased evaluation fields.",
+                    "evaluation_results": [
+                        {
+                            "criterion": "aquatic_toxicity_risk",
+                            "score": 0.7,
+                            "reasoning": "Predicted to be less toxic than the benchmark.",
+                            "tool": "opera_qsar",
+                            "chunk_ids": ["chunk-1"],
+                            "urls": ["https://example.com/opera"],
+                            "inferred": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    result = output.hypotheses[0].evaluation_results[0]
+    assert result.criterion_name == "aquatic_toxicity_risk"
+    assert result.normalized_score == 0.7
+    assert result.rationale == "Predicted to be less toxic than the benchmark."
+    assert result.tool_id == "opera_qsar"
+    assert result.citation_chunk_ids == ["chunk-1"]
+    assert result.citation_urls == ["https://example.com/opera"]
+    assert result.is_inferred is True
+
+
+def test_hypothesis_seed_accepts_single_entry_evaluation_result_maps():
+    output = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Candidate coalescent C",
+                    "summary": "A candidate with one-entry evaluation summaries.",
+                    "evaluation_results": [
+                        {
+                            "Aquatic toxicity": "Predicted low acute aquatic toxicity; no structural alerts.",
+                        },
+                        {
+                            "Coalescing efficiency": 0.62,
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    first_result = output.hypotheses[0].evaluation_results[0]
+    second_result = output.hypotheses[0].evaluation_results[1]
+    assert first_result.criterion_name == "Aquatic toxicity"
+    assert first_result.rationale == "Predicted low acute aquatic toxicity; no structural alerts."
+    assert first_result.value is None
+    assert second_result.criterion_name == "Coalescing efficiency"
+    assert second_result.value == 0.62
+
+
+def test_reflection_assessment_normalizes_criterion_result_aliases():
+    assessment = ReflectionAssessment.model_validate(
+        {
+            "criterion_results": [
+                {
+                    "criterion": "water_compatibility",
+                    "score": 0.55,
+                    "description": "Estimated to have acceptable water compatibility.",
+                }
+            ]
+        }
+    )
+
+    result = assessment.criterion_results[0]
+    assert result.criterion_name == "water_compatibility"
+    assert result.normalized_score == 0.55
+    assert result.rationale == "Estimated to have acceptable water compatibility."
+
+
+def test_hypothesis_seed_normalizes_non_unit_score_scales():
+    output = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Candidate coalescent D",
+                    "summary": "A candidate with mixed score scales.",
+                    "evaluation_results": [
+                        {
+                            "criterion_name": "film_forming_potential",
+                            "normalized_score": 4,
+                        },
+                        {
+                            "criterion_name": "water_compatibility",
+                            "normalized_score": "8/10",
+                        },
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "normalized_score": "80%",
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    results = output.hypotheses[0].evaluation_results
+    assert results[0].normalized_score == 0.8
+    assert results[1].normalized_score == 0.8
+    assert results[2].normalized_score == 0.8
+
+
+def test_generation_preserves_candidate_artifact_primary_identifier():
+    class GenericGenerationLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "Candidate coalescent A",
+                            "summary": "Candidate with a plausible low-toxicity profile.",
+                            "candidate_artifact": {
+                                "name_or_label": "Candidate A",
+                                "smiles": "CCOC(=O)OCC",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.61,
+                        }
+                    ]
+                }
+            )
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(GenericGenerationLLM(), retriever)
+
+    hypotheses = agent.generate(make_generic_document())
+
+    assert len(hypotheses) == 1
+    assert hypotheses[0].candidate_artifact["smiles"] == "CCOC(=O)OCC"
+    assert hypotheses[0].candidate_artifact["name_or_label"] == "Candidate A"
+
+
+def test_reflection_reviews_generic_criteria_without_running_tools():
+    discovery = FakeDiscoveryAgent()
+    agent = ReflectionAgent(
+        GenericReflectionLLM(),
+        LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder()),
+        DiscoveryEvidenceTool(discovery),
+    )
+    hypothesis = make_hypothesis().model_copy(
+        update={
+            "title": "Candidate coalescent A",
+            "candidate_artifact": {
+                "name_or_label": "Candidate A",
+                "smiles": "CCOC(=O)OCC",
+                "intended_binder_system": "acrylic latex",
+            },
+        }
+    )
+
+    reflected, run_count = agent.reflect(make_generic_document(), hypothesis)
+
+    assert run_count == 3
+    assert discovery.queries[0] == "candidate aquatic toxicity prediction"
+    assert reflected.reflection_assessment is not None
+    assert reflected.reflection_assessment.criterion_results[0].criterion_name == "aquatic_toxicity_risk"
+    assert reflected.reflection_assessment.tool_request_notes == ["Run opera_qsar before making a final toxicity call."]
+
+
+def test_reflection_search_planner_uses_evaluation_criteria_queries():
+    planner = ReflectionSearchPlanner()
+    hypothesis = make_hypothesis().model_copy(
+        update={
+            "title": "Candidate coalescent A",
+            "candidate_artifact": {"smiles": "CCOC(=O)OCC"},
+        }
+    )
+
+    queries = planner.plan(
+        make_generic_document(),
+        hypothesis,
+        ReflectionAssessment(),
+        suggested_queries=[],
+    )
+
+    assert "candidate aquatic toxicity prediction" in queries
+    assert "CCOC(=O)OCC aquatic_toxicity_risk" in queries
+
+
+def test_ranking_uses_criterion_results_when_present():
+    reflected = make_hypothesis().model_copy(
+        update={
+            "status": "reflected",
+            "reflection_assessment": ReflectionAssessment.model_validate(
+                {
+                    "criterion_results": [
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "normalized_score": 0.81,
+                            "confidence": 0.7,
+                            "rationale": "Looks promising.",
+                            "is_inferred": True,
+                        }
+                    ]
+                }
+            ),
+        }
+    )
+
+    score = RankingAgent._heuristic_score(reflected)
+
+    assert score > 0.7
+
+
+def test_report_includes_tool_requests():
+    hypothesis = make_hypothesis().model_copy(
+        update={
+            "reflection_assessment": ReflectionAssessment.model_validate(
+                {
+                    "criterion_results": [
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "normalized_score": 0.76,
+                            "confidence": 0.62,
+                            "rationale": "Indirect evidence only.",
+                            "is_inferred": True,
+                        }
+                    ],
+                    "tool_request_notes": ["Run opera_qsar before final selection."],
+                }
+            )
+        }
+    )
+
+    report = CoScientistRunner._build_tool_request_report(make_generic_document(), [hypothesis])
+
+    assert "opera_qsar" in report
+    assert "Dependent criteria: aquatic_toxicity_risk" in report
+    assert "Run opera_qsar before final selection." in report
+
+
+def test_evaluation_criterion_normalizes_evidence_mode_aliases():
+    document = ResearchGoalDocument.model_validate(
+        {
+            "research_id": "screen-2",
+            "raw_goal": "Screen coalescing aids.",
+            "target_hypotheses_final": 2,
+            "target_hypotheses_generated": 4,
+            "evaluation_criteria": [
+                {
+                    "name": "aquatic_toxicity_risk",
+                    "evidence_mode": "computational_prediction",
+                },
+                {
+                    "name": "film_formation_proxy",
+                    "evidence_mode": "qsar",
+                },
+                {
+                    "name": "synthesis_feasibility",
+                    "evidence_mode": "computational_retrosynthesis",
+                },
+                {
+                    "name": "bench_validation",
+                    "evidence_mode": "computational_and_experimental",
+                },
+            ],
+            "tool_requests": [
+                {
+                    "tool_id": "custom_qsar",
+                    "purpose": "Prototype a toxicity-screening helper.",
+                    "status": "to_be_developed",
+                }
+            ],
+        }
+    )
+
+    assert document.evaluation_criteria[0].evidence_mode == "external_tool"
+    assert document.evaluation_criteria[1].evidence_mode == "external_tool"
+    assert document.evaluation_criteria[2].evidence_mode == "external_tool"
+    assert document.evaluation_criteria[3].evidence_mode == "mixed"
+    assert document.tool_requests[0].status == "requested"
+
+
 def test_reflection_checks_local_evidence_first_and_skips_discovery_when_sufficient():
     discovery = FakeDiscoveryAgent()
     agent = ReflectionAgent(
@@ -837,6 +1290,142 @@ def test_reflection_infers_missing_assessment_fields_after_review():
     assert assessment.market_size_score.is_inferred is True
     assert assessment.incumbent_price_usd_per_kg.value is not None
     assert assessment.incumbent_price_usd_per_kg.is_inferred is True
+
+
+def test_reflection_estimates_and_persists_missing_graph_volume(tmp_path):
+    import bmscientist.graph_enrichment as ge
+    from bmscientist.graph_enrichment import (
+        APPLICATION_NODE_SCHEMA,
+        MARKET_APPLICATION_SCHEMA,
+        MARKET_NODE_SCHEMA,
+        empty_row,
+        write_rows,
+    )
+
+    class VolumeEstimateLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            self.calls += 1
+            assert "Estimate the current annual substrate/material volume" in user_prompt
+            assert "revenue_value" in user_prompt
+            return response_model.model_validate(
+                {
+                    "market_name": "medical packaging",
+                    "application_name": "medical trays",
+                    "total_substrate_volume_value": 80000,
+                    "total_substrate_volume_unit": "metric_tons_per_year",
+                    "volume_year": 2026,
+                    "revenue_value": 1200,
+                    "revenue_unit": "USD million",
+                    "revenue_year": 2026,
+                    "confidence": 0.52,
+                    "rationale": "Estimated from tray market revenue and substrate price assumptions.",
+                    "material_volumes": [
+                        {
+                            "material_name": "PETG",
+                            "volume_value": 44000,
+                            "volume_unit": "metric_tons_per_year",
+                            "share_of_total": 0.55,
+                            "confidence": 0.5,
+                            "rationale": "PETG is the leading tray substrate.",
+                        },
+                        {
+                            "material_name": "PVC",
+                            "volume_value": 4000,
+                            "volume_unit": "metric_tons_per_year",
+                            "share_of_total": 0.05,
+                            "confidence": 0.45,
+                            "rationale": "PVC is a small legacy share.",
+                        },
+                    ],
+                    "source_citations": [
+                        {
+                            "chunk_id": "graph:Market_HAS_APPLICATION_Application:edge-1",
+                            "source_url": "https://example.com/stats",
+                            "source_title": "Offline graph market data",
+                        }
+                    ],
+                }
+            )
+
+    graph_path = tmp_path / "graph"
+    write_rows(
+        graph_path / "nodes" / "Market.parquet",
+        [
+            {
+                "market_id": "market:medical-packaging",
+                "name": "medical packaging",
+                "normalized_name": "medical packaging",
+                "primary_slug": "medical-packaging-market",
+                "source_vendor": "test",
+            }
+        ],
+        MARKET_NODE_SCHEMA,
+    )
+    write_rows(
+        graph_path / "nodes" / "Application.parquet",
+        [
+            {
+                "application_id": "application:medical-trays",
+                "name": "medical trays",
+                "normalized_name": "medical trays",
+                "node_type": "application",
+            }
+        ],
+        APPLICATION_NODE_SCHEMA,
+    )
+    edge = empty_row(MARKET_APPLICATION_SCHEMA)
+    edge.update(
+        {
+            "edge_id": "edge-1",
+            "market_id": "market:medical-packaging",
+            "application_id": "application:medical-trays",
+            "scope_type": "statistics",
+            "source_node_type": "application",
+            "page_url": "https://example.com/stats",
+            "target_url": "https://example.com/stats",
+            "status": "fetched",
+            "revenue_value": 1200.0,
+            "revenue_year": 2026,
+            "unit": "USD million",
+            "source_url": "https://example.com/stats",
+            "source_title": "Offline graph market data",
+            "supporting_quote": "Medical tray market revenue was estimated at $1.2B.",
+            "confidence": 0.7,
+            "validation_status": "accepted",
+        }
+    )
+    write_rows(graph_path / "edges" / "Market_HAS_APPLICATION_Application.parquet", [edge], MARKET_APPLICATION_SCHEMA)
+
+    original_graph_path = ge.GRAPH_PATH
+    ge.GRAPH_PATH = graph_path
+    volume_llm = VolumeEstimateLLM()
+    try:
+        agent = ReflectionAgent(
+            ReflectionNoSearchLLM(),
+            LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder()),
+            DiscoveryEvidenceTool(FakeDiscoveryAgent()),
+            graph_evidence=GraphMarketEvidence(graph_path),
+            volume_estimation_llm=volume_llm,
+        )
+
+        reflected, _ = agent.reflect(make_document(), make_hypothesis())
+    finally:
+        ge.GRAPH_PATH = original_graph_path
+
+    assert reflected.reflection_assessment is not None
+    assert volume_llm.calls == 1
+
+    product_edges = pq.read_table(graph_path / "edges" / "Product_USED_IN_Application.parquet").to_pylist()
+    volumes_by_product = {edge["product_id"]: edge["volume_value"] for edge in product_edges}
+    assert volumes_by_product["product:pvc"] == 4000
+    assert volumes_by_product["product:petg"] == 44000
+
+    market_edges = pq.read_table(graph_path / "edges" / "Market_HAS_APPLICATION_Application.parquet").to_pylist()
+    ai_edges = [edge for edge in market_edges if edge["source_node_type"] == "ai_volume_estimate"]
+    assert ai_edges[0]["volume_value"] == 80000
 
 
 def test_reflection_discovery_retains_low_relevance_pages_for_later_scoring():
@@ -1121,7 +1710,7 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
         def run(self, **kwargs):
             from bmscientist.coscientist_models import CoScientistRunResult
             assert kwargs["project_name"] == "calm-river-beacon"
-            assert kwargs["spawn_reflection_daemons"] is True
+            assert kwargs["spawn_reflection_daemons"] is False
 
             return CoScientistRunResult(
                 research_id="research-123",
@@ -1166,6 +1755,66 @@ def test_cli_smoke_writes_expected_summary(monkeypatch, tmp_path):
         skip_loop=False,
         target_final_hypotheses=None,
         max_rounds=2,
+        evolve_top_k=5,
+        evolved_per_round=5,
+        regenerated_per_round=5,
+        proximity_check_every=1,
+        max_synthesized_per_round=3,
+        promotion_score_threshold=0.72,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
+        spawn_reflection_daemons=False,
+    )
+    config = AppConfig(
+        deepseek_api_key="x",
+        exa_api_key="y",
+    )
+
+    exit_code = run_coscientist_command(args, config, runner_cls=FakeRunner)
+
+    assert exit_code == 0
+
+
+def test_cli_can_opt_into_legacy_reflection_daemons(tmp_path):
+    class FakeRunner:
+        def __init__(self, config):
+            self.config = config
+
+        def prepare_project_name(self, preferred_name=None):
+            return preferred_name or "calm-river-beacon"
+
+        def run(self, **kwargs):
+            from bmscientist.coscientist_models import CoScientistRunResult
+
+            assert kwargs["spawn_reflection_daemons"] is True
+            return CoScientistRunResult(
+                research_id="research-123",
+                generated_hypotheses=4,
+                reflected_hypotheses=4,
+                automatic_discovery_runs=1,
+                research_goal_path=str(tmp_path / "goal.json"),
+                hypothesis_path=str(tmp_path / "hypotheses.jsonl"),
+                report_path=str(tmp_path / "report.md"),
+            )
+
+        def run_loop(self, **kwargs):
+            raise AssertionError("skip_loop should avoid loop execution")
+
+    args = argparse.Namespace(
+        goal="Find PVC replacement opportunities.",
+        project_name=None,
+        target_hypotheses=4,
+        regions="",
+        strategic_fit_notes=None,
+        preferred_evidence_recency_days=180,
+        max_reflection_searches_per_hypothesis=3,
+        results_per_query=5,
+        max_pages_per_search=8,
+        reflection_concurrency=2,
+        spawn_reflection_daemons=True,
+        skip_loop=True,
+        target_final_hypotheses=None,
+        max_rounds=None,
         evolve_top_k=5,
         evolved_per_round=5,
         regenerated_per_round=5,
@@ -1366,6 +2015,30 @@ def test_coscientist_store_claims_and_releases_generated_hypothesis(tmp_path):
     assert (tmp_path / "coscientist" / "research-1" / "hypotheses" / "generated" / "hyp-1.json").exists()
 
 
+def test_coscientist_store_retries_transient_claim_file_locks(tmp_path, monkeypatch):
+    store = CoScientistStore(tmp_path / "coscientist")
+    hypothesis = make_hypothesis()
+    store.append_hypothesis_snapshot(hypothesis)
+    generated_path = store.hypothesis_file_path(hypothesis)
+    original_rename = Path.rename
+    state = {"attempts": 0}
+
+    def flaky_rename(self, target):
+        if self == generated_path and state["attempts"] == 0:
+            state["attempts"] += 1
+            raise PermissionError("simulated Windows file lock")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky_rename)
+
+    claimed = store.claim_next_generated_hypothesis("research-1", worker_id="worker-a", lease_seconds=120)
+
+    assert claimed is not None
+    assert claimed.hypothesis_id == hypothesis.hypothesis_id
+    assert claimed.status == "reflecting"
+    assert state["attempts"] == 1
+
+
 def test_coscientist_store_requeues_expired_reflection_claims(tmp_path):
     store = CoScientistStore(tmp_path / "coscientist")
     expired = make_hypothesis().model_copy(
@@ -1386,6 +2059,48 @@ def test_coscientist_store_requeues_expired_reflection_claims(tmp_path):
     assert latest["hyp-1"].status == "generated"
     assert latest["hyp-1"].reflection_worker_id is None
     assert latest["hyp-1"].reflection_error == "Reflection lease expired before completion."
+
+
+def test_reflect_hypothesis_exposes_single_hypothesis_api(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    document = make_document()
+    hypothesis = make_hypothesis()
+
+    class FakeReflectRunner:
+        def __init__(self):
+            self.calls = []
+
+        def reflect(self, document_arg, hypothesis_arg):
+            self.calls.append((document_arg.research_id, hypothesis_arg.hypothesis_id))
+            return (
+                hypothesis_arg.model_copy(
+                    update={
+                        "status": "reflected",
+                        "reflection_assessment": ReflectionAssessment.model_validate(
+                            {
+                                "strategic_fit_score": {
+                                    "value": 0.6,
+                                    "rationale": "Reflected through public API.",
+                                    "confidence": 0.5,
+                                }
+                            }
+                        ),
+                    }
+                ),
+                2,
+            )
+
+    runner = object.__new__(CoScientistRunner)
+    runner._artifact_store = store
+    runner._reflection_agent = FakeReflectRunner()
+
+    reflected, discovery_runs = runner.reflect_hypothesis(document, hypothesis, persist=True)
+    latest = {item.hypothesis_id: item for item in store.latest_hypotheses("research-1")}
+
+    assert reflected.status == "reflected"
+    assert discovery_runs == 2
+    assert runner._reflection_agent.calls == [("research-1", "hyp-1")]
+    assert latest["hyp-1"].status == "reflected"
 
 
 def test_reflect_existing_only_processes_pending_hypotheses(tmp_path):
@@ -1621,10 +2336,23 @@ def test_run_reports_stage_progress(tmp_path):
         def write_report(self, research_id, report):
             return tmp_path / "report.md"
 
+        def write_cost_report(self, research_id, payload):
+            import json
+
+            path = tmp_path / "cost.json"
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            return path
+
         def hypothesis_path(self, research_id):
             return tmp_path / "hypotheses"
 
     runner = object.__new__(CoScientistRunner)
+    runner._config = AppConfig(
+        deepseek_api_key="x",
+        exa_api_key="y",
+    )
+    runner._cost_tracker = CostTracker(runner._config)
+    runner._cost_tracker_seeded_research_ids = set()
     runner._planning_agent = FakePlanningAgent()
     runner._generation_agent = FakeGenerationAgent()
     runner._artifact_store = FakeArtifactStore()
@@ -1639,6 +2367,7 @@ def test_run_reports_stage_progress(tmp_path):
 
     assert result.generated_hypotheses == 2
     assert result.reflected_hypotheses == 2
+    assert result.cost_path == str((tmp_path / "cost.json").resolve())
     assert reporter.events == [
         ("start", "planning", "Processing goal", None),
         ("complete", "planning", "Goal processed", None, None),

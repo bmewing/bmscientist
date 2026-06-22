@@ -145,12 +145,16 @@ class LanceEvidenceStore:
         rows = table.search(vector).limit(top_k).to_list()
         return [self._deserialize_row(row) for row in rows]
 
-    def all_rows(self) -> list[dict[str, Any]]:
+    def all_rows(self, where: str | None = None) -> list[dict[str, Any]]:
         table = self._table
         if table is None:
             if TABLE_NAME not in self._table_names():
                 return []
             table = self._db.open_table(TABLE_NAME)
+        if where:
+            if hasattr(table, "search"):
+                rows = table.search().where(where).to_list()
+                return [self._deserialize_row(row) for row in rows]
         if hasattr(table, "to_arrow"):
             return [self._deserialize_row(row) for row in table.to_arrow().to_pylist()]
         return [self._deserialize_row(row) for row in table.search([0.0] * (self._vector_dim or 1)).limit(1000).to_list()]

@@ -35,8 +35,8 @@ class EvidenceStore(Protocol):
         """Return up to *top_k* nearest neighbours for *vector*."""
         ...
 
-    def all_rows(self) -> list[dict[str, Any]]:
-        """Return every row in the store as plain dicts."""
+    def all_rows(self, where: str | None = None) -> list[dict[str, Any]]:
+        """Return every row in the store as plain dicts, optionally filtered."""
         ...
 
 

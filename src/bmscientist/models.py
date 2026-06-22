@@ -31,8 +31,19 @@ class SearchResultItem(BaseModel):
     search_query: str
     snippet: str = Field(default="")
     summary: str = Field(default="")
+    exa_id: str | None = None
+    request_id: str | None = None
+    cost_dollars: float | None = None
+    highlights: list[str] = Field(default_factory=list)
+    highlight_scores: list[float] = Field(default_factory=list)
+    content_text: str = Field(default="")
+    content_text_characters: int | None = None
     published_date: str | None = None
     score: float | None = None
+    category: str | None = None
+    image_url: str | None = None
+    favicon_url: str | None = None
+    content_source: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

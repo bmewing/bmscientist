@@ -18,11 +18,14 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from bmscientist.chunking import TextChunker
 from bmscientist.classify import EvidenceClassifier
 from bmscientist.config import AppConfig
+from bmscientist.cost_tracking import CostTracker
 from bmscientist.coscientist_models import (
     AssessmentMetric,
+    CandidateEvaluationResult,
     CoScientistRunResult,
     CoScientistLoopResult,
     EvidenceCitation,
+    EvaluationCriterion,
     EvolutionHypothesisSeed,
     GapShrinkageStatus,
     Hypothesis,
@@ -30,6 +33,7 @@ from bmscientist.coscientist_models import (
     HypothesisGenerationOutput,
     MetaReviewOutput,
     MetaReviewRound,
+    MarketVolumeEstimateOutput,
     PriceMetric,
     ProximityConcept,
     ProximityReviewOutput,
@@ -54,7 +58,8 @@ from bmscientist.manual_ingest import ManualEvidenceIngestor
 from bmscientist.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
 from bmscientist.price_cache import StructuredPriceCache
 from bmscientist.prompt_library import PROMPTS
-from bmscientist.search import ExaSearchClient, deduplicate_search_results
+from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_search_result, compose_partial_text
+from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options
 
 
 if TYPE_CHECKING:
@@ -133,6 +138,7 @@ class LocalEvidenceRetriever:
         queries.extend(document.target_incumbent_materials[:2])
         queries.extend(document.preferred_candidate_materials[:2])
         queries.extend(document.recycling_or_sustainability_angles[:2])
+        queries.extend(self._goal_queries_from_contract(document))
         return self.search_many(queries, top_k_per_query=6, max_results=max_results)
 
     def retrieve_for_hypothesis(self, document: ResearchGoalDocument, hypothesis: Hypothesis, max_results: int = 16) -> list[dict[str, Any]]:
@@ -147,8 +153,49 @@ class LocalEvidenceRetriever:
             f"{hypothesis.application or ''} replacement drivers regulatory sustainability".strip(),
             f"{hypothesis.application or ''} {hypothesis.candidate_material or ''} drop in replacement {hypothesis.incumbent_material or ''}".strip(),
         ]
+        queries.extend(self._hypothesis_queries_from_contract(document, hypothesis))
         normalized_queries = [query for query in queries if query]
         return self.search_many(normalized_queries, top_k_per_query=5, max_results=max_results)
+
+    @staticmethod
+    def _goal_queries_from_contract(document: ResearchGoalDocument) -> list[str]:
+        queries: list[str] = []
+        schema = document.candidate_artifact_schema
+        if schema.artifact_type:
+            queries.append(schema.artifact_type)
+        if schema.primary_identifier_field:
+            queries.append(f"{document.raw_goal} {schema.primary_identifier_field}")
+        queries.extend(document.search_strategy_notes[:3])
+        for criterion in document.evaluation_criteria[:5]:
+            queries.append(criterion.name)
+            if criterion.description:
+                queries.append(f"{document.raw_goal} {criterion.description}")
+            queries.extend(criterion.suggested_search_queries[:2])
+        return queries
+
+    @staticmethod
+    def _hypothesis_queries_from_contract(document: ResearchGoalDocument, hypothesis: Hypothesis) -> list[str]:
+        queries: list[str] = []
+        artifact = hypothesis.candidate_artifact or {}
+        primary_field = document.candidate_artifact_schema.primary_identifier_field
+        primary_value = artifact.get(primary_field)
+        if primary_value:
+            queries.append(str(primary_value))
+        for key, value in artifact.items():
+            text = str(value).strip()
+            if text:
+                queries.append(f"{key} {text}")
+        for criterion in document.evaluation_criteria[:5]:
+            queries.append(f"{hypothesis.title} {criterion.name}")
+            if primary_value:
+                queries.append(f"{primary_value} {criterion.name}")
+            if criterion.description:
+                queries.append(f"{hypothesis.title} {criterion.description}")
+            queries.extend(criterion.suggested_search_queries[:1])
+        queries.extend(hypothesis.unknowns[:3])
+        if hypothesis.reflection_assessment is not None:
+            queries.extend(hypothesis.reflection_assessment.evidence_gap_notes[:3])
+        return queries
 
     @staticmethod
     def citations_from_rows(rows: list[dict[str, Any]], limit: int = 12) -> list[EvidenceCitation]:
@@ -187,14 +234,16 @@ class DiscoveryEvidenceTool:
         llm: DeepSeekLLM | None = None,
         embedder: LocalEmbedder | None = None,
         store: LanceEvidenceStore | None = None,
+        cost_tracker: CostTracker | None = None,
     ):
         self._legacy_discovery_agent = source if hasattr(source, "discover") else None
         self._config = source if isinstance(source, AppConfig) else None
         self._llm = llm
         self._embedder = embedder
         self._store = store
-        self._search = ExaSearchClient(source) if isinstance(source, AppConfig) else None
+        self._search = ExaSearchClient(source, cost_tracker=cost_tracker) if isinstance(source, AppConfig) else None
         self._fetcher = PageFetcher(source) if isinstance(source, AppConfig) else None
+        self._retriever = ExaPageRetriever(source, self._search, self._fetcher) if isinstance(source, AppConfig) else None
         self._classifier = EvidenceClassifier(llm) if isinstance(source, AppConfig) and llm else None
         self._chunker = TextChunker()
         self._write_lock = Lock()
@@ -214,7 +263,15 @@ class DiscoveryEvidenceTool:
         skipped_pages: list[dict[str, Any]] = []
         errors: list[str] = []
         try:
-            search_response = self._search.search(query=query, num_results=limits.results_per_query)
+            search_response = self._search.search(
+                query=query,
+                num_results=limits.results_per_query,
+                options=default_search_options(
+                    self._config,
+                    query,
+                    search_type=self._config.exa_reflection_search_type,
+                ),
+            )
             search_results = search_response.results
         except Exception as exc:
             LOGGER.exception("Reflection search failed for query %s", query)
@@ -254,23 +311,10 @@ class DiscoveryEvidenceTool:
     ) -> list[PageContent]:
         fetched_pages: list[PageContent] = []
         assert self._fetcher is not None
-        for result in results:
-            if self._fetcher.should_skip_direct_fetch(str(result.url)):
-                skipped_pages.append({"url": str(result.url), "search_query": result.search_query, "reason": "blocked_domain"})
-                fallback = self._build_partial_page_from_search_result(query, result, "blocked_domain")
-                if fallback:
-                    fetched_pages.append(fallback)
-                continue
-            page, error = self._fetcher.safe_fetch(result)
-            if page:
-                fetched_pages.append(page)
-                continue
-            if error:
-                skipped_pages.append(error)
-            fallback = self._build_partial_page_from_search_result(query, result, "fetch_error")
-            if fallback:
-                fetched_pages.append(fallback)
-        return fetched_pages
+        assert self._retriever is not None
+        retrieval = self._retriever.retrieve_pages(query, results, max_pages=len(results), contents_query=query)
+        skipped_pages.extend(retrieval.skipped)
+        return retrieval.pages
 
     def _filter_pages(
         self,
@@ -353,30 +397,14 @@ class DiscoveryEvidenceTool:
 
     @staticmethod
     def _build_partial_page_from_search_result(query: str, result: SearchResultItem, reason: str) -> PageContent | None:
-        parts = [result.title.strip(), result.summary.strip(), result.snippet.strip()]
-        partial_text = "\n\n".join(part for part in parts if part)
+        parts = compose_partial_text(result)
+        partial_text = parts
         if len(partial_text) < 80:
             return None
-        return PageContent(
-            title=result.title,
-            url=str(result.url),
-            search_query=query,
-            source_domain=extract_domain(str(result.url)),
-            fetched_at=datetime.now(timezone.utc),
-            text=partial_text,
-            status_code=None,
-            content_type="application/x-search-snippet",
-            raw_excerpt=partial_text[:500],
-            metadata={
-                "is_partial_evidence": True,
-                "partial_evidence_reason": reason,
-                "source_type": "exa_search_result",
-                "search_result_summary": result.summary,
-                "search_result_snippet": result.snippet,
-                "search_result_score": result.score,
-                "search_result_published_date": result.published_date,
-            },
-        )
+        partial_page = build_partial_page_from_search_result(result, reason)
+        if partial_page is None:
+            return None
+        return partial_page.model_copy(update={"search_query": query})
 
 
 class ReflectionSearchPlanner:
@@ -387,6 +415,8 @@ class ReflectionSearchPlanner:
         assessment: ReflectionAssessment,
         suggested_queries: list[str],
     ) -> list[str]:
+        if document.evaluation_criteria:
+            return self._plan_for_criteria(document, hypothesis, assessment, suggested_queries)
         needs = self._evidence_needs(assessment)
         queries: "OrderedDict[str, None]" = OrderedDict()
         region_text = " ".join(document.regions).strip()
@@ -433,6 +463,61 @@ class ReflectionSearchPlanner:
             if normalized:
                 queries[normalized] = None
         return list(queries.keys())
+
+    def _plan_for_criteria(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        assessment: ReflectionAssessment,
+        suggested_queries: list[str],
+    ) -> list[str]:
+        queries: "OrderedDict[str, None]" = OrderedDict()
+        region_text = " ".join(document.regions).strip()
+        artifact = hypothesis.candidate_artifact or {}
+        primary_field = document.candidate_artifact_schema.primary_identifier_field
+        primary_value = str(artifact.get(primary_field) or "").strip()
+        unresolved = self._criteria_needing_evidence(document.evaluation_criteria, assessment)
+        if not unresolved:
+            unresolved = document.evaluation_criteria[:3]
+        for criterion in unresolved:
+            for query in criterion.suggested_search_queries:
+                normalized = " ".join(query.split())
+                if normalized:
+                    queries[normalized] = None
+            if primary_value:
+                queries[f"{primary_value} {criterion.name}".strip()] = None
+                if criterion.description:
+                    queries[f"{primary_value} {criterion.description}".strip()] = None
+            elif hypothesis.title:
+                queries[f"{hypothesis.title} {criterion.name}".strip()] = None
+            if region_text:
+                queries[f"{hypothesis.title} {criterion.name} {region_text}".strip()] = None
+            for field_name in criterion.required_candidate_fields[:2]:
+                field_value = artifact.get(field_name)
+                if field_value:
+                    queries[f"{field_value} {criterion.name}".strip()] = None
+        for query in suggested_queries:
+            normalized = " ".join(query.split())
+            if normalized:
+                queries[normalized] = None
+        return [query for query in queries.keys() if query]
+
+    @staticmethod
+    def _criteria_needing_evidence(
+        criteria: list[EvaluationCriterion],
+        assessment: ReflectionAssessment,
+    ) -> list[EvaluationCriterion]:
+        results_by_name = {
+            result.criterion_name: result
+            for result in assessment.criterion_results
+            if result.criterion_name
+        }
+        unresolved: list[EvaluationCriterion] = []
+        for criterion in criteria:
+            result = results_by_name.get(criterion.name)
+            if result is None or result.normalized_score is None or result.confidence < 0.35:
+                unresolved.append(criterion)
+        return unresolved
 
     @staticmethod
     def _evidence_needs(assessment: ReflectionAssessment) -> set[str]:
@@ -487,6 +572,7 @@ class ResearchPlanningAgent:
             raw_goal=raw_goal,
             target_hypotheses_final=target_hypotheses_final,
             target_hypotheses_generated=self._default_generated_count(target_hypotheses_final),
+            research_mode=draft.research_mode,
             regions=regions or [],
             strategic_fit_criteria=draft.strategic_fit_criteria,
             target_incumbent_materials=draft.target_incumbent_materials,
@@ -502,6 +588,11 @@ class ResearchPlanningAgent:
             commercialization_constraints=draft.commercialization_constraints,
             ranking_weights=draft.ranking_weights,
             success_definition=draft.success_definition,
+            candidate_artifact_schema=draft.candidate_artifact_schema,
+            evaluation_criteria=draft.evaluation_criteria,
+            reflection_guidance=draft.reflection_guidance,
+            tool_requests=draft.tool_requests,
+            search_strategy_notes=draft.search_strategy_notes,
             strategic_fit_notes=strategic_fit_notes,
         )
 
@@ -521,6 +612,7 @@ class ResearchPlanningAgent:
         return document.model_copy(
             update={
                 "raw_goal": updated.raw_goal,
+                "research_mode": updated.research_mode,
                 "regions": updated.regions,
                 "strategic_fit_criteria": updated.strategic_fit_criteria,
                 "target_incumbent_materials": updated.target_incumbent_materials,
@@ -534,6 +626,11 @@ class ResearchPlanningAgent:
                 "commercialization_constraints": updated.commercialization_constraints,
                 "ranking_weights": updated.ranking_weights,
                 "success_definition": updated.success_definition,
+                "candidate_artifact_schema": updated.candidate_artifact_schema,
+                "evaluation_criteria": updated.evaluation_criteria,
+                "reflection_guidance": updated.reflection_guidance,
+                "tool_requests": updated.tool_requests,
+                "search_strategy_notes": updated.search_strategy_notes,
                 "strategic_fit_notes": updated.strategic_fit_notes,
             }
         )
@@ -575,6 +672,7 @@ class GenerationAgent:
                 "candidate_materials": row.get("candidate_materials"),
                 "application_requirements": row.get("application_requirements"),
                 "substitution_drivers": row.get("substitution_drivers"),
+                "metadata": row.get("metadata", {}),
                 "source_url": row.get("source_url"),
                 "source_title": row.get("source_title"),
                 "relevance_score": row.get("relevance_score"),
@@ -619,6 +717,7 @@ class GenerationAgent:
                 "application": row.get("application"),
                 "incumbent_material": row.get("incumbent_material"),
                 "candidate_materials": row.get("candidate_materials"),
+                "metadata": row.get("metadata", {}),
                 "source_url": row.get("source_url"),
                 "source_title": row.get("source_title"),
                 "excerpt": str(row.get("chunk_text", ""))[:500],
@@ -714,6 +813,7 @@ class GenerationAgent:
                 "market_segment": hypothesis.market_segment,
                 "candidate_material": hypothesis.candidate_material,
                 "incumbent_material": hypothesis.incumbent_material,
+                "candidate_artifact": hypothesis.candidate_artifact,
             }
             for hypothesis in hypotheses
         ]
@@ -728,17 +828,22 @@ class GenerationAgent:
     ) -> list[Hypothesis]:
         hypotheses: "OrderedDict[str, Hypothesis]" = OrderedDict()
         for seed in seeds:
+            primary_field = document.candidate_artifact_schema.primary_identifier_field
+            primary_identifier = str((seed.candidate_artifact or {}).get(primary_field) or "").strip()
             hypothesis_id = str(
                 uuid5(
                     NAMESPACE_URL,
                     (
                         f"{document.research_id}::{generation_source}::{round_index}::"
-                        f"{seed.title}::{seed.application or ''}::{seed.candidate_material or ''}"
+                        f"{seed.title}::{seed.application or ''}::{seed.candidate_material or ''}::{primary_identifier}"
                     ),
                 )
             )
             if hypothesis_id in hypotheses:
                 continue
+            candidate_artifact = dict(seed.candidate_artifact or {})
+            if not candidate_artifact:
+                candidate_artifact = GenerationAgent._fallback_candidate_artifact(document, seed)
             hypotheses[hypothesis_id] = Hypothesis(
                 hypothesis_id=hypothesis_id,
                 research_id=document.research_id,
@@ -763,6 +868,8 @@ class GenerationAgent:
                 supporting_urls=seed.supporting_urls,
                 assumptions=seed.assumptions,
                 unknowns=seed.unknowns,
+                candidate_artifact=candidate_artifact,
+                evaluation_results=seed.evaluation_results,
                 generation_confidence=seed.generation_confidence,
                 round_index=round_index,
                 generation_source=generation_source,
@@ -770,6 +877,21 @@ class GenerationAgent:
             if len(hypotheses) >= limit:
                 break
         return list(hypotheses.values())
+
+    @staticmethod
+    def _fallback_candidate_artifact(document: ResearchGoalDocument, seed: Any) -> dict[str, Any]:
+        artifact = {
+            "candidate_material": seed.candidate_material,
+            "incumbent_material": seed.incumbent_material,
+            "application": seed.application,
+        }
+        primary_field = document.candidate_artifact_schema.primary_identifier_field
+        if primary_field and primary_field not in artifact:
+            if getattr(seed, "candidate_material", None):
+                artifact[primary_field] = seed.candidate_material
+            elif getattr(seed, "title", None):
+                artifact[primary_field] = seed.title
+        return {key: value for key, value in artifact.items() if value not in (None, "", [])}
 
 
 class RankingAgent:
@@ -884,12 +1006,15 @@ class RankingAgent:
                 "market_segment": hypothesis.market_segment,
                 "candidate_material": hypothesis.candidate_material,
                 "incumbent_material": hypothesis.incumbent_material,
+                "candidate_artifact": hypothesis.candidate_artifact,
+                "evaluation_results": [result.model_dump() for result in hypothesis.evaluation_results],
                 "nbca": hypothesis.next_best_competitive_alternative,
                 "generation_source": hypothesis.generation_source,
                 "round_index": hypothesis.round_index,
                 "heuristic_score": round(heuristic_by_id.get(hypothesis.hypothesis_id, 0.0), 3),
                 "reflection": self._assessment_payload(hypothesis.reflection_assessment),
                 "evidence_gaps": (hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []),
+                "tool_request_notes": (hypothesis.reflection_assessment.tool_request_notes if hypothesis.reflection_assessment else []),
                 "user_feedback_status": hypothesis.user_feedback_status,
                 "user_feedback_comment": hypothesis.user_feedback_comment,
             }
@@ -952,6 +1077,8 @@ class RankingAgent:
         assessment = hypothesis.reflection_assessment
         if assessment is None:
             return max(0.0, min(1.0, hypothesis.generation_confidence * 0.5))
+        if assessment.criterion_results:
+            return cls._criterion_score(assessment)
         weighted_values = [
             (assessment.strategic_fit_score.value, 0.16),
             (assessment.market_size_score.value, 0.16),
@@ -969,6 +1096,20 @@ class RankingAgent:
         return max(0.0, min(1.0, score - gap_penalty))
 
     @staticmethod
+    def _criterion_score(assessment: ReflectionAssessment) -> float:
+        present = [
+            (float(result.normalized_score), max(0.25, result.confidence))
+            for result in assessment.criterion_results
+            if result.normalized_score is not None
+        ]
+        if not present:
+            return 0.25
+        score = sum(value * weight for value, weight in present) / sum(weight for _, weight in present)
+        gap_penalty = min(len(assessment.evidence_gap_notes) * 0.025, 0.15)
+        tool_penalty = min(len(assessment.tool_request_notes) * 0.02, 0.1)
+        return max(0.0, min(1.0, score - gap_penalty - tool_penalty))
+
+    @staticmethod
     def _assessment_payload(assessment: ReflectionAssessment | None) -> dict[str, Any]:
         if assessment is None:
             return {}
@@ -983,6 +1124,8 @@ class RankingAgent:
             "replacement_driver_strength_score": assessment.replacement_driver_strength_score.value,
             "technical_success_probability": assessment.technical_success_probability.value,
             "commercial_success_probability": assessment.commercial_success_probability.value,
+            "criterion_results": [result.model_dump() for result in assessment.criterion_results],
+            "tool_request_notes": assessment.tool_request_notes,
         }
 
 
@@ -1678,6 +1821,7 @@ class ReflectionAgent:
         discovery_tool: DiscoveryEvidenceTool,
         price_cache: StructuredPriceCache | None = None,
         graph_evidence: GraphMarketEvidence | None = None,
+        volume_estimation_llm: DeepSeekLLM | None = None,
     ):
         self._llm = llm
         self._retriever = retriever
@@ -1685,10 +1829,12 @@ class ReflectionAgent:
         self._search_planner = ReflectionSearchPlanner()
         self._price_cache = price_cache
         self._graph_evidence = graph_evidence
+        self._volume_estimation_llm = volume_estimation_llm
 
     def reflect(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> tuple[Hypothesis, int]:
+        use_material_path = not document.evaluation_criteria and document.research_mode == "materials_opportunity"
         price_document = None
-        if self._price_cache is not None:
+        if use_material_path and self._price_cache is not None:
             try:
                 price_document = self._price_cache.ensure_fresh()
             except Exception:
@@ -1716,12 +1862,17 @@ class ReflectionAgent:
                 refreshed_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
                 evidence_rows = self._augment_evidence_rows(document, hypothesis, refreshed_rows, price_document)
 
+        if use_material_path:
+            evidence_rows = self._augment_with_ai_market_volume_estimate(document, hypothesis, evidence_rows)
+
         final_review = self._review(document, hypothesis, evidence_rows)
-        assessment = self._merge_price_metrics(
-            final_review.assessment,
-            hypothesis,
-            price_document,
-        )
+        assessment = final_review.assessment
+        if use_material_path:
+            assessment = self._merge_price_metrics(
+                assessment,
+                hypothesis,
+                price_document,
+            )
         assessment = self._finalize_missing_assessment_fields(document, hypothesis, assessment, evidence_rows)
         assessment = assessment.model_copy(
             update={
@@ -1750,10 +1901,11 @@ class ReflectionAgent:
             row_id = str(row.get("id", ""))
             if row_id:
                 augmented[row_id] = row
-        for row in self._graph_market_rows(document, hypothesis):
-            augmented[str(row["id"])] = row
-        for row in self._price_rows(hypothesis, price_document):
-            augmented[str(row["id"])] = row
+        if not document.evaluation_criteria and document.research_mode == "materials_opportunity":
+            for row in self._graph_market_rows(document, hypothesis):
+                augmented[str(row["id"])] = row
+            for row in self._price_rows(hypothesis, price_document):
+                augmented[str(row["id"])] = row
         return list(augmented.values())
 
     def _price_rows(
@@ -1779,7 +1931,186 @@ class ReflectionAgent:
             LOGGER.exception("Offline graph market evidence unavailable during reflection for %s", hypothesis.hypothesis_id)
             return []
 
+    def _augment_with_ai_market_volume_estimate(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self._volume_estimation_llm is None:
+            return evidence_rows
+        if not self._needs_ai_market_volume_estimate(hypothesis, evidence_rows):
+            return evidence_rows
+        try:
+            estimate = self._estimate_market_volume(document, hypothesis, evidence_rows)
+            if estimate.total_substrate_volume_value is None and not estimate.material_volumes:
+                return evidence_rows
+            from bmscientist.graph_enrichment import GraphEnrichmentStore
+
+            GraphEnrichmentStore().write_ai_market_volume_estimate(hypothesis, estimate)
+            return self._merge_evidence_rows(evidence_rows, self._market_volume_estimate_rows(hypothesis, estimate))
+        except Exception:
+            LOGGER.exception("AI market-volume estimate failed for hypothesis %s", hypothesis.hypothesis_id)
+            return evidence_rows
+
+    @staticmethod
+    def _needs_ai_market_volume_estimate(hypothesis: Hypothesis, evidence_rows: list[dict[str, Any]]) -> bool:
+        if not (hypothesis.application and hypothesis.market_segment):
+            return False
+        graph_rows = [
+            row
+            for row in evidence_rows
+            if row.get("metadata", {}).get("source_type") == "offline-graph-market-data"
+        ]
+        if not graph_rows:
+            return False
+        if any(row.get("metadata", {}).get("volume_value") is not None for row in graph_rows):
+            return False
+        return any(
+            row.get("metadata", {}).get(key) is not None
+            for row in graph_rows
+            for key in ("revenue_value", "forecast_revenue_value", "cagr_value", "price_value")
+        )
+
+    def _estimate_market_volume(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+    ) -> MarketVolumeEstimateOutput:
+        evidence_payload = [
+            {
+                "chunk_id": row.get("id"),
+                "source_url": row.get("source_url"),
+                "source_title": row.get("source_title"),
+                "application": row.get("application"),
+                "incumbent_material": row.get("incumbent_material"),
+                "candidate_materials": row.get("candidate_materials"),
+                "metadata": row.get("metadata", {}),
+                "excerpt": str(row.get("chunk_text", ""))[:1000],
+            }
+            for row in evidence_rows[:24]
+        ]
+        system_prompt = (
+            "You estimate annual material volumes for market/application combinations. "
+            "Use careful quantitative reasoning, but return strict JSON only. "
+            "Prefer conservative estimates. Do not invent source URLs; cite only source rows supplied by the user. "
+            "If you infer volume from revenue, explain the price and conversion assumptions. "
+            "Use metric_tons_per_year for volume units where possible."
+        )
+        user_prompt = (
+            "Estimate the current annual substrate/material volume for this hypothesis's market/application. "
+            "Also estimate material-level volume shares for the incumbent and relevant alternatives when evidence supports it.\n\n"
+            f"Research goal:\n{document.model_dump_json(indent=2)}\n\n"
+            f"Hypothesis:\n{hypothesis.model_dump_json(indent=2)}\n\n"
+            f"Evidence rows:\n{json.dumps(evidence_payload, indent=2)}\n\n"
+            "Return JSON with market_name, application_name, total_substrate_volume_value, "
+            "total_substrate_volume_unit, volume_year, revenue_value, revenue_unit, revenue_year, "
+            "assumed_average_price_value, assumed_average_price_unit, material_volumes, confidence, rationale, "
+            "and source_citations. Keep confidence medium unless there is direct source evidence."
+        )
+        return self._volume_estimation_llm.complete_json(
+            MarketVolumeEstimateOutput,
+            system_prompt,
+            user_prompt,
+            temperature=0.0,
+        )
+
+    @staticmethod
+    def _market_volume_estimate_rows(hypothesis: Hypothesis, estimate: MarketVolumeEstimateOutput) -> list[dict[str, Any]]:
+        source_url = ReflectionAgent._estimate_source_url(hypothesis, estimate)
+        source_title = "AI generated market volume estimate"
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        market_name = estimate.market_name or hypothesis.market_segment
+        application_name = estimate.application_name or hypothesis.application
+        rows: list[dict[str, Any]] = []
+        if estimate.total_substrate_volume_value is not None:
+            rows.append(
+                {
+                    "id": f"ai-volume:{hypothesis.hypothesis_id}:total",
+                    "source_url": source_url,
+                    "source_title": source_title,
+                    "application": application_name,
+                    "incumbent_material": hypothesis.incumbent_material,
+                    "candidate_materials": [],
+                    "relevance_score": 0.86,
+                    "retrieved_at": retrieved_at,
+                    "chunk_text": (
+                        f"AI generated estimate: {market_name} / {application_name} total substrate volume is "
+                        f"{estimate.total_substrate_volume_value:g} {estimate.total_substrate_volume_unit} "
+                        f"in {estimate.volume_year or 'the current period'}. {estimate.rationale}"
+                    )[:1800],
+                    "metadata": {
+                        "source_type": "offline-graph-market-data",
+                        "source_node_type": "ai_volume_estimate",
+                        "edge_type": "Market_HAS_APPLICATION_Application",
+                        "market_name": market_name,
+                        "target_name": application_name,
+                        "volume_value": estimate.total_substrate_volume_value,
+                        "volume_unit": estimate.total_substrate_volume_unit,
+                        "volume_year": estimate.volume_year,
+                        "revenue_value": estimate.revenue_value,
+                        "revenue_year": estimate.revenue_year,
+                        "unit": estimate.revenue_unit,
+                        "is_inferred": True,
+                    },
+                }
+            )
+        for item in estimate.material_volumes:
+            if item.volume_value is None:
+                continue
+            rows.append(
+                {
+                    "id": f"ai-volume:{hypothesis.hypothesis_id}:{item.material_name.lower().replace(' ', '-')}",
+                    "source_url": source_url,
+                    "source_title": source_title,
+                    "application": application_name,
+                    "incumbent_material": hypothesis.incumbent_material,
+                    "candidate_materials": [item.material_name],
+                    "relevance_score": 0.86,
+                    "retrieved_at": retrieved_at,
+                    "chunk_text": (
+                        f"AI generated estimate: {item.material_name} volume in {application_name} is "
+                        f"{item.volume_value:g} {item.volume_unit} "
+                        f"({item.share_of_total:.1%} of total substrate volume). {item.rationale}"
+                        if item.share_of_total is not None
+                        else f"AI generated estimate: {item.material_name} volume in {application_name} is "
+                        f"{item.volume_value:g} {item.volume_unit}. {item.rationale}"
+                    )[:1800],
+                    "metadata": {
+                        "source_type": "offline-graph-market-data",
+                        "source_node_type": "ai_volume_estimate",
+                        "edge_type": "Product_USED_IN_Application",
+                        "market_name": market_name,
+                        "target_name": application_name,
+                        "volume_value": item.volume_value,
+                        "volume_unit": item.volume_unit,
+                        "volume_year": estimate.volume_year,
+                        "is_inferred": True,
+                    },
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _estimate_source_url(hypothesis: Hypothesis, estimate: MarketVolumeEstimateOutput) -> str:
+        for citation in estimate.source_citations:
+            if citation.source_url:
+                return citation.source_url
+        return f"coscientist://research/{hypothesis.research_id}/hypothesis/{hypothesis.hypothesis_id}"
+
+    @staticmethod
+    def _merge_evidence_rows(existing_rows: list[dict[str, Any]], new_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        for row in [*existing_rows, *new_rows]:
+            row_id = str(row.get("id") or "")
+            if row_id:
+                merged[row_id] = row
+        return list(merged.values())
+
     def _review(self, document: ResearchGoalDocument, hypothesis: Hypothesis, evidence_rows: list[dict[str, Any]]) -> ReflectionReviewOutput:
+        if document.evaluation_criteria or document.research_mode != "materials_opportunity":
+            return self._review_generic_criteria(document, hypothesis, evidence_rows)
         technical = self._review_category(document, hypothesis, evidence_rows, "technical")
         commercial = self._review_category(document, hypothesis, evidence_rows, "commercial")
         strategic = self._review_category(document, hypothesis, evidence_rows, "strategic")
@@ -1793,6 +2124,59 @@ class ReflectionAgent:
                     technical.follow_up_search_queries
                     + commercial.follow_up_search_queries
                     + strategic.follow_up_search_queries
+                )
+            ),
+        )
+
+    def _review_generic_criteria(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+    ) -> ReflectionReviewOutput:
+        criteria = document.evaluation_criteria or self._default_generic_criteria(document, hypothesis)
+        if not criteria:
+            return ReflectionReviewOutput(assessment=ReflectionAssessment(), needs_additional_search=False, follow_up_search_queries=[])
+
+        reviews: list[ReflectionReviewOutput] = []
+        batch_size = 3
+        for offset in range(0, len(criteria), batch_size):
+            batch = criteria[offset : offset + batch_size]
+            evidence_payload = [
+                {
+                    "chunk_id": row.get("id"),
+                    "source_url": row.get("source_url"),
+                    "source_title": row.get("source_title"),
+                    "application": row.get("application"),
+                    "incumbent_material": row.get("incumbent_material"),
+                    "candidate_materials": row.get("candidate_materials"),
+                    "metadata": row.get("metadata", {}),
+                    "relevance_score": row.get("relevance_score"),
+                    "retrieved_at": row.get("retrieved_at"),
+                    "excerpt": str(row.get("chunk_text", ""))[:600],
+                }
+                for row in evidence_rows[:30]
+            ]
+            system_prompt = PROMPTS.render("reflection_agent", "review_criteria.system")
+            user_prompt = PROMPTS.render(
+                "reflection_agent",
+                "review_criteria.user",
+                document_json=document.model_dump_json(indent=2),
+                hypothesis_json=hypothesis.model_dump_json(indent=2),
+                evidence_payload_json=json.dumps(evidence_payload, indent=2),
+                criteria_json=json.dumps([criterion.model_dump() for criterion in batch], indent=2),
+                tool_requests_json=json.dumps([request.model_dump() for request in document.tool_requests], indent=2),
+            )
+            reviews.append(self._llm.complete_json(ReflectionReviewOutput, system_prompt, user_prompt))
+        return ReflectionReviewOutput(
+            assessment=self._merge_assessments([review.assessment for review in reviews]),
+            needs_additional_search=any(review.needs_additional_search for review in reviews),
+            follow_up_search_queries=list(
+                OrderedDict.fromkeys(
+                    query
+                    for review in reviews
+                    for query in review.follow_up_search_queries
+                    if query
                 )
             ),
         )
@@ -1812,6 +2196,7 @@ class ReflectionAgent:
                 "application": row.get("application"),
                 "incumbent_material": row.get("incumbent_material"),
                 "candidate_materials": row.get("candidate_materials"),
+                "metadata": row.get("metadata", {}),
                 "relevance_score": row.get("relevance_score"),
                 "retrieved_at": row.get("retrieved_at"),
                 "excerpt": str(row.get("chunk_text", ""))[:600],
@@ -1877,6 +2262,8 @@ class ReflectionAgent:
         assessment: ReflectionAssessment,
         evidence_rows: list[dict[str, Any]],
     ) -> ReflectionAssessment:
+        if document.evaluation_criteria or document.research_mode != "materials_opportunity":
+            return self._finalize_generic_assessment_fields(document, hypothesis, assessment)
         updates: dict[str, Any] = {}
         metric_fields = [
             "strategic_fit_score",
@@ -1905,6 +2292,35 @@ class ReflectionAgent:
         if not updates:
             return assessment
         return assessment.model_copy(update=updates)
+
+    @staticmethod
+    def _finalize_generic_assessment_fields(
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        assessment: ReflectionAssessment,
+    ) -> ReflectionAssessment:
+        if assessment.criterion_results:
+            return assessment
+        criteria = document.evaluation_criteria
+        if not criteria:
+            return assessment
+        results: list[CandidateEvaluationResult] = []
+        for criterion in criteria:
+            results.append(
+                CandidateEvaluationResult(
+                    criterion_name=criterion.name,
+                    value=None,
+                    normalized_score=0.5 if criterion.direction == "describe" else None,
+                    confidence=0.1,
+                    rationale=(
+                        f"No direct evidence resolved `{criterion.name}` for candidate "
+                        f"`{hypothesis.title}` during reflection."
+                    ),
+                    evidence_mode="mixed",
+                    is_inferred=True,
+                )
+            )
+        return assessment.model_copy(update={"criterion_results": results})
 
     @staticmethod
     def _inferred_metric(
@@ -2069,6 +2485,12 @@ class ReflectionAgent:
         merged = merged.model_copy(
             update={
                 "nbca_material": next((assessment.nbca_material for assessment in assessments if assessment.nbca_material), None),
+                "criterion_results": ReflectionAgent._merge_criterion_results(assessments),
+                "tool_request_notes": list(
+                    OrderedDict.fromkeys(
+                        note for assessment in assessments for note in assessment.tool_request_notes if note
+                    )
+                ),
                 "evidence_gap_notes": list(
                     OrderedDict.fromkeys(
                         note for assessment in assessments for note in assessment.evidence_gap_notes if note
@@ -2088,6 +2510,41 @@ class ReflectionAgent:
         if not supported:
             return default
         return max(supported, key=lambda metric: (metric.value is not None, metric.confidence, bool(metric.citation_chunk_ids)))
+
+    @staticmethod
+    def _merge_criterion_results(assessments: list[ReflectionAssessment]) -> list[CandidateEvaluationResult]:
+        merged: "OrderedDict[str, CandidateEvaluationResult]" = OrderedDict()
+        for assessment in assessments:
+            for result in assessment.criterion_results:
+                existing = merged.get(result.criterion_name)
+                if existing is None or ReflectionAgent._criterion_result_rank(result) > ReflectionAgent._criterion_result_rank(existing):
+                    merged[result.criterion_name] = result
+        return list(merged.values())
+
+    @staticmethod
+    def _criterion_result_rank(result: CandidateEvaluationResult) -> tuple[bool, float, bool]:
+        return (
+            result.normalized_score is not None,
+            result.confidence,
+            bool(result.citation_chunk_ids),
+        )
+
+    @staticmethod
+    def _default_generic_criteria(
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> list[EvaluationCriterion]:
+        primary_field = document.candidate_artifact_schema.primary_identifier_field
+        return [
+            EvaluationCriterion(
+                name="overall_fit",
+                description="Overall fit of the candidate to the stated research goal.",
+                direction="maximize",
+                required_candidate_fields=[primary_field] if primary_field else [],
+                suggested_search_queries=[f"{hypothesis.title} evidence"],
+                reflection_guidance=["Check whether the candidate plausibly addresses the goal without obvious fatal flaws."],
+            )
+        ]
 
     @staticmethod
     def _fallback_search_queries(document: ResearchGoalDocument, hypothesis: Hypothesis) -> list[str]:
@@ -2115,14 +2572,70 @@ class CoScientistRunner:
         self._progress_reporter: ProgressReporter = NullProgressReporter()
         self._config = config
         self._config.ensure_directories()
-        self._llm = llm or DeepSeekLLM(config)
-        self._planning_llm = DeepSeekLLM(config, model=config.planning_chat_model)
-        self._generation_llm = DeepSeekLLM(config, model=config.generation_chat_model)
-        self._reflection_llm = DeepSeekLLM(config, model=config.reflection_chat_model)
-        self._ranking_llm = DeepSeekLLM(config, model=config.ranking_chat_model)
-        self._evolution_llm = DeepSeekLLM(config, model=config.evolution_chat_model)
-        self._proximity_llm = DeepSeekLLM(config, model=config.proximity_chat_model)
-        self._meta_review_llm = DeepSeekLLM(config, model=config.meta_review_chat_model)
+        self._cost_tracker = CostTracker(config)
+        self._cost_tracker_seeded_research_ids: set[str] = set()
+        self._llm = llm or DeepSeekLLM(
+            config,
+            request_profile=config.chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="chat",
+        )
+        self._planning_llm = DeepSeekLLM(
+            config,
+            model=config.planning_chat_model,
+            request_profile=config.planning_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="planning",
+        )
+        self._generation_llm = DeepSeekLLM(
+            config,
+            model=config.generation_chat_model,
+            request_profile=config.generation_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="generation",
+        )
+        self._reflection_llm = DeepSeekLLM(
+            config,
+            model=config.reflection_chat_model,
+            request_profile=config.reflection_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="reflection",
+        )
+        self._market_volume_llm = DeepSeekLLM(
+            config,
+            model=config.market_volume_estimation_chat_model or config.reflection_chat_model,
+            request_profile=config.market_volume_estimation_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="market_volume_estimation",
+        )
+        self._ranking_llm = DeepSeekLLM(
+            config,
+            model=config.ranking_chat_model,
+            request_profile=config.ranking_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="ranking",
+        )
+        self._evolution_llm = DeepSeekLLM(
+            config,
+            model=config.evolution_chat_model,
+            request_profile=config.evolution_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="evolution",
+        )
+        self._proximity_llm = DeepSeekLLM(
+            config,
+            model=config.proximity_chat_model,
+            request_profile=config.proximity_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="proximity",
+        )
+        self._meta_review_llm = DeepSeekLLM(
+            config,
+            model=config.meta_review_chat_model,
+            request_profile=config.meta_review_chat_profile,
+            cost_tracker=self._cost_tracker,
+            client_name="meta_review",
+        )
         if evidence_store is None:
             from bmscientist.store import LanceEvidenceStore
 
@@ -2162,7 +2675,13 @@ class CoScientistRunner:
         discovery_tool = (
             DiscoveryEvidenceTool(discovery_agent)
             if discovery_agent is not None
-            else DiscoveryEvidenceTool(config, self._reflection_llm, self._embedder, self._evidence_store)
+            else DiscoveryEvidenceTool(
+                config,
+                self._reflection_llm,
+                self._embedder,
+                self._evidence_store,
+                cost_tracker=self._cost_tracker,
+            )
         )
         self._reflection_agent = ReflectionAgent(
             self._reflection_llm,
@@ -2170,6 +2689,7 @@ class CoScientistRunner:
             discovery_tool,
             self._price_cache,
             self._graph_evidence,
+            self._market_volume_llm,
         )
 
     def set_progress_reporter(self, reporter: ProgressReporter | None) -> None:
@@ -2177,6 +2697,17 @@ class CoScientistRunner:
 
     def prepare_project_name(self, preferred_name: str | None = None) -> str:
         return self._artifact_store.claim_project_name(preferred_name)
+
+    def reflect_hypothesis(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        persist: bool = False,
+    ) -> tuple[Hypothesis, int]:
+        reflected, discovery_runs = self._reflection_agent.reflect(document, hypothesis)
+        if persist:
+            self._artifact_store.append_hypothesis_snapshot(reflected)
+        return reflected, discovery_runs
 
     def run(
         self,
@@ -2198,6 +2729,7 @@ class CoScientistRunner:
             max_pages_per_search=max_pages_per_search,
         )
         research_id = project_name or self.prepare_project_name()
+        self._seed_cost_tracking_for_research(research_id)
         self._progress_reporter.start("planning", "Processing goal")
         document = self._planning_agent.create_research_goal(
             research_id=research_id,
@@ -2300,6 +2832,8 @@ class CoScientistRunner:
             document.research_id,
             self._build_report(document, reflected_hypotheses),
         )
+        self._write_tool_report(document, reflected_hypotheses)
+        cost_path = self._write_cost_report(document.research_id)
         self._progress_reporter.complete("reporting", "Report written")
         return CoScientistRunResult(
             research_id=document.research_id,
@@ -2309,6 +2843,7 @@ class CoScientistRunner:
             research_goal_path=str(research_goal_path.resolve()),
             hypothesis_path=str(self._artifact_store.hypothesis_path(document.research_id).resolve()),
             report_path=str(report_path.resolve()),
+            cost_path=cost_path,
         )
 
     def run_loop(
@@ -2330,6 +2865,7 @@ class CoScientistRunner:
         max_pages_per_search: int | None = None,
         reflection_concurrency: int = 3,
     ) -> CoScientistLoopResult:
+        self._seed_cost_tracking_for_research(research_id)
         self._progress_reporter.start("loop_load", "Loading research run")
         document = self._artifact_store.load_research_goal(research_id)
         document = self._with_reflection_overrides(
@@ -2559,6 +3095,8 @@ class CoScientistRunner:
             research_id,
             final_report,
         )
+        self._write_tool_report(document, latest_hypotheses)
+        cost_path = self._write_cost_report(research_id)
         self._progress_reporter.complete("loop_reporting", "Loop report written")
         return CoScientistLoopResult(
             research_id=research_id,
@@ -2573,6 +3111,7 @@ class CoScientistRunner:
             hypothesis_path=str(self._artifact_store.hypothesis_path(research_id).resolve()),
             report_path=str(report_path.resolve()),
             stop_reason=stop_reason,
+            cost_path=cost_path,
         )
 
     @staticmethod
@@ -2596,6 +3135,7 @@ class CoScientistRunner:
         poll_interval_seconds: int = 5,
         idle_exit_after_seconds: int | None = None,
     ) -> CoScientistRunResult:
+        self._seed_cost_tracking_for_research(research_id)
         self._progress_reporter.start("resume_load", "Loading research run")
         document = self._artifact_store.load_research_goal(research_id)
         document = self._with_reflection_overrides(
@@ -2628,6 +3168,8 @@ class CoScientistRunner:
             document.research_id,
             self._build_report(document, reflected_hypotheses),
         )
+        self._write_tool_report(document, reflected_hypotheses)
+        cost_path = self._write_cost_report(document.research_id)
         self._progress_reporter.complete("resume_reporting", "Report written")
         return CoScientistRunResult(
             research_id=document.research_id,
@@ -2637,6 +3179,7 @@ class CoScientistRunner:
             research_goal_path=str(self._artifact_store.research_goal_path(document.research_id).resolve()),
             hypothesis_path=str(self._artifact_store.hypothesis_path(document.research_id).resolve()),
             report_path=str(report_path.resolve()),
+            cost_path=cost_path,
         )
 
     def _reflect_from_queue(
@@ -2713,7 +3256,7 @@ class CoScientistRunner:
 
                 idle_started_at = None
                 try:
-                    reflected, run_count = self._reflection_agent.reflect(document, claimed)
+                    reflected, run_count = self.reflect_hypothesis(document, claimed)
                 except Exception as exc:
                     LOGGER.exception("Reflection failed for hypothesis %s", claimed.hypothesis_id)
                     self._artifact_store.release_reflection_claim(claimed, str(exc))
@@ -2748,10 +3291,9 @@ class CoScientistRunner:
             reflected_hypotheses: list[Hypothesis] = []
             discovery_runs = 0
             for index, hypothesis in enumerate(hypotheses, start=1):
-                reflected, run_count = self._reflection_agent.reflect(document, hypothesis)
+                reflected, run_count = self.reflect_hypothesis(document, hypothesis, persist=True)
                 reflected_hypotheses.append(reflected)
                 discovery_runs += run_count
-                self._artifact_store.append_hypothesis_snapshot(reflected)
                 self._progress_reporter.advance(phase, progress_message, index, total_hypotheses)
             self._progress_reporter.complete(phase, f"{progress_message} complete", total_hypotheses, total_hypotheses)
             return reflected_hypotheses, discovery_runs
@@ -2761,7 +3303,7 @@ class CoScientistRunner:
         completed = 0
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
-                executor.submit(self._reflection_agent.reflect, document, hypothesis): hypothesis
+                executor.submit(self.reflect_hypothesis, document, hypothesis): hypothesis
                 for hypothesis in hypotheses
             }
             for future in as_completed(future_map):
@@ -2961,6 +3503,40 @@ class CoScientistRunner:
         with generated_lock:
             return set(generated_by_id.keys())
 
+    def _seed_cost_tracking_for_research(self, research_id: str) -> None:
+        tracker = getattr(self, "_cost_tracker", None)
+        if tracker is None:
+            return
+        seeded_ids = getattr(self, "_cost_tracker_seeded_research_ids", None)
+        if seeded_ids is None:
+            seeded_ids = set()
+            self._cost_tracker_seeded_research_ids = seeded_ids
+        if research_id in seeded_ids:
+            return
+        loader = getattr(self._artifact_store, "load_cost_report", None)
+        if callable(loader):
+            report = loader(research_id)
+            if isinstance(report, dict):
+                tracker.seed_from_report(report)
+        seeded_ids.add(research_id)
+
+    def _write_tool_report(self, document: ResearchGoalDocument, hypotheses: list[Hypothesis]) -> None:
+        writer = getattr(self._artifact_store, "write_tool_report", None)
+        if callable(writer):
+            writer(
+                document.research_id,
+                self._build_tool_request_report(document, hypotheses),
+            )
+
+    def _write_cost_report(self, research_id: str) -> str | None:
+        tracker = getattr(self, "_cost_tracker", None)
+        writer = getattr(self._artifact_store, "write_cost_report", None)
+        if tracker is None or not callable(writer):
+            return None
+        self._seed_cost_tracking_for_research(research_id)
+        path = writer(research_id, tracker.build_report(research_id))
+        return str(path.resolve())
+
     @staticmethod
     def _default_reflection_worker_id(research_id: str) -> str:
         return f"{research_id}-{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}"
@@ -3022,8 +3598,12 @@ class CoScientistRunner:
             "",
             f"Research ID: `{document.research_id}`",
             f"Goal: {document.raw_goal}",
+            f"Research mode: {document.research_mode}",
+            f"Candidate artifact type: {document.candidate_artifact_schema.artifact_type}",
             "",
         ]
+        if document.evaluation_criteria:
+            lines.extend(["Evaluation criteria:", *[f"- {criterion.name}: {criterion.description or criterion.direction}" for criterion in document.evaluation_criteria], ""])
         for hypothesis in hypotheses:
             assessment = hypothesis.reflection_assessment or ReflectionAssessment()
             lines.extend(
@@ -3034,18 +3614,27 @@ class CoScientistRunner:
                     f"- Market segment: {hypothesis.market_segment or 'Unknown'}",
                     f"- Candidate material: {hypothesis.candidate_material or 'Unknown'}",
                     f"- Incumbent material: {hypothesis.incumbent_material or 'Unknown'}",
+                    f"- Candidate artifact: {json.dumps(hypothesis.candidate_artifact, ensure_ascii=True) if hypothesis.candidate_artifact else 'None'}",
                     f"- NBCA material: {assessment.nbca_material or 'Unknown'}",
                     f"- Strategic fit score: {assessment.strategic_fit_score.value}",
                     f"- Market size score: {assessment.market_size_score.value}",
                     f"- Technical success probability: {assessment.technical_success_probability.value}",
                     f"- Commercial success probability: {assessment.commercial_success_probability.value}",
                     f"- Evidence gaps: {', '.join(assessment.evidence_gap_notes) or 'None recorded'}",
+                    f"- Tool request notes: {', '.join(assessment.tool_request_notes) or 'None recorded'}",
                     "",
                     "Summary:",
                     hypothesis.summary,
                     "",
                 ]
             )
+            if assessment.criterion_results:
+                lines.append("Criterion results:")
+                for result in assessment.criterion_results:
+                    lines.append(
+                        f"- {result.criterion_name}: score={result.normalized_score} confidence={result.confidence} value={result.value}"
+                    )
+                lines.append("")
         return "\n".join(lines)
 
     @staticmethod
@@ -3063,6 +3652,7 @@ class CoScientistRunner:
             "",
             f"Research ID: `{document.research_id}`",
             f"Goal: {document.raw_goal}",
+            f"Research mode: {document.research_mode}",
             f"Stop reason: `{stop_reason}`",
             "",
         ]
@@ -3121,15 +3711,70 @@ class CoScientistRunner:
                     f"- Market segment: {hypothesis.market_segment or 'Unknown'}",
                     f"- Candidate material: {hypothesis.candidate_material or 'Unknown'}",
                     f"- Incumbent material: {hypothesis.incumbent_material or 'Unknown'}",
+                    f"- Candidate artifact: {json.dumps(hypothesis.candidate_artifact, ensure_ascii=True) if hypothesis.candidate_artifact else 'None'}",
                     f"- Concepts: {', '.join(hypothesis.concept_labels) or 'None'}",
                     f"- Strategic fit: {assessment.strategic_fit_score.value}",
                     f"- Market size: {assessment.market_size_score.value}",
                     f"- Technical success: {assessment.technical_success_probability.value}",
                     f"- Commercial success: {assessment.commercial_success_probability.value}",
                     f"- Evidence gaps: {', '.join(assessment.evidence_gap_notes) or 'None recorded'}",
+                    f"- Tool request notes: {', '.join(assessment.tool_request_notes) or 'None recorded'}",
                     "",
                     hypothesis.ranking_rationale or hypothesis.summary,
                     "",
                 ]
             )
+            if assessment.criterion_results:
+                lines.append("Criterion results:")
+                for result in assessment.criterion_results:
+                    lines.append(
+                        f"- {result.criterion_name}: score={result.normalized_score} confidence={result.confidence} value={result.value}"
+                    )
+                lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_tool_request_report(document: ResearchGoalDocument, hypotheses: list[Hypothesis]) -> str:
+        lines = [
+            "# Tool Requests",
+            "",
+            f"Research ID: `{document.research_id}`",
+            f"Goal: {document.raw_goal}",
+            f"Research mode: {document.research_mode}",
+            "",
+        ]
+        if not document.tool_requests:
+            lines.append("No tool requests recorded.")
+            return "\n".join(lines)
+        for request in document.tool_requests:
+            dependent_criteria = [
+                criterion.name
+                for criterion in document.evaluation_criteria
+                if request.tool_id in criterion.suggested_tool_ids
+            ]
+            lines.extend(
+                [
+                    f"## {request.tool_id}",
+                    "",
+                    f"- Purpose: {request.purpose}",
+                    f"- Status: {request.status}",
+                    f"- Candidate packages: {', '.join(request.candidate_packages) or 'None recorded'}",
+                    f"- Required inputs: {', '.join(request.required_inputs) or 'None recorded'}",
+                    f"- Expected outputs: {', '.join(request.expected_outputs) or 'None recorded'}",
+                    f"- Dependent criteria: {', '.join(dependent_criteria) or 'None recorded'}",
+                    f"- Limitations: {', '.join(request.limitations) or 'None recorded'}",
+                    "",
+                ]
+            )
+        hypothesis_notes = list(
+            OrderedDict.fromkeys(
+                note
+                for hypothesis in hypotheses
+                for note in (hypothesis.reflection_assessment.tool_request_notes if hypothesis.reflection_assessment else [])
+                if note
+            )
+        )
+        if hypothesis_notes:
+            lines.extend(["## Reflection Notes", ""])
+            lines.extend([f"- {note}" for note in hypothesis_notes])
         return "\n".join(lines)

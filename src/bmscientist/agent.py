@@ -28,7 +28,8 @@ from bmscientist.models import (
     SearchResultItem,
 )
 from bmscientist.prompt_library import PROMPTS
-from bmscientist.search import ExaSearchClient, deduplicate_search_results, load_search_results_file
+from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_search_result, compose_partial_text
+from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options, load_search_results_file
 from bmscientist.store import LanceEvidenceStore
 
 
@@ -53,6 +54,7 @@ class DiscoveryState(TypedDict, total=False):
     graph_enrichment_accepted: int
     summary: DiscoverySummary
     skipped_pages: list[dict[str, Any]]
+    retrieval_stats: dict[str, Any]
     errors: list[str]
     output_path: str
 
@@ -64,6 +66,7 @@ class DiscoveryAgent:
         self._llm = DeepSeekLLM(config)
         self._search = ExaSearchClient(config)
         self._fetcher = PageFetcher(config)
+        self._retriever = ExaPageRetriever(config, self._search, self._fetcher)
         self._classifier = EvidenceClassifier(self._llm)
         self._chunker = TextChunker()
         self._embedder = LocalEmbedder(config)
@@ -208,7 +211,11 @@ class DiscoveryAgent:
         raw_payloads: list[dict[str, Any]] = []
         for query in state["search_queries"]:
             try:
-                response = self._search.search(query=query, num_results=state["results_per_query"])
+                response = self._search.search(
+                    query=query,
+                    num_results=state["results_per_query"],
+                    options=default_search_options(self._config, query),
+                )
                 all_results.extend(response.results)
                 raw_payloads.append({"query": query, "payload": response.raw_payload})
             except Exception as exc:
@@ -224,31 +231,13 @@ class DiscoveryAgent:
         return {"unique_results": unique_results}
 
     def fetch_pages(self, state: DiscoveryState) -> DiscoveryState:
-        fetched_pages: list[PageContent] = []
-        skipped = list(state.get("skipped_pages", []))
-        for result in state.get("unique_results", [])[: state["max_pages"]]:
-            if self._fetcher.should_skip_direct_fetch(str(result.url)):
-                skipped.append(
-                    {
-                        "url": str(result.url),
-                        "search_query": result.search_query,
-                        "reason": "blocked_domain",
-                        "error": "Domain skipped for direct fetch based on configured policy",
-                    }
-                )
-                fallback_page = self._build_partial_page_from_search_result(result, "blocked_domain")
-                if fallback_page:
-                    fetched_pages.append(fallback_page)
-                continue
-            page, error = self._fetcher.safe_fetch(result)
-            if error:
-                skipped.append(error)
-                fallback_page = self._build_partial_page_from_search_result(result, error.get("reason", "fetch_error"))
-                if fallback_page:
-                    fetched_pages.append(fallback_page)
-                continue
-            if page:
-                fetched_pages.append(page)
+        retrieval = self._retriever.retrieve_pages(
+            state["original_query"],
+            state.get("unique_results", [])[: state["max_pages"]],
+            max_pages=state["max_pages"],
+        )
+        fetched_pages = retrieval.pages
+        skipped = list(state.get("skipped_pages", [])) + retrieval.skipped
         raw_pages_path = self._config.data_dir / "raw" / f'{state["run_id"]}_fetched_pages.json'
         raw_pages_path.write_text(
             json.dumps(
@@ -270,7 +259,9 @@ class DiscoveryAgent:
             ),
             encoding="utf-8",
         )
-        return {"fetched_pages": fetched_pages, "skipped_pages": skipped}
+        retrieval_stats_path = self._config.data_dir / "raw" / f'{state["run_id"]}_retrieval_stats.json'
+        retrieval_stats_path.write_text(json.dumps(retrieval.stats, indent=2), encoding="utf-8")
+        return {"fetched_pages": fetched_pages, "skipped_pages": skipped, "retrieval_stats": retrieval.stats}
 
     def filter_relevance(self, state: DiscoveryState) -> DiscoveryState:
         candidates: list[PageContent] = []
@@ -509,34 +500,14 @@ class DiscoveryAgent:
         return pages, skipped
 
     def _build_partial_page_from_search_result(self, result: SearchResultItem, reason: str) -> PageContent | None:
-        partial_text = self._compose_partial_text(result)
+        partial_text = compose_partial_text(result)
         if len(partial_text) < self._config.min_snippet_characters:
             return None
-        return PageContent(
-            title=result.title,
-            url=str(result.url),
-            search_query=result.search_query,
-            source_domain=extract_domain(str(result.url)),
-            fetched_at=datetime.now(timezone.utc),
-            text=partial_text,
-            status_code=None,
-            content_type="application/x-search-snippet",
-            raw_excerpt=partial_text[:500],
-            metadata={
-                "is_partial_evidence": True,
-                "partial_evidence_reason": reason,
-                "source_type": "exa_search_result",
-                "search_result_summary": result.summary,
-                "search_result_snippet": result.snippet,
-                "search_result_score": result.score,
-                "search_result_published_date": result.published_date,
-            },
-        )
+        return build_partial_page_from_search_result(result, reason)
 
     @staticmethod
     def _compose_partial_text(result: SearchResultItem) -> str:
-        parts = [result.title.strip(), result.summary.strip(), result.snippet.strip()]
-        return "\n\n".join(part for part in parts if part)
+        return compose_partial_text(result)
 
     def _enrich_manual_records(self, original_query: str, records: list[ChunkRecord]) -> None:
         try:
