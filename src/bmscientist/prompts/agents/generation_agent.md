@@ -16,6 +16,9 @@ $evidence_payload_json
 Already generated in this run as compact duplicate signatures (avoid duplicates or slight renames):
 $existing_hypotheses_json
 
+Previously rejected ideas to avoid regenerating:
+$avoided_hypotheses_json
+
 Generate $target_hypotheses_generated additional distinct hypotheses grounded in the evidence.
 
 Each hypothesis must include:
@@ -52,6 +55,7 @@ Rules:
 - Prioritize candidates supported by structured evidence when available, including market data, property evidence, or domain-specific evidence.
 - Cite chunk IDs and URLs already present in the evidence.
 - Do not spend separate hypothesis slots on slight renames, regional variants, device-size variants, or material grade/SKU variants when the same candidate family, incumbent, application family, and activation thesis are already represented.
+- Do not regenerate previously rejected ideas unless the supplied evidence clearly changes the thesis in a material way.
 - Capture material form, product type, buyer type, and conversion process when supported or clearly implied.
 - If a detail is unclear, leave it in unknowns rather than inventing it.
 
@@ -76,6 +80,9 @@ $evidence_payload_json
 
 Already generated in this pass as compact duplicate signatures (avoid duplicates or slight renames):
 $existing_hypotheses_json
+
+Previously rejected ideas to avoid regenerating:
+$avoided_hypotheses_json
 
 Generate $target_count new hypotheses that directly address the whitespace gaps and follow the meta-review guidance.
 Cite only provided chunk IDs and URLs.
@@ -111,4 +118,5 @@ Rules:
 - Do not invent tool-derived properties when the requested tool is unavailable or no supporting evidence exists.
 - When returning `evaluation_results.normalized_score`, always use a 0.0 to 1.0 scale. If you reason in 1-5, 1-10, or percentage terms, convert before returning JSON.
 - Do not spend separate hypothesis slots on slight renames, regional variants, device-size variants, or material grade/SKU variants when the same candidate family, incumbent, application family, and activation thesis are already represented.
+- Do not regenerate previously rejected ideas unless the supplied evidence clearly changes the thesis in a material way.
 - Cite only provided chunk IDs and URLs.

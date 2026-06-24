@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.0
+
+### Added
+- Formalized hypothesis-level human feedback states so co-scientist records can carry explicit `accepted`, `rejected`, `edited`, `retired`, and `low_volume` user signals instead of treating feedback as loose comments only.
+
+### Changed
+- Updated co-scientist feedback handling so user-edited or user-accepted hypotheses can be revived into the active reflected set and rescored in later `coscientist-loop` passes.
+- Expanded meta-review inputs to include feedback history across accepted, rejected, and edited hypotheses, including retired rejected ideas, so whitespace analysis and next-pass generation guidance can respond to user expertise directly.
+- Updated regeneration guidance and filtering so previously rejected ideas are treated as "avoid" context and are not reintroduced unless new evidence materially changes the thesis.
+- Integration note for web clients such as `ypotheto.com`: edited hypotheses should be treated as candidates for renewed scoring, while rejected hypotheses should remain visible as user feedback constraints that inform meta-review and future generation rather than disappearing from project context.
+
 ## 0.6.0
 
 ### Added

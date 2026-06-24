@@ -116,6 +116,8 @@ def test_hypothesis_feedback_store_integration(tmp_path, monkeypatch):
     assert updated.user_feedback_status == "edited"
     assert updated.title == "Super PETG for medical trays"
     assert updated.summary == "A modified summary"
+    assert updated.status == "reflected"
+    assert updated.retired_reason is None
 
 
 def test_ranking_agent_includes_feedback_in_payload():
@@ -182,9 +184,16 @@ def test_accepted_hypothesis_forced_evolution():
 
 
 def test_meta_review_receives_user_feedback():
-    hyp = make_test_hypothesis()
-    hyp.user_feedback_status = "rejected"
-    hyp.user_feedback_comment = "Bad smell"
+    hyp = make_test_hypothesis().model_copy(
+        update={
+            "status": "retired",
+            "is_active": False,
+            "retired_reason": "Bad smell",
+            "user_feedback_status": "rejected",
+            "user_feedback_comment": "Bad smell",
+        }
+    )
+    active = make_test_hypothesis("hyp-2")
     
     mock_llm = MockLLM({
         "whitespace_gaps": ["smell issues"],
@@ -200,18 +209,19 @@ def test_meta_review_receives_user_feedback():
         ranking_round_id="r-1",
         research_id="run-1",
         round_index=1,
-        candidate_count=1,
+        candidate_count=2,
         target_final_count=2,
         best_patterns=[],
         worst_patterns=[],
     )
     
-    agent.review(doc, [hyp], mock_ranking, round_index=1, gap_overlap_threshold=0.6, max_gap_persistence_rounds=1)
+    agent.review(doc, [hyp, active], mock_ranking, round_index=1, gap_overlap_threshold=0.6, max_gap_persistence_rounds=1)
     
     assert mock_llm.last_user_prompt is not None
     assert "user_feedback_status" in mock_llm.last_user_prompt
     assert "rejected" in mock_llm.last_user_prompt
     assert "Bad smell" in mock_llm.last_user_prompt
+    assert "User feedback context across accepted, rejected, and edited hypotheses" in mock_llm.last_user_prompt
 
 
 def test_update_project_goal():

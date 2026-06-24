@@ -12,6 +12,7 @@ RankingAction = Literal["advance", "hold", "evolve", "reject"]
 GapShrinkageStatus = Literal["improved", "stable", "worse", "unknown"]
 ProximityMergeMode = Literal["conservative", "balanced", "aggressive"]
 ProximityGranularity = Literal["device_subtype", "application_family", "global"]
+UserFeedbackStatus = Literal["accepted", "rejected", "edited", "retired", "low_volume"]
 ResearchMode = Literal[
     "materials_opportunity",
     "candidate_design",
@@ -95,6 +96,8 @@ def coerce_dict_list(value: Any) -> list[dict[str, Any]]:
             normalized.append(item.model_dump())
         elif isinstance(item, dict):
             normalized.append(item)
+        elif isinstance(item, str):
+            normalized.append({"name": item})
     return normalized
 
 
@@ -1035,7 +1038,7 @@ class Hypothesis(BaseModel):
     retired_reason: str | None = None
     superseded_by_hypothesis_id: str | None = None
     merged_from_hypothesis_ids: list[str] = Field(default_factory=list)
-    user_feedback_status: Literal["accepted", "rejected", "edited", None] = None
+    user_feedback_status: UserFeedbackStatus | None = None
     user_feedback_comment: str | None = None
 
     @field_validator(
@@ -1070,6 +1073,11 @@ class Hypothesis(BaseModel):
     @classmethod
     def normalize_hypothesis_strategic_rationale(cls, value: Any) -> str:
         return coerce_text_value(value)
+
+    @field_validator("generation_confidence", mode="before")
+    @classmethod
+    def normalize_generation_confidence(cls, value: Any) -> float:
+        return normalize_confidence_value(value)
 
 
 class HypothesisSeed(BaseModel):
