@@ -26,6 +26,12 @@ GRAPH_EVIDENCE_EDGE_TYPES = (
     "Product_USED_IN_Application",
     "Company_PRODUCES_Product",
     "Market_HAS_COMPANY_Company",
+    "Product_HAS_MaterialGrade",
+    "MaterialGrade_BELONGS_TO_MaterialFamily",
+    "Company_PRODUCES_MaterialGrade",
+    "MaterialGrade_HAS_Endpoint",
+    "Application_REQUIRES_CriticalToQuality",
+    "CriticalToQuality_INDICATED_BY_Endpoint",
     "Product_HAS_ChemistryClass",
     "Product_HAS_Function",
     "Product_TARGETS_BinderSystem",
@@ -124,10 +130,13 @@ class GraphMarketEvidence:
                     "Product": self._load_node_map("Product", "product_id"),
                     "Geography": self._load_node_map("Geography", "geo_id"),
                     "Company": self._load_node_map("Company", "company_id"),
+                    "MaterialFamily": self._load_node_map("MaterialFamily", "material_family_id"),
+                    "MaterialGrade": self._load_node_map("MaterialGrade", "material_grade_id"),
                     "ChemistryClass": self._load_node_map("ChemistryClass", "chemistry_class_id"),
                     "Function": self._load_node_map("Function", "function_id"),
                     "BinderSystem": self._load_node_map("BinderSystem", "binder_system_id"),
                     "Endpoint": self._load_node_map("Endpoint", "endpoint_id"),
+                    "CriticalToQuality": self._load_node_map("CriticalToQuality", "ctq_id"),
                 }
                 self._edges = {
                     edge_type: self._load_rows(self._graph_path / "edges" / f"{edge_type}.parquet")
@@ -163,7 +172,7 @@ class GraphMarketEvidence:
         if edge_type == "Product_USED_IN_Application":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
-            product_tokens = self._tokens(product.get("name")) | self._tokens(edge.get("product_id"))
+            product_tokens = self._node_tokens(product) | self._tokens(edge.get("product_id"))
             application_tokens = self._tokens(application.get("name")) | self._tokens(edge.get("application_id"))
             material_terms = self._tokens(
                 " ".join(
@@ -208,8 +217,72 @@ class GraphMarketEvidence:
             score = 0.0
             if self._tokens(company.get("name")) & combined_terms:
                 score += 4.0
-            if self._tokens(product.get("name")) & combined_terms:
+            if self._node_tokens(product) & combined_terms:
                 score += 3.0
+            return score
+        if edge_type == "Product_HAS_MaterialGrade":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            score = 0.0
+            if self._node_tokens(product) & combined_terms:
+                score += 3.0
+            if self._node_tokens(material_grade) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "MaterialGrade_BELONGS_TO_MaterialFamily":
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            material_family = self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
+            score = 0.0
+            if self._node_tokens(material_grade) & combined_terms:
+                score += 3.0
+            if self._node_tokens(material_family) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "Company_PRODUCES_MaterialGrade":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            score = 0.0
+            if self._tokens(company.get("name")) & combined_terms:
+                score += 3.0
+            if self._node_tokens(material_grade) & combined_terms:
+                score += 4.0
+            return score
+        if edge_type == "MaterialGrade_HAS_Endpoint":
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            if self._node_tokens(material_grade) & combined_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & combined_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & criterion_terms:
+                score += 3.0
+            if self._number(edge.get("value_numeric")) is not None or edge.get("value_text"):
+                score += 1.0
+            return score
+        if edge_type == "Application_REQUIRES_CriticalToQuality":
+            application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
+            ctq = self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
+            score = 0.0
+            if self._tokens(application.get("name")) & combined_terms:
+                score += 4.0
+            if self._node_tokens(ctq) & combined_terms:
+                score += 3.0
+            if self._node_tokens(ctq) & criterion_terms:
+                score += 2.0
+            if edge.get("property_requirements_json"):
+                score += 1.0
+            return score
+        if edge_type == "CriticalToQuality_INDICATED_BY_Endpoint":
+            ctq = self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            if self._node_tokens(ctq) & combined_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & combined_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & criterion_terms:
+                score += 2.0
             return score
         if edge_type == "Market_HAS_COMPANY_Company":
             company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
@@ -223,7 +296,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             chemistry_class = self._nodes.get("ChemistryClass", {}).get(str(edge.get("chemistry_class_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & combined_terms:
+            if self._node_tokens(product) & combined_terms:
                 score += 2.0
             if self._tokens(chemistry_class.get("name")) & combined_terms:
                 score += 4.0
@@ -232,7 +305,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             function = self._nodes.get("Function", {}).get(str(edge.get("function_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & combined_terms:
+            if self._node_tokens(product) & combined_terms:
                 score += 2.0
             if self._tokens(function.get("name")) & combined_terms:
                 score += 4.0
@@ -241,7 +314,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             binder_system = self._nodes.get("BinderSystem", {}).get(str(edge.get("binder_system_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & combined_terms:
+            if self._node_tokens(product) & combined_terms:
                 score += 2.0
             if self._tokens(binder_system.get("name")) & combined_terms:
                 score += 4.0
@@ -250,8 +323,8 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
             score = 0.0
-            endpoint_tokens = self._tokens(endpoint.get("name"))
-            if self._tokens(product.get("name")) & combined_terms:
+            endpoint_tokens = self._node_tokens(endpoint)
+            if self._node_tokens(product) & combined_terms:
                 score += 2.0
             if endpoint_tokens & combined_terms:
                 score += 3.0
@@ -324,7 +397,7 @@ class GraphMarketEvidence:
         if edge_type == "Product_USED_IN_Application":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
-            product_tokens = self._tokens(product.get("name")) | self._tokens(edge.get("product_id"))
+            product_tokens = self._node_tokens(product) | self._tokens(edge.get("product_id"))
             application_tokens = self._tokens(application.get("name")) | self._tokens(edge.get("application_id"))
             material_terms = self._tokens(
                 " ".join(
@@ -361,8 +434,72 @@ class GraphMarketEvidence:
             score = 0.0
             if self._tokens(company.get("name")) & goal_terms:
                 score += 4.0
-            if self._tokens(product.get("name")) & goal_terms:
+            if self._node_tokens(product) & goal_terms:
                 score += 3.0
+            return score
+        if edge_type == "Product_HAS_MaterialGrade":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            score = 0.0
+            if self._node_tokens(product) & goal_terms:
+                score += 3.0
+            if self._node_tokens(material_grade) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "MaterialGrade_BELONGS_TO_MaterialFamily":
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            material_family = self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
+            score = 0.0
+            if self._node_tokens(material_grade) & goal_terms:
+                score += 3.0
+            if self._node_tokens(material_family) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "Company_PRODUCES_MaterialGrade":
+            company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            score = 0.0
+            if self._tokens(company.get("name")) & goal_terms:
+                score += 3.0
+            if self._node_tokens(material_grade) & goal_terms:
+                score += 4.0
+            return score
+        if edge_type == "MaterialGrade_HAS_Endpoint":
+            material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            if self._node_tokens(material_grade) & goal_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & goal_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & criterion_terms:
+                score += 3.0
+            if self._number(edge.get("value_numeric")) is not None or edge.get("value_text"):
+                score += 1.0
+            return score
+        if edge_type == "Application_REQUIRES_CriticalToQuality":
+            application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
+            ctq = self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
+            score = 0.0
+            if self._tokens(application.get("name")) & goal_terms:
+                score += 4.0
+            if self._node_tokens(ctq) & goal_terms:
+                score += 3.0
+            if self._node_tokens(ctq) & criterion_terms:
+                score += 2.0
+            if edge.get("property_requirements_json"):
+                score += 1.0
+            return score
+        if edge_type == "CriticalToQuality_INDICATED_BY_Endpoint":
+            ctq = self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
+            endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+            score = 0.0
+            if self._node_tokens(ctq) & goal_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & goal_terms:
+                score += 3.0
+            if self._node_tokens(endpoint) & criterion_terms:
+                score += 2.0
             return score
         if edge_type == "Market_HAS_COMPANY_Company":
             company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
@@ -376,7 +513,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             chemistry_class = self._nodes.get("ChemistryClass", {}).get(str(edge.get("chemistry_class_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & goal_terms:
+            if self._node_tokens(product) & goal_terms:
                 score += 2.0
             if self._tokens(chemistry_class.get("name")) & goal_terms:
                 score += 4.0
@@ -385,7 +522,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             function = self._nodes.get("Function", {}).get(str(edge.get("function_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & goal_terms:
+            if self._node_tokens(product) & goal_terms:
                 score += 2.0
             if self._tokens(function.get("name")) & goal_terms:
                 score += 4.0
@@ -394,7 +531,7 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             binder_system = self._nodes.get("BinderSystem", {}).get(str(edge.get("binder_system_id")), {})
             score = 0.0
-            if self._tokens(product.get("name")) & goal_terms:
+            if self._node_tokens(product) & goal_terms:
                 score += 2.0
             if self._tokens(binder_system.get("name")) & goal_terms:
                 score += 4.0
@@ -403,8 +540,8 @@ class GraphMarketEvidence:
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             endpoint = self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
             score = 0.0
-            endpoint_tokens = self._tokens(endpoint.get("name"))
-            if self._tokens(product.get("name")) & goal_terms:
+            endpoint_tokens = self._node_tokens(endpoint)
+            if self._node_tokens(product) & goal_terms:
                 score += 2.0
             if endpoint_tokens & goal_terms:
                 score += 3.0
@@ -468,6 +605,18 @@ class GraphMarketEvidence:
             return self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
         if edge_type == "Company_PRODUCES_Product":
             return self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+        if edge_type == "Product_HAS_MaterialGrade":
+            return self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+        if edge_type == "MaterialGrade_BELONGS_TO_MaterialFamily":
+            return self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
+        if edge_type == "Company_PRODUCES_MaterialGrade":
+            return self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+        if edge_type == "MaterialGrade_HAS_Endpoint":
+            return self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
+        if edge_type == "Application_REQUIRES_CriticalToQuality":
+            return self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
+        if edge_type == "CriticalToQuality_INDICATED_BY_Endpoint":
+            return self._nodes.get("Endpoint", {}).get(str(edge.get("endpoint_id")), {})
         if edge_type == "Market_HAS_COMPANY_Company":
             return self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
         if edge_type == "Product_HAS_ChemistryClass":
@@ -496,6 +645,12 @@ class GraphMarketEvidence:
             "Market_IN_GEOGRAPHY_Geography": "is measured in geography",
             "Product_USED_IN_Application": "is used in application",
             "Company_PRODUCES_Product": "produces product",
+            "Product_HAS_MaterialGrade": "has material grade",
+            "MaterialGrade_BELONGS_TO_MaterialFamily": "belongs to material family",
+            "Company_PRODUCES_MaterialGrade": "produces material grade",
+            "MaterialGrade_HAS_Endpoint": "has endpoint",
+            "Application_REQUIRES_CriticalToQuality": "requires critical to quality feature",
+            "CriticalToQuality_INDICATED_BY_Endpoint": "is indicated by endpoint",
             "Market_HAS_COMPANY_Company": "includes company",
             "Product_HAS_ChemistryClass": "belongs to chemistry class",
             "Product_HAS_Function": "has function",
@@ -504,17 +659,21 @@ class GraphMarketEvidence:
         }.get(edge_type, edge_type)
         product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
         company = self._nodes.get("Company", {}).get(str(edge.get("company_id")), {})
+        material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
+        ctq = self._nodes.get("CriticalToQuality", {}).get(str(edge.get("ctq_id")), {})
         target_name = (
             target.get("name")
             or edge.get("application_id")
             or edge.get("product_id")
+            or edge.get("material_grade_id")
             or edge.get("geo_id")
             or edge.get("company_id")
+            or edge.get("ctq_id")
         )
         metrics_text = self._metrics_text(edge)
         notes = self._json_notes(
             edge,
-            ["critical_to_quality_json", "highlights_json", "industry_trends_json", "data_book_summary_json"],
+            ["critical_to_quality_json", "property_requirements_json", "highlights_json", "industry_trends_json", "data_book_summary_json"],
             limit=4,
         )
         source_url = (
@@ -524,8 +683,8 @@ class GraphMarketEvidence:
             or market.get("canonical_url")
             or str(self._graph_path.resolve())
         )
-        subject_name = self._subject_name(edge_type, market, product, company)
-        if edge_type == "Product_HAS_Endpoint":
+        subject_name = self._subject_name(edge_type, market, product, company, material_grade, ctq)
+        if edge_type in ("Product_HAS_Endpoint", "MaterialGrade_HAS_Endpoint"):
             endpoint_value_parts = [
                 f"value={edge.get('value_numeric')}" if edge.get("value_numeric") is not None else None,
                 f"text={edge.get('value_text')}" if edge.get("value_text") else None,
@@ -558,6 +717,12 @@ class GraphMarketEvidence:
                 else [product.get("name")]
                 if edge_type in ("Product_USED_IN_Application", "Product_HAS_ChemistryClass", "Product_HAS_Function", "Product_TARGETS_BinderSystem", "Product_HAS_Endpoint")
                 and product.get("name")
+                else [material_grade.get("name")]
+                if edge_type in ("Product_HAS_MaterialGrade", "MaterialGrade_BELONGS_TO_MaterialFamily", "Company_PRODUCES_MaterialGrade", "MaterialGrade_HAS_Endpoint")
+                and material_grade.get("name")
+                else [ctq.get("name")]
+                if edge_type in ("Application_REQUIRES_CriticalToQuality", "CriticalToQuality_INDICATED_BY_Endpoint")
+                and ctq.get("name")
                 else []
             ),
             "relevance_score": min(0.98, 0.55 + (score * 0.04)),
@@ -569,7 +734,10 @@ class GraphMarketEvidence:
                 "market_id": edge.get("market_id"),
                 "market_name": market.get("name"),
                 "product_id": edge.get("product_id"),
+                "material_grade_id": edge.get("material_grade_id"),
+                "material_family_id": edge.get("material_family_id"),
                 "application_id": edge.get("application_id"),
+                "ctq_id": edge.get("ctq_id"),
                 "target_name": target_name,
                 "geo_id": edge.get("geo_id"),
                 "revenue_value": self._number(edge.get("revenue_value")),
@@ -591,10 +759,13 @@ class GraphMarketEvidence:
                 "endpoint_id": edge.get("endpoint_id"),
                 "value_text": edge.get("value_text"),
                 "value_numeric": self._number(edge.get("value_numeric")),
+                "value_min": self._number(edge.get("value_min")),
+                "value_max": self._number(edge.get("value_max")),
                 "normalized_score": self._number(edge.get("normalized_score")),
                 "evidence_mode": edge.get("evidence_mode"),
                 "tool_id": edge.get("tool_id"),
                 "is_inferred": edge.get("is_inferred"),
+                "property_requirements_json": edge.get("property_requirements_json"),
                 "evidence_hash": edge.get("evidence_hash"),
                 "source_chunk_id": edge.get("source_chunk_id"),
                 "unit": edge.get("unit"),
@@ -609,18 +780,55 @@ class GraphMarketEvidence:
         market: dict[str, Any],
         product: dict[str, Any],
         company: dict[str, Any],
+        material_grade: dict[str, Any],
+        ctq: dict[str, Any],
     ) -> str:
         if edge_type in (
             "Product_USED_IN_Application",
+            "Product_HAS_MaterialGrade",
+            "MaterialGrade_HAS_Endpoint",
             "Product_HAS_ChemistryClass",
             "Product_HAS_Function",
             "Product_TARGETS_BinderSystem",
             "Product_HAS_Endpoint",
         ):
             return product.get("name")
+        if edge_type in (
+            "MaterialGrade_BELONGS_TO_MaterialFamily",
+            "Company_PRODUCES_MaterialGrade",
+        ):
+            return material_grade.get("name")
+        if edge_type in (
+            "Application_REQUIRES_CriticalToQuality",
+            "CriticalToQuality_INDICATED_BY_Endpoint",
+        ):
+            return ctq.get("name")
         if edge_type == "Company_PRODUCES_Product":
             return company.get("name")
         return market.get("name")
+
+    def _node_tokens(self, node: dict[str, Any]) -> set[str]:
+        parts = [
+            node.get("name"),
+            node.get("canonical_name"),
+            node.get("normalized_name"),
+            " ".join(self._parse_json_list(node.get("aliases_json"))),
+        ]
+        return self._tokens(" ".join(str(part or "") for part in parts if part))
+
+    @staticmethod
+    def _parse_json_list(value: Any) -> list[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed if item]
 
     def _document_terms(self, document: ResearchGoalDocument) -> set[str]:
         parts = [

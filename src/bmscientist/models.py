@@ -242,6 +242,84 @@ class GraphEnrichmentValidationOutput(BaseModel):
     validations: list[GraphEnrichmentValidation] = Field(default_factory=list)
 
 
+class MaterialAliasRecord(BaseModel):
+    material_alias_id: str | None = None
+    alias_text: str
+    normalized_alias: str | None = None
+    canonical_node_id: str
+    canonical_node_label: Literal[
+        "MaterialFamily",
+        "Product",
+        "MaterialGrade",
+        "Company",
+        "Endpoint",
+        "CriticalToQuality",
+    ]
+    alias_type: Literal[
+        "abbreviation",
+        "chemical_name",
+        "trade_name",
+        "synonym",
+        "spelling_variant",
+        "legacy_name",
+        "source_label",
+        "unknown",
+    ] = "unknown"
+    source_vendor: str | None = None
+    source_url: str | None = None
+    evidence_hash: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    validation_status: Literal["accepted", "pending_review", "rejected", "conflict"] = "accepted"
+
+
+class AliasResolution(BaseModel):
+    status: Literal["exact", "normalized", "fuzzy", "ambiguous", "missing"]
+    canonical_node_id: str | None = None
+    canonical_node_label: str | None = None
+    matched_alias: str | None = None
+    matched_by: str | None = None
+    candidate_node_ids: list[str] = Field(default_factory=list)
+
+
+class CTQPropertyRequirement(BaseModel):
+    bound: Literal["min", "max", "range", "qualitative"]
+    value: float | None = None
+    value_min: float | None = None
+    value_max: float | None = None
+    unit: str | None = None
+    condition_text: str | None = None
+    basis: str | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class CriticalToQualityRequirement(BaseModel):
+    ctq_name: str
+    requirement_text: str
+    property_requirements: dict[str, CTQPropertyRequirement] = Field(default_factory=dict)
+    requirement_role: Literal["must_have", "nice_to_have", "differentiator", "failure_mode"] = "must_have"
+
+
+class EndpointIndicatorRule(BaseModel):
+    endpoint_name: str
+    direction: Literal["higher_is_better", "lower_is_better", "within_range", "qualitative"]
+    default_threshold_value: float | None = None
+    default_threshold_min: float | None = None
+    default_threshold_max: float | None = None
+    unit: str | None = None
+    condition_text: str | None = None
+    rationale: str = Field(default="")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class CTQMappingProposal(BaseModel):
+    ctq_name: str
+    requirement_text: str
+    property_requirements: dict[str, CTQPropertyRequirement] = Field(default_factory=dict)
+    indicator_rules: list[EndpointIndicatorRule] = Field(default_factory=list)
+    review_required: bool = False
+    review_reason: str = Field(default="")
+
+
 class DiscoverySummary(BaseModel):
     run_id: str
     original_query: str

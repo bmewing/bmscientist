@@ -21,6 +21,8 @@ Tasks:
 
 Rules:
 - Do not force every hypothesis into a concept.
+- Respect `proximity_merge_policy` from the research configuration when deciding what counts as the same opportunity family.
 - Do not synthesize unless the underlying ideas are genuinely overlapping and combinable.
 - Synthesized hypotheses should be broader, cleaner, and more informative than the source hypotheses.
 - Use merged_from_hypothesis_ids to identify the originals being superseded.
+- When combining ideas from different regions, preserve all of them by merging the regional scope into one synthesized hypothesis rather than splitting by region.

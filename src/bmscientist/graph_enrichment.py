@@ -284,6 +284,148 @@ class GraphEnrichmentStore:
     def _ensure_market(self, market_name: str | None) -> str:
         return self._ensure_node("Market", market_name, "market_id", None)
 
+    def ensure_material_family(
+        self,
+        name: str,
+        *,
+        canonical_name: str | None = None,
+        family_type: str = "unknown",
+        aliases: list[str] | None = None,
+        alias_sources: dict[str, Any] | None = None,
+        description: str | None = None,
+    ) -> str:
+        return self._ensure_node(
+            "MaterialFamily",
+            canonical_name or name,
+            "material_family_id",
+            None,
+            aliases=aliases,
+            extra_fields={
+                "canonical_name": canonical_name or name,
+                "family_type": family_type,
+                "alias_sources_json": json.dumps(alias_sources or {}, sort_keys=True),
+                "description": description,
+            },
+        )
+
+    def ensure_material_grade(
+        self,
+        name: str,
+        *,
+        record_type: str = "unknown",
+        source_vendor: str = "matweb",
+        source_url: str | None = None,
+        source_record_id: str | None = None,
+        source_search_query: str | None = None,
+        manufacturer_name: str | None = None,
+        trade_name: str | None = None,
+        grade_name: str | None = None,
+        material_family_name: str | None = None,
+        category_path: list[str] | None = None,
+        processing_methods: list[str] | None = None,
+        applications: list[str] | None = None,
+        property_table: list[dict[str, Any]] | None = None,
+        raw_record: dict[str, Any] | None = None,
+    ) -> str:
+        grade_id = (
+            f"material_grade:matweb:{slugify(source_record_id)}"
+            if source_vendor == "matweb" and source_record_id
+            else f"material_grade:{slugify(name)}"
+        )
+        path = self._nodes_path / "MaterialGrade.parquet"
+        schema = NODE_SCHEMAS["MaterialGrade"]
+        with FileLock(path):
+            rows = rows_by_key(path, schema, "material_grade_id")
+            now = now_iso()
+            existing = rows.get(grade_id, empty_row(schema))
+            existing.update(
+                {
+                    "material_grade_id": grade_id,
+                    "name": name,
+                    "normalized_name": normalize_name(name),
+                    "record_type": record_type,
+                    "source_vendor": source_vendor,
+                    "source_url": source_url,
+                    "source_record_id": source_record_id,
+                    "source_search_query": source_search_query,
+                    "manufacturer_name": manufacturer_name,
+                    "trade_name": trade_name,
+                    "grade_name": grade_name,
+                    "material_family_name": material_family_name,
+                    "category_path_json": json.dumps(category_path or [], sort_keys=True),
+                    "processing_methods_json": json.dumps(processing_methods or [], sort_keys=True),
+                    "applications_json": json.dumps(applications or [], sort_keys=True),
+                    "property_table_json": json.dumps(property_table or [], sort_keys=True),
+                    "raw_record_json": json.dumps(raw_record or {}, sort_keys=True),
+                    "last_seen_at": now,
+                    "updated_at": now,
+                }
+            )
+            if not existing.get("created_at"):
+                existing["created_at"] = now
+            rows[grade_id] = existing
+            write_rows(path, list(rows.values()), schema)
+        return grade_id
+
+    def ensure_critical_to_quality(
+        self,
+        name: str,
+        *,
+        requirement_type: str = "other",
+        aliases: list[str] | None = None,
+        description: str | None = None,
+    ) -> str:
+        return self._ensure_node(
+            "CriticalToQuality",
+            name,
+            "ctq_id",
+            None,
+            aliases=aliases,
+            extra_fields={"requirement_type": requirement_type, "description": description},
+        )
+
+    def ensure_material_alias(
+        self,
+        alias_text: str,
+        canonical_node_id: str,
+        canonical_node_label: str,
+        *,
+        alias_type: str = "unknown",
+        source_vendor: str | None = None,
+        source_url: str | None = None,
+        evidence_hash: str | None = None,
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> str:
+        alias_id = f"material_alias:{slugify(canonical_node_id)}:{slugify(alias_text)}"
+        path = self._nodes_path / "MaterialAlias.parquet"
+        schema = NODE_SCHEMAS["MaterialAlias"]
+        with FileLock(path):
+            rows = rows_by_key(path, schema, "material_alias_id")
+            now = now_iso()
+            existing = rows.get(alias_id, empty_row(schema))
+            existing.update(
+                {
+                    "material_alias_id": alias_id,
+                    "alias_text": alias_text,
+                    "normalized_alias": normalize_name(alias_text),
+                    "canonical_node_id": canonical_node_id,
+                    "canonical_node_label": canonical_node_label,
+                    "alias_type": alias_type,
+                    "source_vendor": source_vendor,
+                    "source_url": source_url,
+                    "evidence_hash": evidence_hash,
+                    "confidence": confidence,
+                    "validation_status": validation_status,
+                    "updated_at": now,
+                }
+            )
+            if not existing.get("created_at"):
+                existing["created_at"] = now
+            rows[alias_id] = existing
+            write_rows(path, list(rows.values()), schema)
+        return alias_id
+
     def _ensure_product_node(self, proposal: GraphEnrichmentProposal, validation: GraphEnrichmentValidation) -> str:
         aliases = effective_product_aliases(proposal, validation)
         canonical_name = canonical_product_name(proposal.product_name, aliases)
@@ -308,7 +450,10 @@ class GraphEnrichmentStore:
     ) -> str:
         safe_name = (name or "Unknown").strip() or "Unknown"
         normalized_name = normalize_name(safe_name)
-        prefix = label.lower()
+        prefix = {
+            "MaterialFamily": "material_family",
+            "CriticalToQuality": "ctq",
+        }.get(label, label.lower())
         node_id = f"{prefix}:{slugify(safe_name)}"
         schema = NODE_SCHEMAS[label]
         path = self._nodes_path / f"{label}.parquet"
@@ -1315,6 +1460,282 @@ class GraphEnrichmentStore:
             "edge_id",
         )
 
+    def append_product_material_grade_edge(
+        self,
+        product_id: str,
+        material_grade_id: str,
+        *,
+        relationship_role: str = "product_line_grade",
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(PRODUCT_MATERIAL_GRADE_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Product_HAS_MaterialGrade", product_id, material_grade_id, evidence_hash or ""),
+                "product_id": product_id,
+                "material_grade_id": material_grade_id,
+                "relationship_role": relationship_role,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_HAS_MaterialGrade.parquet",
+            [row],
+            PRODUCT_MATERIAL_GRADE_SCHEMA,
+            "edge_id",
+        )
+
+    def append_material_grade_family_edge(
+        self,
+        material_grade_id: str,
+        material_family_id: str,
+        *,
+        relationship_role: str = "base_family",
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(MATERIAL_GRADE_MATERIAL_FAMILY_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("MaterialGrade_BELONGS_TO_MaterialFamily", material_grade_id, material_family_id, evidence_hash or ""),
+                "material_grade_id": material_grade_id,
+                "material_family_id": material_family_id,
+                "relationship_role": relationship_role,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "MaterialGrade_BELONGS_TO_MaterialFamily.parquet",
+            [row],
+            MATERIAL_GRADE_MATERIAL_FAMILY_SCHEMA,
+            "edge_id",
+        )
+
+    def append_company_material_grade_edge(
+        self,
+        company_id: str,
+        material_grade_id: str,
+        *,
+        role: str = "manufacturer",
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(COMPANY_MATERIAL_GRADE_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Company_PRODUCES_MaterialGrade", company_id, material_grade_id, evidence_hash or ""),
+                "company_id": company_id,
+                "material_grade_id": material_grade_id,
+                "role": role,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Company_PRODUCES_MaterialGrade.parquet",
+            [row],
+            COMPANY_MATERIAL_GRADE_SCHEMA,
+            "edge_id",
+        )
+
+    def append_material_grade_endpoint_edge(
+        self,
+        material_grade_id: str,
+        endpoint_id: str,
+        *,
+        value_text: str | None = None,
+        value_numeric: float | None = None,
+        value_min: float | None = None,
+        value_max: float | None = None,
+        unit: str | None = None,
+        condition_text: str | None = None,
+        test_method: str | None = None,
+        original_property_name: str | None = None,
+        original_value_text: str | None = None,
+        original_unit: str | None = None,
+        normalized_score: float | None = None,
+        evidence_mode: str = "matweb_table",
+        tool_id: str | None = None,
+        is_inferred: bool = False,
+        source_chunk_id: str | None = None,
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(MATERIAL_GRADE_ENDPOINT_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("MaterialGrade_HAS_Endpoint", material_grade_id, endpoint_id, evidence_hash or ""),
+                "material_grade_id": material_grade_id,
+                "endpoint_id": endpoint_id,
+                "value_text": value_text,
+                "value_numeric": value_numeric,
+                "value_min": value_min,
+                "value_max": value_max,
+                "unit": unit,
+                "condition_text": condition_text,
+                "test_method": test_method,
+                "original_property_name": original_property_name,
+                "original_value_text": original_value_text,
+                "original_unit": original_unit,
+                "normalized_score": normalized_score,
+                "evidence_mode": evidence_mode,
+                "tool_id": tool_id,
+                "is_inferred": is_inferred,
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "MaterialGrade_HAS_Endpoint.parquet",
+            [row],
+            MATERIAL_GRADE_ENDPOINT_SCHEMA,
+            "edge_id",
+        )
+
+    def append_application_ctq_edge(
+        self,
+        application_id: str,
+        ctq_id: str,
+        *,
+        market_id: str | None = None,
+        requirement_role: str = "must_have",
+        requirement_text: str = "",
+        property_requirements: dict[str, Any] | None = None,
+        source_chunk_id: str | None = None,
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(APPLICATION_CTQ_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Application_REQUIRES_CriticalToQuality", application_id, ctq_id, evidence_hash or ""),
+                "application_id": application_id,
+                "ctq_id": ctq_id,
+                "market_id": market_id,
+                "requirement_role": requirement_role,
+                "requirement_text": requirement_text,
+                "property_requirements_json": json.dumps(property_requirements or {}, sort_keys=True),
+                "source_chunk_id": source_chunk_id,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Application_REQUIRES_CriticalToQuality.parquet",
+            [row],
+            APPLICATION_CTQ_SCHEMA,
+            "edge_id",
+        )
+
+    def append_ctq_endpoint_edge(
+        self,
+        ctq_id: str,
+        endpoint_id: str,
+        *,
+        direction: str,
+        default_threshold_value: float | None = None,
+        default_threshold_min: float | None = None,
+        default_threshold_max: float | None = None,
+        unit: str | None = None,
+        condition_text: str | None = None,
+        rationale: str = "",
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(CTQ_ENDPOINT_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("CriticalToQuality_INDICATED_BY_Endpoint", ctq_id, endpoint_id, evidence_hash or ""),
+                "ctq_id": ctq_id,
+                "endpoint_id": endpoint_id,
+                "direction": direction,
+                "default_threshold_value": default_threshold_value,
+                "default_threshold_min": default_threshold_min,
+                "default_threshold_max": default_threshold_max,
+                "unit": unit,
+                "condition_text": condition_text,
+                "rationale": rationale,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "CriticalToQuality_INDICATED_BY_Endpoint.parquet",
+            [row],
+            CTQ_ENDPOINT_SCHEMA,
+            "edge_id",
+        )
+
     @staticmethod
     def _candidate_label(hypothesis: Any, candidate_artifact: dict[str, Any]) -> str:
         values = [
@@ -1722,6 +2143,61 @@ COMPANY_NODE_SCHEMA = pa.schema(
         ("updated_at", pa.string()),
     ]
 )
+MATERIAL_FAMILY_NODE_SCHEMA = pa.schema(
+    [
+        ("material_family_id", pa.string()),
+        ("name", pa.string()),
+        ("canonical_name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("family_type", pa.string()),
+        ("aliases_json", pa.string()),
+        ("alias_sources_json", pa.string()),
+        ("description", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+MATERIAL_GRADE_NODE_SCHEMA = pa.schema(
+    [
+        ("material_grade_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("record_type", pa.string()),
+        ("source_vendor", pa.string()),
+        ("source_url", pa.string()),
+        ("source_record_id", pa.string()),
+        ("source_search_query", pa.string()),
+        ("manufacturer_name", pa.string()),
+        ("trade_name", pa.string()),
+        ("grade_name", pa.string()),
+        ("material_family_name", pa.string()),
+        ("category_path_json", pa.string()),
+        ("processing_methods_json", pa.string()),
+        ("applications_json", pa.string()),
+        ("property_table_json", pa.string()),
+        ("raw_record_json", pa.string()),
+        ("last_seen_at", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+MATERIAL_ALIAS_NODE_SCHEMA = pa.schema(
+    [
+        ("material_alias_id", pa.string()),
+        ("alias_text", pa.string()),
+        ("normalized_alias", pa.string()),
+        ("canonical_node_id", pa.string()),
+        ("canonical_node_label", pa.string()),
+        ("alias_type", pa.string()),
+        ("source_vendor", pa.string()),
+        ("source_url", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
 CHEMISTRY_CLASS_NODE_SCHEMA = pa.schema(
     [
         ("chemistry_class_id", pa.string()),
@@ -1759,15 +2235,31 @@ ENDPOINT_NODE_SCHEMA = pa.schema(
         ("updated_at", pa.string()),
     ]
 )
+CRITICAL_TO_QUALITY_NODE_SCHEMA = pa.schema(
+    [
+        ("ctq_id", pa.string()),
+        ("name", pa.string()),
+        ("normalized_name", pa.string()),
+        ("description", pa.string()),
+        ("requirement_type", pa.string()),
+        ("aliases_json", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
 NODE_SCHEMAS = {
     "Product": PRODUCT_NODE_SCHEMA,
     "Application": APPLICATION_NODE_SCHEMA,
     "Market": MARKET_NODE_SCHEMA,
     "Company": COMPANY_NODE_SCHEMA,
+    "MaterialFamily": MATERIAL_FAMILY_NODE_SCHEMA,
+    "MaterialGrade": MATERIAL_GRADE_NODE_SCHEMA,
+    "MaterialAlias": MATERIAL_ALIAS_NODE_SCHEMA,
     "ChemistryClass": CHEMISTRY_CLASS_NODE_SCHEMA,
     "Function": FUNCTION_NODE_SCHEMA,
     "BinderSystem": BINDER_SYSTEM_NODE_SCHEMA,
     "Endpoint": ENDPOINT_NODE_SCHEMA,
+    "CriticalToQuality": CRITICAL_TO_QUALITY_NODE_SCHEMA,
 }
 
 MARKET_EDGE_FIELDS = [
@@ -1949,6 +2441,126 @@ MARKET_COMPANY_SCHEMA = pa.schema(
         ("source", pa.string()),
         ("queue_candidate", pa.bool_()),
         ("source_chunk_id", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_MATERIAL_GRADE_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("material_grade_id", pa.string()),
+        ("relationship_role", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+MATERIAL_GRADE_MATERIAL_FAMILY_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("material_grade_id", pa.string()),
+        ("material_family_id", pa.string()),
+        ("relationship_role", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+COMPANY_MATERIAL_GRADE_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("company_id", pa.string()),
+        ("material_grade_id", pa.string()),
+        ("role", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+MATERIAL_GRADE_ENDPOINT_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("material_grade_id", pa.string()),
+        ("endpoint_id", pa.string()),
+        ("value_text", pa.string()),
+        ("value_numeric", pa.float64()),
+        ("value_min", pa.float64()),
+        ("value_max", pa.float64()),
+        ("unit", pa.string()),
+        ("condition_text", pa.string()),
+        ("test_method", pa.string()),
+        ("original_property_name", pa.string()),
+        ("original_value_text", pa.string()),
+        ("original_unit", pa.string()),
+        ("normalized_score", pa.float64()),
+        ("evidence_mode", pa.string()),
+        ("tool_id", pa.string()),
+        ("is_inferred", pa.bool_()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+APPLICATION_CTQ_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("application_id", pa.string()),
+        ("ctq_id", pa.string()),
+        ("market_id", pa.string()),
+        ("requirement_role", pa.string()),
+        ("requirement_text", pa.string()),
+        ("property_requirements_json", pa.string()),
+        ("source_chunk_id", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+CTQ_ENDPOINT_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("ctq_id", pa.string()),
+        ("endpoint_id", pa.string()),
+        ("direction", pa.string()),
+        ("default_threshold_value", pa.float64()),
+        ("default_threshold_min", pa.float64()),
+        ("default_threshold_max", pa.float64()),
+        ("unit", pa.string()),
+        ("condition_text", pa.string()),
+        ("rationale", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
         ("evidence_hash", pa.string()),
         ("supporting_quote", pa.string()),
         ("confidence", pa.float64()),
