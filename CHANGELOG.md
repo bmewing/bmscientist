@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.8.0
+
+### Added
+- Added explicit novelty-intent planning fields for co-scientist candidate-design runs, including `candidate_origin_policy`, `novelty_requirements`, `known_candidate_exclusion_terms`, and `novelty_check_policy`, so the system can distinguish de novo scientific design requests from ordinary substitution searches.
+
+### Changed
+- Updated research planning, generation, retrieval, reflection, ranking, and final-portfolio prompts so novel molecule-design goals use evidence as design constraints and benchmarks rather than defaulting to known commercial substitution candidates.
+
+### Fixed
+- Fixed co-scientist hypothesis generation for de novo SMILES-style goals so requests like "find brand-new, never-before-seen molecules" no longer return known commercial coalescing aids as final answers, enforce required artifact identifiers such as `smiles`, and dedupe exact structures before reflection.
+
 ## 0.7.0
 
 ### Added
