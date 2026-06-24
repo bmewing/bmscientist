@@ -19,8 +19,15 @@ from bmscientist.coscientist_cli import (
     run_coscientist_meta_review_command,
 )
 from bmscientist.graph_backfill import LanceGraphBackfiller
-from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_estimate import GraphEstimateAgent, format_graph_estimate_result
+from bmscientist.graph_enrichment import (
+    GraphEnrichmentExpander,
+    GraphEnrichmentProposer,
+    GraphEnrichmentStore,
+    GraphEnrichmentValidator,
+)
 from bmscientist.graph_backfill import chunk_record_from_lancedb_row
+from bmscientist.graph_query import DuckDBGraphQueryEngine, GraphQueryAgent, format_graph_query_result
 from bmscientist.embeddings import LocalEmbedder
 from bmscientist.llm import DeepSeekLLM
 from bmscientist.store import LanceEvidenceStore
@@ -84,6 +91,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Vector-search LanceDB first and backfill only matching chunks. May be repeated.",
     )
     graph_backfill.add_argument("--top-k-per-query", type=int, default=25)
+
+    graph_sql = subparsers.add_parser("graph-sql", help="Run a read-only DuckDB query against the graph parquet tables.")
+    graph_sql.add_argument("--sql", required=True)
+    graph_sql.add_argument("--limit", type=int, default=100)
+
+    subparsers.add_parser("graph-schema", help="List graph parquet tables and columns available to DuckDB queries.")
+
+    graph_ask = subparsers.add_parser("graph-ask", help="Use an LLM to write a read-only graph query, then execute it.")
+    graph_ask.add_argument("--question", required=True)
+    graph_ask.add_argument("--limit", type=int, default=100)
+
+    graph_estimate = subparsers.add_parser(
+        "graph-estimate",
+        help="Use the graph plus LLM reasoning to estimate material shares or tonnage without web search.",
+    )
+    graph_estimate.add_argument("--question", required=True)
+    graph_estimate.add_argument("--limit", type=int, default=24)
+    graph_estimate.add_argument("--dry-run", action="store_true", help="Do not persist the AI estimate back into the graph.")
     add_coscientist_parser(subparsers)
 
     return parser
@@ -197,6 +222,7 @@ def run_graph_backfill(args: argparse.Namespace, config: AppConfig) -> int:
         store,
         GraphEnrichmentProposer(llm),
         GraphEnrichmentValidator(llm),
+        GraphEnrichmentExpander(llm),
         GraphEnrichmentStore(),
     )
     result = backfiller.run(
@@ -212,6 +238,40 @@ def run_graph_backfill(args: argparse.Namespace, config: AppConfig) -> int:
     console.print(f"[bold]Proposed claims:[/bold] {result.proposed_claims}")
     console.print(f"[bold]Accepted claims:[/bold] {result.accepted_claims}")
     console.print(f"[bold]Backfill details:[/bold] {result.output_path}")
+    return 0
+
+
+def run_graph_sql(args: argparse.Namespace, config: AppConfig) -> int:
+    engine = DuckDBGraphQueryEngine(config.data_dir / "graph")
+    result = engine.query(args.sql, limit=args.limit)
+    console.print(format_graph_query_result(result))
+    return 0
+
+
+def run_graph_schema(config: AppConfig) -> int:
+    engine = DuckDBGraphQueryEngine(config.data_dir / "graph")
+    console.print(engine.schema_summary())
+    return 0
+
+
+def run_graph_ask(args: argparse.Namespace, config: AppConfig) -> int:
+    llm = DeepSeekLLM(config)
+    engine = DuckDBGraphQueryEngine(config.data_dir / "graph")
+    agent = GraphQueryAgent(llm, engine)
+    result = agent.run(args.question, limit=args.limit)
+    console.print(f"[bold]SQL:[/bold] {result.sql}")
+    if result.assumptions:
+        console.print(f"[bold]Assumptions:[/bold] {'; '.join(result.assumptions)}")
+    console.print(format_graph_query_result(result))
+    return 0
+
+
+def run_graph_estimate(args: argparse.Namespace, config: AppConfig) -> int:
+    llm = DeepSeekLLM(config)
+    engine = DuckDBGraphQueryEngine(config.data_dir / "graph")
+    agent = GraphEstimateAgent(llm, engine)
+    result = agent.run(args.question, limit=args.limit, persist=not args.dry_run)
+    console.print(format_graph_estimate_result(result))
     return 0
 
 
@@ -266,6 +326,14 @@ def main() -> int:
         return run_replay(args, config)
     if args.command == "graph-backfill":
         return run_graph_backfill(args, config)
+    if args.command == "graph-sql":
+        return run_graph_sql(args, config)
+    if args.command == "graph-schema":
+        return run_graph_schema(config)
+    if args.command == "graph-ask":
+        return run_graph_ask(args, config)
+    if args.command == "graph-estimate":
+        return run_graph_estimate(args, config)
     if args.command == "coscientist":
         return run_coscientist_command(args, config)
     if args.command == "coscientist-reflect":

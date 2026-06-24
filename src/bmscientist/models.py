@@ -153,6 +153,7 @@ GRAPH_ENRICHMENT_EDGE_TYPES = (
     "Market_HAS_APPLICATION_Application",
     "Market_HAS_COMPANY_Company",
     "Company_PRODUCES_Product",
+    "Product_BELONGS_TO_MaterialFamily",
 )
 
 
@@ -173,9 +174,11 @@ class GraphEnrichmentProposal(BaseModel):
         "Market_HAS_APPLICATION_Application",
         "Market_HAS_COMPANY_Company",
         "Company_PRODUCES_Product",
+        "Product_BELONGS_TO_MaterialFamily",
     ]
     product_name: str | None = None
     product_aliases: list[str] = Field(default_factory=list)
+    material_family_name: str | None = None
     application_name: str | None = None
     market_name: str | None = None
     company_name: str | None = None
@@ -208,6 +211,32 @@ class GraphEnrichmentProposalOutput(BaseModel):
     proposals: list[GraphEnrichmentProposal] = Field(default_factory=list)
 
 
+class GraphEnrichmentFollowUpQuestion(BaseModel):
+    source_chunk_id: str
+    question: str
+    rationale: str = Field(default="")
+    target_edge_types: list[str] = Field(default_factory=list)
+
+    @field_validator("target_edge_types", mode="before")
+    @classmethod
+    def default_target_edge_types(cls, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return value
+
+
+class GraphEnrichmentExpansionOutput(BaseModel):
+    follow_up_questions: list[GraphEnrichmentFollowUpQuestion] = Field(default_factory=list)
+    proposals: list[GraphEnrichmentProposal] = Field(default_factory=list)
+
+    @field_validator("follow_up_questions", "proposals", mode="before")
+    @classmethod
+    def default_expansion_lists(cls, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return value
+
+
 class GraphEnrichmentValidation(BaseModel):
     proposal_id: str
     accepted: bool
@@ -219,9 +248,11 @@ class GraphEnrichmentValidation(BaseModel):
         "Market_HAS_APPLICATION_Application",
         "Market_HAS_COMPANY_Company",
         "Company_PRODUCES_Product",
+        "Product_BELONGS_TO_MaterialFamily",
     ] | None = None
     corrected_relationship_role: str | None = None
     corrected_product_aliases: list[str] = Field(default_factory=list)
+    corrected_material_family_name: str | None = None
     corrected_metrics: list[GraphEnrichmentMetric] = Field(default_factory=list)
     corrected_critical_to_quality: list[str] = Field(default_factory=list)
 
@@ -320,6 +351,49 @@ class CTQMappingProposal(BaseModel):
     review_reason: str = Field(default="")
 
 
+class GraphTableSchema(BaseModel):
+    table_name: str
+    parquet_path: str
+    columns: list[str] = Field(default_factory=list)
+
+
+class GraphQueryPlan(BaseModel):
+    sql: str
+    rationale: str = Field(default="")
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class GraphEntityMatch(BaseModel):
+    node_label: str
+    node_id: str
+    name: str
+    matched_text: str
+    score: float = Field(ge=0.0, le=1.0)
+    match_basis: str
+
+
+class GraphEntityMatchBuckets(BaseModel):
+    materials: list[GraphEntityMatch] = Field(default_factory=list)
+    markets: list[GraphEntityMatch] = Field(default_factory=list)
+    applications: list[GraphEntityMatch] = Field(default_factory=list)
+    companies: list[GraphEntityMatch] = Field(default_factory=list)
+    ctqs: list[GraphEntityMatch] = Field(default_factory=list)
+    endpoints: list[GraphEntityMatch] = Field(default_factory=list)
+    other: list[GraphEntityMatch] = Field(default_factory=list)
+
+
+class GraphQueryResult(BaseModel):
+    sql: str
+    rationale: str = Field(default="")
+    assumptions: list[str] = Field(default_factory=list)
+    matched_entities: list[GraphEntityMatch] = Field(default_factory=list)
+    matched_entity_buckets: GraphEntityMatchBuckets = Field(default_factory=GraphEntityMatchBuckets)
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+
+
 class DiscoverySummary(BaseModel):
     run_id: str
     original_query: str
@@ -331,6 +405,9 @@ class DiscoverySummary(BaseModel):
     stored_chunks: int
     graph_enrichment_proposals: int = 0
     graph_enrichment_accepted: int = 0
+    graph_enrichment_follow_up_questions: int = 0
+    graph_enrichment_expansion_proposals: int = 0
+    graph_enrichment_external_search_queries: int = 0
     opportunity_summary: str
     notable_applications: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)

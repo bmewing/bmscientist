@@ -1,4 +1,7 @@
+import json
 from datetime import datetime, timezone
+
+import pyarrow.parquet as pq
 
 from bmscientist.config import AppConfig
 from bmscientist.price_cache import PriceCacheDocument, PriceCacheEntry, StructuredPriceCache
@@ -210,3 +213,48 @@ def test_fetch_fx_rate_accepts_uppercase_eur_key(tmp_path):
 
     assert rate == 1.25
     assert fetched_at is not None
+
+
+def test_sync_graph_baseline_prices_updates_material_nodes(tmp_path):
+    graph_path = tmp_path / "graph"
+    cache = StructuredPriceCache(
+        AppConfig(deepseek_api_key="x", exa_api_key="y"),
+        cache_path=tmp_path / "prices.json",
+        graph_path=graph_path,
+    )
+    document = PriceCacheDocument(
+        fetched_at=datetime.now(timezone.utc),
+        eur_usd_rate=1.1,
+        entries=[
+            PriceCacheEntry(
+                source="average_resin",
+                page_url="https://example.com/avg",
+                label="Average resin prices",
+                polymer_name="ABS",
+                normalized_polymer="abs",
+                price_eur_per_kg=3.15,
+                price_usd_per_kg=3.465,
+                raw_price_text="3.15 EUR/kg",
+                fetched_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+
+    cache.sync_graph_baseline_prices(document)
+
+    family_rows = pq.read_table(graph_path / "nodes" / "MaterialFamily.parquet").to_pylist()
+    product_rows = pq.read_table(graph_path / "nodes" / "Product.parquet").to_pylist()
+    alias_rows = pq.read_table(graph_path / "nodes" / "MaterialAlias.parquet").to_pylist()
+
+    assert family_rows[0]["name"] == "ABS"
+    assert family_rows[0]["baseline_price_value"] == 3.465
+    assert family_rows[0]["baseline_price_currency"] == "USD"
+    assert family_rows[0]["baseline_price_basis"] == "average_resin"
+    assert family_rows[0]["baseline_price_region"] == "Europe"
+
+    assert product_rows[0]["name"] == "ABS"
+    assert product_rows[0]["baseline_price_value"] == 3.465
+    assert "Acrylonitrile Butadiene Styrene" in json.loads(product_rows[0]["aliases_json"])
+
+    assert any(row["alias_text"] == "Acrylonitrile Butadiene Styrene" for row in alias_rows)
+    assert all(row["canonical_node_label"] == "MaterialFamily" for row in alias_rows)

@@ -131,6 +131,14 @@ Search local evidence:
 .\.venv\Scripts\python.exe -m bmscientist search --query "Where is PVC used in clear rigid applications?" --top-k 8
 ```
 
+Inspect and query the local graph with DuckDB:
+
+```powershell
+.\.venv\Scripts\python.exe -m bmscientist graph-schema
+.\.venv\Scripts\python.exe -m bmscientist graph-sql --sql "SELECT name, product_id FROM Product ORDER BY name LIMIT 20"
+.\.venv\Scripts\python.exe -m bmscientist graph-ask --question "Show me the material grades linked to Tritan"
+```
+
 Manually obtained files can be dropped into the configured data directory: `data/manually-obtained/`. Workflows ingest them and move processed files to `data/manually-obtained/processed/`.
 
 ### 2. Co-Scientist Workflow

@@ -48,9 +48,10 @@ class PriceCacheDocument(BaseModel):
 
 
 class StructuredPriceCache:
-    def __init__(self, config: AppConfig, cache_path: Path | None = None):
+    def __init__(self, config: AppConfig, cache_path: Path | None = None, graph_path: Path | None = None):
         self._config = config
         self._cache_path = cache_path if cache_path is not None else DEFAULT_PRICE_CACHE_PATH
+        self._graph_path = graph_path
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": config.user_agent})
@@ -58,12 +59,14 @@ class StructuredPriceCache:
     def ensure_fresh(self, max_age_days: int = 7) -> PriceCacheDocument:
         cached = self.load()
         if cached and datetime.now(timezone.utc) - cached.fetched_at < timedelta(days=max_age_days):
+            self.sync_graph_baseline_prices(cached)
             return cached
         try:
             return self.refresh(existing=cached)
         except Exception:
             if cached is not None:
                 LOGGER.exception("Structured price cache refresh failed; using stale cached prices")
+                self.sync_graph_baseline_prices(cached)
                 return cached
             raise
 
@@ -88,6 +91,7 @@ class StructuredPriceCache:
             entries=entries,
         )
         self._cache_path.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+        self.sync_graph_baseline_prices(document)
         LOGGER.info("Updated structured price cache with %s entries", len(entries))
         return document
 
@@ -185,7 +189,7 @@ class StructuredPriceCache:
         document: PriceCacheDocument | None = None,
     ) -> list[PriceCacheEntry]:
         document = document or self.ensure_fresh()
-        target_aliases = set(self._aliases_for_material(material_name))
+        target_aliases = {self._normalize_text(alias) for alias in self._aliases_for_material(material_name)}
         ranked: list[tuple[int, PriceCacheEntry]] = []
         for entry in document.entries:
             score = self._match_score(target_aliases, entry.normalized_polymer)
@@ -194,10 +198,52 @@ class StructuredPriceCache:
         ranked.sort(key=lambda item: (item[0], item[1].fetched_at.isoformat(), item[1].source == "average_resin"), reverse=True)
         return [entry for _, entry in ranked]
 
+    def sync_graph_baseline_prices(self, document: PriceCacheDocument) -> None:
+        from bmscientist.graph_enrichment import GraphEnrichmentStore
+
+        store = GraphEnrichmentStore(self._graph_path) if self._graph_path is not None else GraphEnrichmentStore()
+        for entry in self._preferred_entries(document):
+            usd_value, usd_is_inferred = self._usd_price_for_entry(entry, document)
+            aliases = self._aliases_for_material(entry.polymer_name)
+            family_type = "commodity_subfamily" if len(entry.normalized_polymer.split()) > 1 else "commodity_resin"
+            store.sync_material_baseline_price(
+                entry.polymer_name,
+                aliases=aliases,
+                family_type=family_type,
+                price_value=usd_value,
+                price_currency="USD" if usd_value is not None else None,
+                price_unit="kg",
+                price_year=document.fetched_at.year,
+                price_region="Europe",
+                price_basis=entry.source,
+                price_source=PRICE_EVIDENCE_SOURCE_TITLE,
+                price_source_url=entry.page_url,
+                price_source_label=entry.label,
+                price_confidence=0.8 if not usd_is_inferred else 0.65,
+                alias_type="pricing_cache_synonym",
+                source_vendor="plasticportal",
+                evidence_hash=f"price-cache:{entry.source}:{entry.normalized_polymer}:{entry.label}",
+                description=f"Baseline price synced from {PRICE_EVIDENCE_SOURCE_TITLE}.",
+            )
+
     def _fetch_text(self, url: str) -> str:
         response = self._session.get(url, timeout=self._config.request_timeout_seconds)
         response.raise_for_status()
         return response.text
+
+    @staticmethod
+    def _preferred_entries(document: PriceCacheDocument) -> list[PriceCacheEntry]:
+        grouped: dict[str, PriceCacheEntry] = {}
+        for entry in document.entries:
+            existing = grouped.get(entry.normalized_polymer)
+            if existing is None or StructuredPriceCache._entry_priority(entry) > StructuredPriceCache._entry_priority(existing):
+                grouped[entry.normalized_polymer] = entry
+        return list(grouped.values())
+
+    @staticmethod
+    def _entry_priority(entry: PriceCacheEntry) -> tuple[int, str]:
+        source_priority = 2 if entry.source == "average_resin" else 1
+        return (source_priority, entry.fetched_at.isoformat())
 
     @staticmethod
     def _usd_price_for_entry(
@@ -340,46 +386,46 @@ class StructuredPriceCache:
 
     def _aliases_for_material(self, material_name: str) -> list[str]:
         normalized = self._normalize_text(material_name)
-        aliases = {normalized}
+        aliases = {material_name.strip()}
         canonical_aliases = {
-            "polyvinyl chloride": ["pvc"],
-            "pvc": ["polyvinyl chloride"],
-            "polyethylene terephthalate": ["pet"],
-            "pet": ["polyethylene terephthalate"],
-            "petg": ["pet", "pet g", "pet-g", "polyethylene terephthalate glycol"],
-            "polyethylene terephthalate glycol": ["petg", "pet g", "pet-g", "pet"],
-            "high impact polystyrene": ["hips", "ps impact", "polystyrene"],
-            "hips": ["high impact polystyrene", "ps impact", "polystyrene"],
-            "general purpose polystyrene": ["gpps", "ps crystal", "polystyrene"],
-            "gpps": ["general purpose polystyrene", "ps crystal", "polystyrene"],
-            "polystyrene": ["ps", "ps impact", "ps crystal", "hips", "gpps"],
-            "ps": ["polystyrene", "ps impact", "ps crystal"],
-            "styrene acrylonitrile": ["san"],
-            "san": ["styrene acrylonitrile"],
-            "acrylonitrile butadiene styrene": ["abs"],
-            "abs": ["acrylonitrile butadiene styrene"],
-            "polycarbonate": ["pc"],
-            "pc": ["polycarbonate"],
-            "polyamide": ["pa"],
-            "pa": ["polyamide"],
-            "pmma": ["acrylic"],
-            "polyoxymethylene": ["pom"],
-            "pom": ["polyoxymethylene"],
-            "polybutylene terephthalate": ["pbt"],
-            "pbt": ["polybutylene terephthalate"],
-            "polypropylene": ["pp", "pp homo", "pp copo"],
-            "pp": ["polypropylene", "pp homo", "pp copo"],
-            "high density polyethylene": ["hdpe"],
-            "hdpe": ["high density polyethylene"],
-            "low density polyethylene": ["ldpe"],
-            "ldpe": ["low density polyethylene"],
-            "linear low density polyethylene": ["lldpe"],
-            "lldpe": ["linear low density polyethylene"],
+            "polyvinyl chloride": ["PVC"],
+            "pvc": ["Polyvinyl Chloride"],
+            "polyethylene terephthalate": ["PET"],
+            "pet": ["Polyethylene Terephthalate"],
+            "petg": ["PET", "PET G", "PET-G", "Polyethylene Terephthalate Glycol"],
+            "polyethylene terephthalate glycol": ["PETG", "PET G", "PET-G", "PET"],
+            "high impact polystyrene": ["HIPS", "PS impact", "Polystyrene"],
+            "hips": ["High Impact Polystyrene", "PS impact", "Polystyrene"],
+            "general purpose polystyrene": ["GPPS", "PS crystal", "Polystyrene"],
+            "gpps": ["General Purpose Polystyrene", "PS crystal", "Polystyrene"],
+            "polystyrene": ["PS", "PS impact", "PS crystal", "HIPS", "GPPS"],
+            "ps": ["Polystyrene", "PS impact", "PS crystal"],
+            "styrene acrylonitrile": ["SAN"],
+            "san": ["Styrene Acrylonitrile"],
+            "acrylonitrile butadiene styrene": ["ABS"],
+            "abs": ["Acrylonitrile Butadiene Styrene"],
+            "polycarbonate": ["PC"],
+            "pc": ["Polycarbonate"],
+            "polyamide": ["PA"],
+            "pa": ["Polyamide"],
+            "pmma": ["Acrylic"],
+            "polyoxymethylene": ["POM"],
+            "pom": ["Polyoxymethylene"],
+            "polybutylene terephthalate": ["PBT"],
+            "pbt": ["Polybutylene Terephthalate"],
+            "polypropylene": ["PP", "PP homo", "PP copo"],
+            "pp": ["Polypropylene", "PP homo", "PP copo"],
+            "high density polyethylene": ["HDPE"],
+            "hdpe": ["High Density Polyethylene"],
+            "low density polyethylene": ["LDPE"],
+            "ldpe": ["Low Density Polyethylene"],
+            "linear low density polyethylene": ["LLDPE"],
+            "lldpe": ["Linear Low Density Polyethylene"],
         }
         for key, values in canonical_aliases.items():
             if self._contains_alias(normalized, key):
                 aliases.update(values)
-        return sorted({self._normalize_text(alias) for alias in aliases if alias})
+        return sorted({alias.strip() for alias in aliases if alias and alias.strip()}, key=str.lower)
 
     @staticmethod
     def _contains_alias(normalized_text: str, normalized_alias: str) -> bool:

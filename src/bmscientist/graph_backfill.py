@@ -9,7 +9,12 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_enrichment import (
+    GraphEnrichmentExpander,
+    GraphEnrichmentProposer,
+    GraphEnrichmentStore,
+    GraphEnrichmentValidator,
+)
 from bmscientist.models import ChunkRecord
 from bmscientist.store import LanceEvidenceStore
 
@@ -35,12 +40,14 @@ class LanceGraphBackfiller:
         store: LanceEvidenceStore,
         proposer: GraphEnrichmentProposer,
         validator: GraphEnrichmentValidator,
+        expander: GraphEnrichmentExpander,
         graph_store: GraphEnrichmentStore,
         data_dir: Path | None = None,
     ):
         self._store = store
         self._proposer = proposer
         self._validator = validator
+        self._expander = expander
         self._graph_store = graph_store
         self._data_dir = data_dir if data_dir is not None else DEFAULT_DATA_DIR
 
@@ -76,22 +83,29 @@ class LanceGraphBackfiller:
             batches += 1
             proposals = self._proposer.propose(query, batch, limit=batch_size)
             validations = self._validator.validate(proposals, batch)
-            accepted = self._graph_store.write(proposals, validations, run_id, query)
-            total_proposed += len(proposals)
+            follow_up_questions, expanded = self._expander.expand(query, proposals, validations, batch)
+            expanded_validations = self._validator.validate(expanded, batch) if expanded else []
+            all_proposals = [*proposals, *expanded]
+            all_validations = [*validations, *expanded_validations]
+            accepted = self._graph_store.write(all_proposals, all_validations, run_id, query)
+            total_proposed += len(all_proposals)
             total_accepted += accepted
             details.append(
                 {
                     "batch": batches,
                     "chunk_ids": [record.id for record in batch],
-                    "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
-                    "validations": [validation.model_dump(mode="json") for validation in validations],
+                    "proposals": [proposal.model_dump(mode="json") for proposal in all_proposals],
+                    "validations": [validation.model_dump(mode="json") for validation in all_validations],
+                    "follow_up_questions": [question.model_dump(mode="json") for question in follow_up_questions],
+                    "initial_proposal_count": len(proposals),
+                    "expansion_proposal_count": len(expanded),
                     "accepted": accepted,
                 }
             )
             LOGGER.info(
                 "Graph backfill batch %s produced %s proposals and %s accepted claims",
                 batches,
-                len(proposals),
+                len(all_proposals),
                 accepted,
             )
 

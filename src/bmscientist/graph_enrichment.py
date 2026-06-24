@@ -19,6 +19,8 @@ import pyarrow.parquet as pq
 
 from bmscientist.models import (
     ChunkRecord,
+    GraphEnrichmentExpansionOutput,
+    GraphEnrichmentFollowUpQuestion,
     GraphEnrichmentMetric,
     GraphEnrichmentProposal,
     GraphEnrichmentProposalOutput,
@@ -130,6 +132,7 @@ class GraphEnrichmentProposer:
                     "evidence_hash": evidence_hash,
                 }
             )
+            enriched = normalize_graph_enrichment_entities(enriched, record)
             normalized.setdefault(proposal_id, enriched)
         return list(normalized.values())
 
@@ -162,6 +165,66 @@ class GraphEnrichmentValidator:
         output = self._llm.complete_json(GraphEnrichmentValidationOutput, system_prompt, user_prompt)
         known_ids = {proposal.proposal_id for proposal in proposals if proposal.proposal_id}
         return [validation for validation in output.validations if validation.proposal_id in known_ids]
+
+
+class GraphEnrichmentExpander:
+    def __init__(self, llm):
+        self._llm = llm
+
+    def expand(
+        self,
+        original_query: str,
+        proposals: list[GraphEnrichmentProposal],
+        validations: list[GraphEnrichmentValidation],
+        records: list[ChunkRecord],
+        *,
+        max_questions_per_chunk: int = 3,
+    ) -> tuple[list[GraphEnrichmentFollowUpQuestion], list[GraphEnrichmentProposal]]:
+        if not proposals or not validations or not records:
+            return [], []
+
+        records_by_id = {record.id: record for record in records}
+        proposals_by_id = {proposal.proposal_id: proposal for proposal in proposals if proposal.proposal_id}
+        accepted_by_chunk: dict[str, list[GraphEnrichmentProposal]] = {}
+        for validation in validations:
+            if not validation.accepted or validation.confidence_score < 0.6:
+                continue
+            proposal = proposals_by_id.get(validation.proposal_id)
+            if proposal is None or proposal.source_chunk_id not in records_by_id:
+                continue
+            accepted_by_chunk.setdefault(proposal.source_chunk_id, []).append(proposal)
+
+        if not accepted_by_chunk:
+            return [], []
+
+        existing_ids = {proposal.proposal_id for proposal in proposals if proposal.proposal_id}
+        all_questions: list[GraphEnrichmentFollowUpQuestion] = []
+        expanded: list[GraphEnrichmentProposal] = []
+
+        for chunk_id, accepted in accepted_by_chunk.items():
+            record = records_by_id[chunk_id]
+            system_prompt = PROMPTS.render("graph_enrichment_agent", "expand.system")
+            user_prompt = PROMPTS.render(
+                "graph_enrichment_agent",
+                "expand.user",
+                original_query=original_query,
+                max_questions_per_chunk=max_questions_per_chunk,
+                evidence_json=json.dumps(GraphEnrichmentProposer._evidence_row(record), indent=2),
+                accepted_proposals_json=json.dumps([proposal.model_dump(mode="json") for proposal in accepted], indent=2),
+            )
+            output = self._llm.complete_json(GraphEnrichmentExpansionOutput, system_prompt, user_prompt)
+            normalized = GraphEnrichmentProposer._normalize_proposals(output.proposals, [record])
+            for proposal in normalized:
+                if proposal.proposal_id and proposal.proposal_id not in existing_ids:
+                    expanded.append(proposal)
+                    existing_ids.add(proposal.proposal_id)
+            for question in output.follow_up_questions[:max_questions_per_chunk]:
+                all_questions.append(
+                    question.model_copy(update={"source_chunk_id": question.source_chunk_id or chunk_id})
+                    if question.source_chunk_id != chunk_id
+                    else question
+                )
+        return all_questions, expanded
 
 
 class GraphEnrichmentStore:
@@ -218,6 +281,7 @@ class GraphEnrichmentStore:
                     "edge_type": proposal.edge_type,
                     "product_name": proposal.product_name,
                     "product_aliases_json": json.dumps(effective_product_aliases(proposal, validation), sort_keys=True),
+                    "material_family_name": effective_material_family_name(proposal, validation),
                     "application_name": proposal.application_name,
                     "market_name": proposal.market_name,
                     "company_name": proposal.company_name,
@@ -280,6 +344,37 @@ class GraphEnrichmentStore:
             market_id = self._ensure_market(proposal.market_name)
             company_id = self._ensure_node("Company", proposal.company_name, "company_id", None)
             self._append_market_company_edge(proposal, validation, market_id, company_id)
+        elif edge_type == "Product_BELONGS_TO_MaterialFamily":
+            product_id = self._ensure_product_node(proposal, validation)
+            material_family_name = effective_material_family_name(proposal, validation)
+            material_family_id = self.ensure_material_family(material_family_name or "Unknown", canonical_name=material_family_name or "Unknown")
+            self.append_product_material_family_edge(
+                product_id,
+                material_family_id,
+                relationship_role=validation.corrected_relationship_role or proposal.relationship_role or "base_family",
+                source_url=proposal.source_url,
+                source_title=proposal.source_title,
+                evidence_hash=proposal.evidence_hash,
+                supporting_quote=proposal.supporting_quote,
+                confidence=validation.confidence_score,
+                validation_status="accepted",
+            )
+
+        material_family_name = effective_material_family_name(proposal, validation)
+        if proposal.product_name and material_family_name:
+            product_id = self._ensure_product_node(proposal, validation)
+            material_family_id = self.ensure_material_family(material_family_name, canonical_name=material_family_name)
+            self.append_product_material_family_edge(
+                product_id,
+                material_family_id,
+                relationship_role="base_family",
+                source_url=proposal.source_url,
+                source_title=proposal.source_title,
+                evidence_hash=proposal.evidence_hash,
+                supporting_quote=proposal.supporting_quote,
+                confidence=validation.confidence_score,
+                validation_status="accepted",
+            )
 
     def _ensure_market(self, market_name: str | None) -> str:
         return self._ensure_node("Market", market_name, "market_id", None)
@@ -426,6 +521,139 @@ class GraphEnrichmentStore:
             write_rows(path, list(rows.values()), schema)
         return alias_id
 
+    def set_node_baseline_price(
+        self,
+        label: str,
+        node_id: str,
+        *,
+        price_value: float | None,
+        price_currency: str | None,
+        price_unit: str | None,
+        price_year: int | None,
+        price_region: str | None,
+        price_basis: str | None,
+        price_source: str | None,
+        price_source_url: str | None,
+        price_source_label: str | None,
+        price_confidence: float | None,
+        price_updated_at: str | None = None,
+    ) -> None:
+        key = {
+            "Product": "product_id",
+            "MaterialFamily": "material_family_id",
+            "MaterialGrade": "material_grade_id",
+        }.get(label)
+        if key is None:
+            raise ValueError(f"Baseline pricing is not supported for node label {label!r}")
+
+        path = self._nodes_path / f"{label}.parquet"
+        schema = NODE_SCHEMAS[label]
+        with FileLock(path):
+            rows = rows_by_key(path, schema, key)
+            existing = rows.get(node_id)
+            if existing is None:
+                raise KeyError(f"Cannot set baseline price for missing {label} node {node_id}")
+            existing.update(
+                {
+                    "baseline_price_value": price_value,
+                    "baseline_price_currency": price_currency,
+                    "baseline_price_unit": price_unit,
+                    "baseline_price_year": price_year,
+                    "baseline_price_region": price_region,
+                    "baseline_price_basis": price_basis,
+                    "baseline_price_source": price_source,
+                    "baseline_price_source_url": price_source_url,
+                    "baseline_price_source_label": price_source_label,
+                    "baseline_price_confidence": price_confidence,
+                    "baseline_price_updated_at": price_updated_at or now_iso(),
+                    "updated_at": now_iso(),
+                }
+            )
+            rows[node_id] = existing
+            write_rows(path, list(rows.values()), schema)
+
+    def sync_material_baseline_price(
+        self,
+        canonical_name: str,
+        *,
+        aliases: list[str] | None = None,
+        family_type: str = "commodity_resin",
+        price_value: float | None,
+        price_currency: str | None,
+        price_unit: str | None,
+        price_year: int | None,
+        price_region: str | None,
+        price_basis: str | None,
+        price_source: str | None,
+        price_source_url: str | None,
+        price_source_label: str | None,
+        price_confidence: float | None,
+        alias_type: str = "canonical_synonym",
+        source_vendor: str | None = None,
+        evidence_hash: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, str]:
+        cleaned_aliases = sorted({alias.strip() for alias in aliases or [] if alias and alias.strip()}, key=str.lower)
+        family_id = self.ensure_material_family(
+            canonical_name,
+            canonical_name=canonical_name,
+            family_type=family_type,
+            aliases=cleaned_aliases,
+            alias_sources={
+                "baseline_price_sync": {
+                    "source": price_source,
+                    "source_url": price_source_url,
+                    "label": price_source_label,
+                }
+            },
+            description=description,
+        )
+        self.set_node_baseline_price(
+            "MaterialFamily",
+            family_id,
+            price_value=price_value,
+            price_currency=price_currency,
+            price_unit=price_unit,
+            price_year=price_year,
+            price_region=price_region,
+            price_basis=price_basis,
+            price_source=price_source,
+            price_source_url=price_source_url,
+            price_source_label=price_source_label,
+            price_confidence=price_confidence,
+        )
+
+        product_id = self._ensure_node("Product", canonical_name, "product_id", "product", aliases=cleaned_aliases)
+        self.set_node_baseline_price(
+            "Product",
+            product_id,
+            price_value=price_value,
+            price_currency=price_currency,
+            price_unit=price_unit,
+            price_year=price_year,
+            price_region=price_region,
+            price_basis=price_basis,
+            price_source=price_source,
+            price_source_url=price_source_url,
+            price_source_label=price_source_label,
+            price_confidence=price_confidence,
+        )
+
+        for alias in cleaned_aliases:
+            self.ensure_material_alias(
+                alias,
+                family_id,
+                "MaterialFamily",
+                alias_type=alias_type,
+                source_vendor=source_vendor,
+                source_url=price_source_url,
+                evidence_hash=evidence_hash,
+                confidence=price_confidence or 0.7,
+                validation_status="accepted",
+            )
+
+        return {"material_family_id": family_id, "product_id": product_id}
+
     def _ensure_product_node(self, proposal: GraphEnrichmentProposal, validation: GraphEnrichmentValidation) -> str:
         aliases = effective_product_aliases(proposal, validation)
         canonical_name = canonical_product_name(proposal.product_name, aliases)
@@ -437,7 +665,14 @@ class GraphEnrichmentStore:
             },
             key=str.lower,
         )
-        return self._ensure_node("Product", canonical_name, "product_id", "product", aliases=product_aliases)
+        return self._ensure_node(
+            "Product",
+            canonical_name,
+            "product_id",
+            "product",
+            aliases=product_aliases,
+            extra_fields={"product_family": effective_material_family_name(proposal, validation)},
+        )
 
     def _ensure_node(
         self,
@@ -1460,6 +1695,44 @@ class GraphEnrichmentStore:
             "edge_id",
         )
 
+    def append_product_material_family_edge(
+        self,
+        product_id: str,
+        material_family_id: str,
+        *,
+        relationship_role: str = "base_family",
+        source_url: str | None = None,
+        source_title: str | None = None,
+        evidence_hash: str | None = None,
+        supporting_quote: str = "",
+        confidence: float = 1.0,
+        validation_status: str = "accepted",
+    ) -> None:
+        now = now_iso()
+        row = empty_row(PRODUCT_MATERIAL_FAMILY_SCHEMA)
+        row.update(
+            {
+                "edge_id": stable_id("Product_BELONGS_TO_MaterialFamily", product_id, material_family_id, evidence_hash or ""),
+                "product_id": product_id,
+                "material_family_id": material_family_id,
+                "relationship_role": relationship_role,
+                "source_url": source_url,
+                "source_title": source_title,
+                "evidence_hash": evidence_hash,
+                "supporting_quote": supporting_quote,
+                "confidence": confidence,
+                "validation_status": validation_status,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        self._append_unique_rows(
+            self._edges_path / "Product_BELONGS_TO_MaterialFamily.parquet",
+            [row],
+            PRODUCT_MATERIAL_FAMILY_SCHEMA,
+            "edge_id",
+        )
+
     def append_product_material_grade_edge(
         self,
         product_id: str,
@@ -1989,6 +2262,87 @@ def market_id_or_none(market_name: str | None) -> str | None:
     return f"market:{slugify(market_name)}"
 
 
+MATERIAL_FAMILY_ALIASES: dict[str, str] = {
+    "abs": "ABS",
+    "acrylonitrile butadiene styrene": "ABS",
+    "polycarbonate": "Polycarbonate",
+    "pc": "Polycarbonate",
+    "pet": "PET",
+    "polyethylene terephthalate": "PET",
+    "petg": "PETG",
+    "polyethylene terephthalate glycol": "PETG",
+    "pvc": "PVC",
+    "polyvinyl chloride": "PVC",
+    "pmma": "PMMA",
+    "acrylic": "PMMA",
+    "polymethyl methacrylate": "PMMA",
+    "pp": "Polypropylene",
+    "polypropylene": "Polypropylene",
+    "hips": "High Impact Polystyrene",
+    "high impact polystyrene": "High Impact Polystyrene",
+    "gpps": "General Purpose Polystyrene",
+    "general purpose polystyrene": "General Purpose Polystyrene",
+    "polystyrene": "Polystyrene",
+    "ps": "Polystyrene",
+    "hdpe": "HDPE",
+    "high density polyethylene": "HDPE",
+    "ldpe": "LDPE",
+    "low density polyethylene": "LDPE",
+    "lldpe": "LLDPE",
+    "linear low density polyethylene": "LLDPE",
+    "pom": "POM",
+    "polyoxymethylene": "POM",
+    "pbt": "PBT",
+    "polybutylene terephthalate": "PBT",
+    "pa": "Polyamide",
+    "polyamide": "Polyamide",
+    "san": "SAN",
+    "styrene acrylonitrile": "SAN",
+}
+
+PRODUCT_DESCRIPTOR_TERMS = {
+    "anti",
+    "clear",
+    "clarity",
+    "diffuser",
+    "diffusers",
+    "diffusing",
+    "diffusion",
+    "extruded",
+    "extrusion",
+    "film",
+    "food",
+    "frosted",
+    "grade",
+    "heat",
+    "high",
+    "impact",
+    "injection",
+    "lens",
+    "lenses",
+    "light",
+    "matte",
+    "medical",
+    "molded",
+    "moulded",
+    "opaque",
+    "optical",
+    "resistant",
+    "retardant",
+    "sheet",
+    "sheeting",
+    "sterile",
+    "thermoformed",
+    "thermoformable",
+    "thermoforming",
+    "transparent",
+    "tray",
+    "trays",
+    "uv",
+    "white",
+}
+
+
 def effective_metrics(proposal: GraphEnrichmentProposal, validation: GraphEnrichmentValidation) -> list[GraphEnrichmentMetric]:
     return validation.corrected_metrics or proposal.metrics
 
@@ -1997,8 +2351,12 @@ def effective_ctqs(proposal: GraphEnrichmentProposal, validation: GraphEnrichmen
     return validation.corrected_critical_to_quality or proposal.critical_to_quality
 
 
+def effective_material_family_name(proposal: GraphEnrichmentProposal, validation: GraphEnrichmentValidation) -> str | None:
+    return validation.corrected_material_family_name or proposal.material_family_name
+
+
 def effective_product_aliases(proposal: GraphEnrichmentProposal, validation: GraphEnrichmentValidation) -> list[str]:
-    aliases = validation.corrected_product_aliases or proposal.product_aliases
+    aliases = [*proposal.product_aliases, *(validation.corrected_product_aliases or [])]
     deduped: dict[str, str] = OrderedDict()
     for alias in aliases:
         text = str(alias or "").strip()
@@ -2022,6 +2380,103 @@ def canonical_product_name(product_name: str | None, aliases: list[str]) -> str 
 def is_probable_abbreviation(value: str) -> bool:
     text = re.sub(r"[^A-Za-z0-9]", "", value or "")
     return 1 < len(text) <= 5 and text.upper() == text
+
+
+def normalize_graph_enrichment_entities(
+    proposal: GraphEnrichmentProposal,
+    record: ChunkRecord,
+) -> GraphEnrichmentProposal:
+    updates: dict[str, Any] = {}
+    product_name = str(proposal.product_name or "").strip()
+    aliases = [str(item).strip() for item in proposal.product_aliases if str(item).strip()]
+
+    if proposal.edge_type == "Product_USED_IN_Application" and not proposal.application_name and record.application:
+        updates["application_name"] = record.application
+
+    normalized_family = canonical_material_family_name(proposal.material_family_name)
+    if normalized_family:
+        updates["material_family_name"] = normalized_family
+
+    if product_name:
+        split = split_trailing_material_family(product_name)
+        if split is not None:
+            prefix_text, material_family_name = split
+            merged_aliases = dedupe_texts([*aliases, product_name])
+            if looks_like_descriptor_prefix(prefix_text):
+                updates["product_name"] = material_family_name
+                updates["product_aliases"] = merged_aliases
+                if not proposal.application_name:
+                    updates["application_name"] = record.application or prefix_text
+                updates["material_family_name"] = None
+            else:
+                updates["product_name"] = prefix_text
+                updates["product_aliases"] = merged_aliases
+                updates["material_family_name"] = material_family_name
+        else:
+            canonical_family = canonical_material_family_name(product_name)
+            if canonical_family and normalize_name(product_name) != normalize_name(canonical_family):
+                updates["product_name"] = canonical_family
+                updates["product_aliases"] = dedupe_texts([*aliases, product_name])
+
+    final_product_name = str(updates.get("product_name") or product_name or "").strip()
+    final_material_family_name = updates.get("material_family_name")
+    if final_material_family_name is None and proposal.material_family_name:
+        final_material_family_name = canonical_material_family_name(proposal.material_family_name)
+    if final_product_name and final_material_family_name:
+        if normalize_name(str(final_material_family_name)) == normalize_name(final_product_name):
+            updates["material_family_name"] = None
+
+    return proposal.model_copy(update=updates) if updates else proposal
+
+
+def canonical_material_family_name(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return MATERIAL_FAMILY_ALIASES.get(normalize_name(text), text)
+
+
+def split_trailing_material_family(product_name: str) -> tuple[str, str] | None:
+    raw_tokens = [token for token in str(product_name or "").strip().split() if token]
+    if len(raw_tokens) < 2:
+        return None
+    normalized_tokens = [normalize_name(token) for token in raw_tokens]
+    alias_items = sorted(MATERIAL_FAMILY_ALIASES.items(), key=lambda item: len(item[0].split()), reverse=True)
+    for alias, canonical_name in alias_items:
+        alias_tokens = alias.split()
+        if len(alias_tokens) >= len(normalized_tokens):
+            continue
+        if normalized_tokens[-len(alias_tokens) :] == alias_tokens:
+            prefix_text = " ".join(raw_tokens[:-len(alias_tokens)]).strip()
+            if prefix_text:
+                return prefix_text, canonical_name
+    return None
+
+
+def looks_like_descriptor_prefix(prefix_text: str) -> bool:
+    raw_tokens = [token for token in str(prefix_text or "").strip().split() if token]
+    normalized_tokens = [normalize_name(token) for token in raw_tokens]
+    if not normalized_tokens:
+        return False
+    if any(any(ch.isdigit() for ch in token) for token in raw_tokens):
+        return False
+    if any(token.isupper() and len(token) > 1 for token in raw_tokens):
+        return False
+    if any(token[:1].isupper() for token in raw_tokens):
+        return False
+    return all(
+        token in PRODUCT_DESCRIPTOR_TERMS or token.endswith(("ing", "ion", "ers", "er", "al", "ic"))
+        for token in normalized_tokens
+    )
+
+
+def dedupe_texts(values: list[str]) -> list[str]:
+    deduped: "OrderedDict[str, str]" = OrderedDict()
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            deduped.setdefault(normalize_name(text), text)
+    return list(deduped.values())
 
 
 def parse_json_list(value: Any) -> list[str]:
@@ -2066,6 +2521,7 @@ CLAIM_SCHEMA = pa.schema(
         ("edge_type", pa.string()),
         ("product_name", pa.string()),
         ("product_aliases_json", pa.string()),
+        ("material_family_name", pa.string()),
         ("application_name", pa.string()),
         ("market_name", pa.string()),
         ("company_name", pa.string()),
@@ -2100,6 +2556,17 @@ PRODUCT_NODE_SCHEMA = pa.schema(
         ("inchi_key", pa.string()),
         ("cas_number", pa.string()),
         ("product_family", pa.string()),
+        ("baseline_price_value", pa.float64()),
+        ("baseline_price_currency", pa.string()),
+        ("baseline_price_unit", pa.string()),
+        ("baseline_price_year", pa.int32()),
+        ("baseline_price_region", pa.string()),
+        ("baseline_price_basis", pa.string()),
+        ("baseline_price_source", pa.string()),
+        ("baseline_price_source_url", pa.string()),
+        ("baseline_price_source_label", pa.string()),
+        ("baseline_price_confidence", pa.float64()),
+        ("baseline_price_updated_at", pa.string()),
         ("created_at", pa.string()),
         ("updated_at", pa.string()),
     ]
@@ -2153,6 +2620,17 @@ MATERIAL_FAMILY_NODE_SCHEMA = pa.schema(
         ("aliases_json", pa.string()),
         ("alias_sources_json", pa.string()),
         ("description", pa.string()),
+        ("baseline_price_value", pa.float64()),
+        ("baseline_price_currency", pa.string()),
+        ("baseline_price_unit", pa.string()),
+        ("baseline_price_year", pa.int32()),
+        ("baseline_price_region", pa.string()),
+        ("baseline_price_basis", pa.string()),
+        ("baseline_price_source", pa.string()),
+        ("baseline_price_source_url", pa.string()),
+        ("baseline_price_source_label", pa.string()),
+        ("baseline_price_confidence", pa.float64()),
+        ("baseline_price_updated_at", pa.string()),
         ("created_at", pa.string()),
         ("updated_at", pa.string()),
     ]
@@ -2177,6 +2655,17 @@ MATERIAL_GRADE_NODE_SCHEMA = pa.schema(
         ("property_table_json", pa.string()),
         ("raw_record_json", pa.string()),
         ("last_seen_at", pa.string()),
+        ("baseline_price_value", pa.float64()),
+        ("baseline_price_currency", pa.string()),
+        ("baseline_price_unit", pa.string()),
+        ("baseline_price_year", pa.int32()),
+        ("baseline_price_region", pa.string()),
+        ("baseline_price_basis", pa.string()),
+        ("baseline_price_source", pa.string()),
+        ("baseline_price_source_url", pa.string()),
+        ("baseline_price_source_label", pa.string()),
+        ("baseline_price_confidence", pa.float64()),
+        ("baseline_price_updated_at", pa.string()),
         ("created_at", pa.string()),
         ("updated_at", pa.string()),
     ]
@@ -2441,6 +2930,22 @@ MARKET_COMPANY_SCHEMA = pa.schema(
         ("source", pa.string()),
         ("queue_candidate", pa.bool_()),
         ("source_chunk_id", pa.string()),
+        ("evidence_hash", pa.string()),
+        ("supporting_quote", pa.string()),
+        ("confidence", pa.float64()),
+        ("validation_status", pa.string()),
+        ("created_at", pa.string()),
+        ("updated_at", pa.string()),
+    ]
+)
+PRODUCT_MATERIAL_FAMILY_SCHEMA = pa.schema(
+    [
+        ("edge_id", pa.string()),
+        ("product_id", pa.string()),
+        ("material_family_id", pa.string()),
+        ("relationship_role", pa.string()),
+        ("source_url", pa.string()),
+        ("source_title", pa.string()),
         ("evidence_hash", pa.string()),
         ("supporting_quote", pa.string()),
         ("confidence", pa.float64()),

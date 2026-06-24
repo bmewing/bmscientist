@@ -25,6 +25,7 @@ GRAPH_EVIDENCE_EDGE_TYPES = (
     "Market_IN_GEOGRAPHY_Geography",
     "Product_USED_IN_Application",
     "Company_PRODUCES_Product",
+    "Product_BELONGS_TO_MaterialFamily",
     "Market_HAS_COMPANY_Company",
     "Product_HAS_MaterialGrade",
     "MaterialGrade_BELONGS_TO_MaterialFamily",
@@ -219,6 +220,15 @@ class GraphMarketEvidence:
                 score += 4.0
             if self._node_tokens(product) & combined_terms:
                 score += 3.0
+            return score
+        if edge_type == "Product_BELONGS_TO_MaterialFamily":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            material_family = self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
+            score = 0.0
+            if self._node_tokens(product) & combined_terms:
+                score += 3.0
+            if self._node_tokens(material_family) & combined_terms:
+                score += 4.0
             return score
         if edge_type == "Product_HAS_MaterialGrade":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
@@ -437,6 +447,15 @@ class GraphMarketEvidence:
             if self._node_tokens(product) & goal_terms:
                 score += 3.0
             return score
+        if edge_type == "Product_BELONGS_TO_MaterialFamily":
+            product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+            material_family = self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
+            score = 0.0
+            if self._node_tokens(product) & goal_terms:
+                score += 3.0
+            if self._node_tokens(material_family) & goal_terms:
+                score += 4.0
+            return score
         if edge_type == "Product_HAS_MaterialGrade":
             product = self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
             material_grade = self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
@@ -605,6 +624,8 @@ class GraphMarketEvidence:
             return self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
         if edge_type == "Company_PRODUCES_Product":
             return self._nodes.get("Product", {}).get(str(edge.get("product_id")), {})
+        if edge_type == "Product_BELONGS_TO_MaterialFamily":
+            return self._nodes.get("MaterialFamily", {}).get(str(edge.get("material_family_id")), {})
         if edge_type == "Product_HAS_MaterialGrade":
             return self._nodes.get("MaterialGrade", {}).get(str(edge.get("material_grade_id")), {})
         if edge_type == "MaterialGrade_BELONGS_TO_MaterialFamily":
@@ -632,6 +653,7 @@ class GraphMarketEvidence:
     def _row_from_edge(self, edge_type: str, edge: dict[str, Any], score: float) -> dict[str, Any] | None:
         market = self._nodes.get("Market", {}).get(str(edge.get("market_id")), {})
         target = self._target_node(edge_type, edge)
+        application = self._nodes.get("Application", {}).get(str(edge.get("application_id")), {})
         if not market and edge_type in (
             "Market_HAS_APPLICATION_Application",
             "Market_USES_Product",
@@ -645,6 +667,7 @@ class GraphMarketEvidence:
             "Market_IN_GEOGRAPHY_Geography": "is measured in geography",
             "Product_USED_IN_Application": "is used in application",
             "Company_PRODUCES_Product": "produces product",
+            "Product_BELONGS_TO_MaterialFamily": "belongs to material family",
             "Product_HAS_MaterialGrade": "has material grade",
             "MaterialGrade_BELONGS_TO_MaterialFamily": "belongs to material family",
             "Company_PRODUCES_MaterialGrade": "produces material grade",
@@ -683,7 +706,7 @@ class GraphMarketEvidence:
             or market.get("canonical_url")
             or str(self._graph_path.resolve())
         )
-        subject_name = self._subject_name(edge_type, market, product, company, material_grade, ctq)
+        subject_name = self._subject_name(edge_type, market, application, product, company, material_grade, ctq)
         if edge_type in ("Product_HAS_Endpoint", "MaterialGrade_HAS_Endpoint"):
             endpoint_value_parts = [
                 f"value={edge.get('value_numeric')}" if edge.get("value_numeric") is not None else None,
@@ -709,13 +732,19 @@ class GraphMarketEvidence:
             "id": row_id,
             "source_url": source_url,
             "source_title": "Offline graph market data",
-            "application": target_name if edge_type in ("Market_HAS_APPLICATION_Application", "Product_USED_IN_Application") else None,
+            "application": (
+                target_name
+                if edge_type in ("Market_HAS_APPLICATION_Application", "Product_USED_IN_Application")
+                else application.get("name")
+                if edge_type == "Application_REQUIRES_CriticalToQuality"
+                else None
+            ),
             "incumbent_material": None,
             "candidate_materials": (
                 [target_name]
                 if edge_type == "Market_USES_Product" and target_name
                 else [product.get("name")]
-                if edge_type in ("Product_USED_IN_Application", "Product_HAS_ChemistryClass", "Product_HAS_Function", "Product_TARGETS_BinderSystem", "Product_HAS_Endpoint")
+                if edge_type in ("Product_USED_IN_Application", "Product_BELONGS_TO_MaterialFamily", "Product_HAS_ChemistryClass", "Product_HAS_Function", "Product_TARGETS_BinderSystem", "Product_HAS_Endpoint")
                 and product.get("name")
                 else [material_grade.get("name")]
                 if edge_type in ("Product_HAS_MaterialGrade", "MaterialGrade_BELONGS_TO_MaterialFamily", "Company_PRODUCES_MaterialGrade", "MaterialGrade_HAS_Endpoint")
@@ -778,13 +807,19 @@ class GraphMarketEvidence:
     def _subject_name(
         edge_type: str,
         market: dict[str, Any],
+        application: dict[str, Any],
         product: dict[str, Any],
         company: dict[str, Any],
         material_grade: dict[str, Any],
         ctq: dict[str, Any],
     ) -> str:
+        if edge_type == "Application_REQUIRES_CriticalToQuality":
+            return application.get("name")
+        if edge_type == "Company_PRODUCES_MaterialGrade":
+            return company.get("name")
         if edge_type in (
             "Product_USED_IN_Application",
+            "Product_BELONGS_TO_MaterialFamily",
             "Product_HAS_MaterialGrade",
             "MaterialGrade_HAS_Endpoint",
             "Product_HAS_ChemistryClass",
