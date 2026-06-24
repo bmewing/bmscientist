@@ -17,6 +17,10 @@ Return JSON with:
 - target_incumbent_materials (array of strings)
 - preferred_candidate_materials (array of strings)
 - candidate_material_preferences (array of strings)
+- candidate_origin_policy (one of: known_candidates, novel_candidates, novel_analogs, de_novo_design, unspecified)
+- novelty_requirements (array of strings)
+- known_candidate_exclusion_terms (array of strings)
+- novelty_check_policy (one of: none, name_only, identifier_lookup, substructure_similarity)
 - recycling_or_sustainability_angles (array of strings)
 - material_scope (array of strings)
 - application_scope (array of strings)
@@ -34,8 +38,11 @@ Return JSON with:
 Rules:
 - Be concise and specific. Do not invent constraints not implied by the goal.
 - Infer the right candidate representation for the goal. For molecule discovery or screening, prefer an artifact schema with identifiers such as `smiles`.
+- Detect whether the user wants known substitutions or newly designed candidates. Phrases such as "brand-new", "never before seen", "invent", "generate SMILES", or "not substitutions" should push toward `candidate_design` plus `candidate_origin_policy = de_novo_design` or `novel_analogs`.
+- If the user asks for existing replacements, drop-in substitutes, suppliers, or commercially available alternatives, keep the contract oriented toward `materials_opportunity` and `known_candidates`.
 - Keep `research_mode` as `materials_opportunity` when the goal is clearly about incumbent-material replacement in applications.
 - If the goal is broader, use the most fitting research mode and artifact schema.
+- For de novo molecule-design goals, treat known commercial materials as exclusions or benchmarks rather than final answers. For example, if the user asks for brand-new coalescing-aid SMILES, do not return existing coalescents such as propylene glycol n-butyl ether or ethyl 3-ethoxypropionate as the final candidates.
 - Evaluation criteria should explain what makes a good candidate and what evidence would be convincing.
 - Tool requests should be concrete capability requests, not instructions to execute code. Do not assume requested tools are installed.
 - Reflection guidance should help downstream reviewers know what to validate, what to falsify, and what missing evidence matters most.
@@ -64,6 +71,10 @@ Return JSON with:
 - target_incumbent_materials (array of strings)
 - preferred_candidate_materials (array of strings)
 - candidate_material_preferences (array of strings)
+- candidate_origin_policy (one of: known_candidates, novel_candidates, novel_analogs, de_novo_design, unspecified)
+- novelty_requirements (array of strings)
+- known_candidate_exclusion_terms (array of strings)
+- novelty_check_policy (one of: none, name_only, identifier_lookup, substructure_similarity)
 - recycling_or_sustainability_angles (array of strings)
 - material_scope (array of strings)
 - application_scope (array of strings)
@@ -82,3 +93,4 @@ Return JSON with:
 Rules:
 - Keep unmodified aspects of the original goals unless they conflict with the new feedback.
 - Preserve the existing research mode and generic contract unless the feedback clearly changes what kind of candidates or evaluation logic is needed.
+- If the feedback changes the request from substitution search to invention of new structures, update `candidate_origin_policy` accordingly and add novelty requirements instead of leaving the plan in replacement mode.

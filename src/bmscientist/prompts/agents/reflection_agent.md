@@ -71,6 +71,7 @@ Rules:
 - Each criterion result should include `criterion_name`, `value`, `unit`, `normalized_score`, `confidence`, `rationale`, `evidence_mode`, `tool_id`, `citation_chunk_ids`, `citation_urls`, and `is_inferred`.
 - `normalized_score` must always be on a 0.0 to 1.0 scale. If you reason in 1-5, 1-10, or percentage terms, convert before returning JSON.
 - If evidence is incomplete, you may provide conservative inferred estimates, but do not pretend a requested tool was actually run unless the evidence explicitly contains its output.
+- If the research configuration requires novel or de novo candidates, distinguish between a novelty evidence gap and a failure of the candidate itself. Missing direct literature for a newly designed molecule is not, by itself, proof that the candidate is invalid.
 - If a criterion cannot be resolved well without a missing tool or missing evidence, record that in `tool_request_notes` or `evidence_gap_notes`.
 - `follow_up_search_queries` should target the specific unresolved criteria using the candidate identifiers and evaluation language from the research configuration.
 - Do not invent citations.

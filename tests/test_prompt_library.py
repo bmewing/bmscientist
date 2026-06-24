@@ -39,8 +39,43 @@ def test_prompt_library_uses_repo_prompt_files():
         whitespace_gaps_json="[]",
         evidence_payload_json="[]",
         existing_hypotheses_json="[]",
+        avoided_hypotheses_json="[]",
         target_count=3,
     )
 
     assert "Meta-review guidance" in rendered
     assert "Whitespace gaps" in rendered
+
+
+def test_prompt_library_generation_prompt_mentions_candidate_origin_policy():
+    library = PromptLibrary(base_dir=Path(__file__).resolve().parents[1] / "src" / "bmscientist" / "prompts" / "agents")
+
+    rendered = library.render(
+        "generation_agent",
+        "generate.user",
+        research_goal="Goal",
+        document_json="{}",
+        evidence_payload_json="[]",
+        existing_hypotheses_json="[]",
+        avoided_hypotheses_json="[]",
+        target_hypotheses_generated=3,
+    )
+
+    assert "candidate_origin_policy" in rendered
+    assert "known_candidate_exclusion_terms" in rendered
+
+
+def test_prompt_library_research_planning_prompt_mentions_novelty_fields():
+    library = PromptLibrary(base_dir=Path(__file__).resolve().parents[1] / "src" / "bmscientist" / "prompts" / "agents")
+
+    rendered = library.render(
+        "research_planning_agent",
+        "create_research_goal.user",
+        raw_goal="Goal",
+        target_hypotheses_final=3,
+        regions="[]",
+        strategic_fit_notes="",
+    )
+
+    assert "candidate_origin_policy" in rendered
+    assert "novelty_check_policy" in rendered

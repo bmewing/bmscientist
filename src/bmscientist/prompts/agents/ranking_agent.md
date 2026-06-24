@@ -28,4 +28,5 @@ Return:
 Rules:
 - If the research mode is `materials_opportunity`, you may still reason about commercial and technical replacement logic in the usual way.
 - If generic `evaluation_criteria` are present, use them as the primary rubric.
+- If the research configuration requires novel or de novo candidates, rank known commercial chemicals or obvious substitution recommendations low even if they otherwise look plausible.
 - Penalize candidates with unresolved evidence gaps, low-confidence criterion results, or dependence on unavailable tool requests.

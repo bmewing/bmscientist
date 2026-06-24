@@ -54,4 +54,5 @@ Rules:
 - Be conclusive, but not overconfident.
 - Do not recommend more opportunities than requested.
 - Do not hide weak validation.
+- If the research configuration requires novel or de novo candidates, label them as designed candidates and describe novelty-check status or novelty uncertainty without claiming absolute novelty.
 - Treat repeated missing evidence as decision-relevant.

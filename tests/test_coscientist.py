@@ -145,6 +145,24 @@ class GenericPlanningLLM:
         )
 
 
+class NovelPlanningLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        return response_model.model_validate(
+            {
+                "research_mode": "candidate_design",
+                "strategic_fit_criteria": ["excellent coalescing behavior", "low aquatic toxicity risk"],
+                "material_scope": ["waterborne coalescing aids"],
+                "application_scope": ["latex coatings"],
+                "success_definition": "Design novel coalescent candidates for follow-up screening.",
+                "candidate_artifact_schema": {
+                    "artifact_type": "small_molecule",
+                    "primary_identifier_field": "smiles",
+                    "required_fields": ["name_or_label"],
+                },
+            }
+        )
+
+
 class GenerationLLM:
     def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
         return response_model.model_validate(
@@ -551,6 +569,28 @@ def make_generic_document() -> ResearchGoalDocument:
             }
         ],
         search_strategy_notes=["Use SMILES and toxicity language in discovery queries."],
+    )
+
+
+def make_novel_smiles_document() -> ResearchGoalDocument:
+    base = make_generic_document()
+    return base.model_copy(
+        update={
+            "raw_goal": "Find 3 brand-new, never before seen molecules (SMILES strings) that would be excellent water-borne coalescing aids with low aquatic toxicity risk.",
+            "candidate_origin_policy": "de_novo_design",
+            "novelty_requirements": [
+                "Do not return existing commercial coalescents as final answers.",
+                "Provide explicit SMILES strings for each candidate.",
+            ],
+            "known_candidate_exclusion_terms": [
+                "propylene glycol n-butyl ether",
+                "ethyl 3-ethoxypropionate",
+            ],
+            "novelty_check_policy": "identifier_lookup",
+            "candidate_artifact_schema": base.candidate_artifact_schema.model_copy(
+                update={"required_fields": ["name_or_label", "smiles", "intended_binder_system"]}
+            ),
+        }
     )
 
 
@@ -990,6 +1030,25 @@ def test_research_planning_accepts_generic_candidate_design_contract():
     assert document.tool_requests[0].tool_id == "opera_qsar"
 
 
+def test_research_planning_detects_de_novo_smiles_intent():
+    agent = ResearchPlanningAgent(NovelPlanningLLM())
+
+    document = agent.create_research_goal(
+        research_id="screen-2",
+        raw_goal="Find 3 brand-new, never before seen molecules (SMILES strings) that would be excellent water-borne coalescing aids with low aquatic toxicity risk.",
+        target_hypotheses_final=3,
+        regions=["North America"],
+        strategic_fit_notes=None,
+        preferred_evidence_recency_days=180,
+        reflection_search_limits=ReflectionSearchLimits(),
+    )
+
+    assert document.research_mode == "candidate_design"
+    assert document.candidate_origin_policy == "de_novo_design"
+    assert document.novelty_check_policy == "identifier_lookup"
+    assert "smiles" in document.candidate_artifact_schema.required_fields
+
+
 def test_hypothesis_seed_accepts_candidate_artifact():
     output = HypothesisGenerationOutput.model_validate(
         {
@@ -1162,6 +1221,131 @@ def test_generation_preserves_candidate_artifact_primary_identifier():
     assert len(hypotheses) == 1
     assert hypotheses[0].candidate_artifact["smiles"] == "CCOC(=O)OCC"
     assert hypotheses[0].candidate_artifact["name_or_label"] == "Candidate A"
+
+
+def test_generation_rejects_excluded_known_candidate_when_novel_required():
+    class NovelGenerationLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "Propylene glycol n-butyl ether as low aquatic toxicity coalescing aid",
+                            "summary": "Known commercial coalescent.",
+                            "candidate_material": "Propylene glycol n-butyl ether",
+                            "candidate_artifact": {
+                                "name_or_label": "Propylene glycol n-butyl ether",
+                                "smiles": "CCCCOCC(C)O",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.5,
+                        },
+                        {
+                            "title": "Designed coalescent A",
+                            "summary": "Novel designed candidate.",
+                            "candidate_artifact": {
+                                "name_or_label": "Designed coalescent A",
+                                "smiles": "CCOC(=O)OCCOC",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.62,
+                        },
+                    ]
+                }
+            )
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(NovelGenerationLLM(), retriever)
+
+    hypotheses = agent.generate(make_novel_smiles_document().model_copy(update={"target_hypotheses_generated": 2}))
+
+    assert len(hypotheses) == 1
+    assert hypotheses[0].candidate_artifact["name_or_label"] == "Designed coalescent A"
+    assert hypotheses[0].candidate_artifact["novelty_check_status"] == "passed_exact_identifier_check"
+
+
+def test_generation_rejects_missing_required_smiles_when_novel_required():
+    class MissingSmilesLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "Designed coalescent without structure",
+                            "summary": "Missing the required SMILES field.",
+                            "candidate_artifact": {
+                                "name_or_label": "Designed coalescent A",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.4,
+                        }
+                    ]
+                }
+            )
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(MissingSmilesLLM(), retriever)
+
+    hypotheses = agent.generate(make_novel_smiles_document().model_copy(update={"target_hypotheses_generated": 1}))
+
+    assert hypotheses == []
+
+
+def test_generation_dedupes_exact_smiles_when_titles_differ():
+    class DuplicateSmilesLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "Designed coalescent A",
+                            "summary": "First label for a structure.",
+                            "candidate_artifact": {
+                                "name_or_label": "Designed coalescent A",
+                                "smiles": "CCOC(=O)OCCOC",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.6,
+                        },
+                        {
+                            "title": "Designed coalescent B",
+                            "summary": "Second label for the same structure.",
+                            "candidate_artifact": {
+                                "name_or_label": "Designed coalescent B",
+                                "smiles": "CCOC(=O)OCCOC",
+                                "intended_binder_system": "acrylic latex",
+                            },
+                            "generation_confidence": 0.61,
+                        },
+                    ]
+                }
+            )
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(DuplicateSmilesLLM(), retriever)
+
+    hypotheses = agent.generate(make_novel_smiles_document().model_copy(update={"target_hypotheses_generated": 2}))
+
+    assert len(hypotheses) == 1
+    assert hypotheses[0].candidate_artifact["smiles"] == "CCOC(=O)OCCOC"
+
+
+def test_fallback_candidate_artifact_does_not_fill_smiles_from_candidate_material():
+    seed = HypothesisGenerationOutput.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "title": "Designed coalescent A",
+                    "summary": "No candidate artifact supplied.",
+                    "candidate_material": "Designed coalescent A",
+                }
+            ]
+        }
+    ).hypotheses[0]
+
+    artifact = GenerationAgent._fallback_candidate_artifact(make_novel_smiles_document(), seed)
+
+    assert "smiles" not in artifact
 
 
 def test_reflection_reviews_generic_criteria_without_running_tools():

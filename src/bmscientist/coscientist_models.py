@@ -21,6 +21,14 @@ ResearchMode = Literal[
     "literature_map",
     "generic_screening",
 ]
+CandidateOriginPolicy = Literal[
+    "known_candidates",
+    "novel_candidates",
+    "novel_analogs",
+    "de_novo_design",
+    "unspecified",
+]
+NoveltyCheckPolicy = Literal["none", "name_only", "identifier_lookup", "substructure_similarity"]
 CriterionDirection = Literal["maximize", "minimize", "target", "avoid", "classify", "describe"]
 CriterionEvidenceMode = Literal["literature", "local_tool", "external_tool", "human_review", "mixed"]
 ToolRequestStatus = Literal["requested", "available", "blocked", "deferred"]
@@ -444,6 +452,71 @@ def normalize_tool_request_status(value: Any) -> str:
     return "requested"
 
 
+def normalize_candidate_origin_policy(value: Any) -> str:
+    if value is None:
+        return "unspecified"
+    text = str(value).strip().lower()
+    if not text:
+        return "unspecified"
+    alias_map = {
+        "known": "known_candidates",
+        "known_candidate": "known_candidates",
+        "known_materials": "known_candidates",
+        "known_material": "known_candidates",
+        "commercial": "known_candidates",
+        "commercial_candidates": "known_candidates",
+        "novel": "novel_candidates",
+        "novel_candidate": "novel_candidates",
+        "novel_materials": "novel_candidates",
+        "novel_analog": "novel_analogs",
+        "novel_analogue": "novel_analogs",
+        "de_novo": "de_novo_design",
+        "denovo": "de_novo_design",
+        "de-novo": "de_novo_design",
+        "new_design": "de_novo_design",
+        "invented": "de_novo_design",
+        "none": "unspecified",
+        "unknown": "unspecified",
+    }
+    if text in alias_map:
+        return alias_map[text]
+    valid = {
+        "known_candidates",
+        "novel_candidates",
+        "novel_analogs",
+        "de_novo_design",
+        "unspecified",
+    }
+    if text in valid:
+        return text
+    return "unspecified"
+
+
+def normalize_novelty_check_policy(value: Any) -> str:
+    if value is None:
+        return "none"
+    text = str(value).strip().lower()
+    if not text:
+        return "none"
+    alias_map = {
+        "off": "none",
+        "disabled": "none",
+        "name": "name_only",
+        "names": "name_only",
+        "identifier": "identifier_lookup",
+        "identifier_check": "identifier_lookup",
+        "lookup": "identifier_lookup",
+        "similarity": "substructure_similarity",
+        "substructure": "substructure_similarity",
+    }
+    if text in alias_map:
+        return alias_map[text]
+    valid = {"none", "name_only", "identifier_lookup", "substructure_similarity"}
+    if text in valid:
+        return text
+    return "none"
+
+
 
 class ReflectionSearchLimits(BaseModel):
     max_reflection_searches_per_hypothesis: int = Field(default=3, ge=1, le=10)
@@ -632,6 +705,10 @@ class ResearchGoalDocument(BaseModel):
     target_incumbent_materials: list[str] = Field(default_factory=list)
     preferred_candidate_materials: list[str] = Field(default_factory=list)
     candidate_material_preferences: list[str] = Field(default_factory=list)
+    candidate_origin_policy: CandidateOriginPolicy = "unspecified"
+    novelty_requirements: list[str] = Field(default_factory=list)
+    known_candidate_exclusion_terms: list[str] = Field(default_factory=list)
+    novelty_check_policy: NoveltyCheckPolicy = "none"
     recycling_or_sustainability_angles: list[str] = Field(default_factory=list)
     preferred_evidence_recency_days: int = Field(default=180, ge=1)
     reflection_search_limits: ReflectionSearchLimits = Field(default_factory=ReflectionSearchLimits)
@@ -661,6 +738,8 @@ class ResearchGoalDocument(BaseModel):
         "target_incumbent_materials",
         "preferred_candidate_materials",
         "candidate_material_preferences",
+        "novelty_requirements",
+        "known_candidate_exclusion_terms",
         "recycling_or_sustainability_angles",
         "material_scope",
         "application_scope",
@@ -676,6 +755,16 @@ class ResearchGoalDocument(BaseModel):
     @classmethod
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
+
+    @field_validator("candidate_origin_policy", mode="before")
+    @classmethod
+    def normalize_candidate_origin_policy_field(cls, value: Any) -> str:
+        return normalize_candidate_origin_policy(value)
+
+    @field_validator("novelty_check_policy", mode="before")
+    @classmethod
+    def normalize_novelty_check_policy_field(cls, value: Any) -> str:
+        return normalize_novelty_check_policy(value)
 
     @field_validator("ranking_weights", mode="before")
     @classmethod
@@ -706,6 +795,10 @@ class ResearchPlanDraft(BaseModel):
     target_incumbent_materials: list[str] = Field(default_factory=list)
     preferred_candidate_materials: list[str] = Field(default_factory=list)
     candidate_material_preferences: list[str] = Field(default_factory=list)
+    candidate_origin_policy: CandidateOriginPolicy = "unspecified"
+    novelty_requirements: list[str] = Field(default_factory=list)
+    known_candidate_exclusion_terms: list[str] = Field(default_factory=list)
+    novelty_check_policy: NoveltyCheckPolicy = "none"
     recycling_or_sustainability_angles: list[str] = Field(default_factory=list)
     material_scope: list[str] = Field(default_factory=list)
     application_scope: list[str] = Field(default_factory=list)
@@ -725,6 +818,8 @@ class ResearchPlanDraft(BaseModel):
         "target_incumbent_materials",
         "preferred_candidate_materials",
         "candidate_material_preferences",
+        "novelty_requirements",
+        "known_candidate_exclusion_terms",
         "recycling_or_sustainability_angles",
         "material_scope",
         "application_scope",
@@ -737,6 +832,16 @@ class ResearchPlanDraft(BaseModel):
     @classmethod
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
+
+    @field_validator("candidate_origin_policy", mode="before")
+    @classmethod
+    def normalize_candidate_origin_policy_field(cls, value: Any) -> str:
+        return normalize_candidate_origin_policy(value)
+
+    @field_validator("novelty_check_policy", mode="before")
+    @classmethod
+    def normalize_novelty_check_policy_field(cls, value: Any) -> str:
+        return normalize_novelty_check_policy(value)
 
     @field_validator("ranking_weights", mode="before")
     @classmethod
@@ -764,6 +869,10 @@ class UpdatedResearchPlan(BaseModel):
     target_incumbent_materials: list[str] = Field(default_factory=list)
     preferred_candidate_materials: list[str] = Field(default_factory=list)
     candidate_material_preferences: list[str] = Field(default_factory=list)
+    candidate_origin_policy: CandidateOriginPolicy = "unspecified"
+    novelty_requirements: list[str] = Field(default_factory=list)
+    known_candidate_exclusion_terms: list[str] = Field(default_factory=list)
+    novelty_check_policy: NoveltyCheckPolicy = "none"
     recycling_or_sustainability_angles: list[str] = Field(default_factory=list)
     material_scope: list[str] = Field(default_factory=list)
     application_scope: list[str] = Field(default_factory=list)
@@ -785,6 +894,8 @@ class UpdatedResearchPlan(BaseModel):
         "target_incumbent_materials",
         "preferred_candidate_materials",
         "candidate_material_preferences",
+        "novelty_requirements",
+        "known_candidate_exclusion_terms",
         "recycling_or_sustainability_angles",
         "material_scope",
         "application_scope",
@@ -797,6 +908,16 @@ class UpdatedResearchPlan(BaseModel):
     @classmethod
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
+
+    @field_validator("candidate_origin_policy", mode="before")
+    @classmethod
+    def normalize_candidate_origin_policy_field(cls, value: Any) -> str:
+        return normalize_candidate_origin_policy(value)
+
+    @field_validator("novelty_check_policy", mode="before")
+    @classmethod
+    def normalize_novelty_check_policy_field(cls, value: Any) -> str:
+        return normalize_novelty_check_policy(value)
 
     @field_validator("ranking_weights", mode="before")
     @classmethod
