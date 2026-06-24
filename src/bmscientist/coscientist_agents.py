@@ -654,6 +654,8 @@ class GenerationAgent:
 
     def batch_size_for(self, requested_hypotheses: int) -> int:
         requested = max(0, requested_hypotheses)
+        if requested < 20:
+            return requested
         return max(self._minimum_batch_size, (requested + 3) // 4)
 
     def generate(

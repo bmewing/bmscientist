@@ -724,6 +724,38 @@ def test_generation_uses_quarter_sized_batches_for_large_targets():
     assert llm.requested_targets == [6, 6, 6, 6]
 
 
+def test_generation_uses_full_generated_target_as_single_batch_for_small_runs():
+    class BatchSizingLLM:
+        def __init__(self):
+            self.requested_targets = []
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            match = re.search(r"Generate (\d+) additional distinct hypotheses", user_prompt)
+            assert match is not None
+            batch_target = int(match.group(1))
+            self.requested_targets.append(batch_target)
+            payload = {
+                "hypotheses": [
+                    {
+                        "title": f"Idea {index}",
+                        "summary": "Idea",
+                        "candidate_material": "PETG",
+                    }
+                    for index in range(1, batch_target + 1)
+                ]
+            }
+            return response_model.model_validate(payload)
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    llm = BatchSizingLLM()
+    agent = GenerationAgent(llm, retriever)
+
+    hypotheses = agent.generate(make_document().model_copy(update={"target_hypotheses_generated": 6}))
+
+    assert len(hypotheses) == 6
+    assert llm.requested_targets == [6]
+
+
 def test_generation_existing_hypothesis_payload_is_compact():
     payload = GenerationAgent._existing_hypothesis_prompt_payload(make_document(), [make_hypothesis()])
 

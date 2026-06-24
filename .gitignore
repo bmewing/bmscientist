@@ -25,6 +25,7 @@ data/coscientist/*
 data/*
 AGENTS.md
 ISSUES.txt
+SKILLS.md
 PLAN.md
 MAT_PLAN.md
 .env
