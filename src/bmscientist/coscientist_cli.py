@@ -143,6 +143,18 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     coscientist.add_argument("--max-pages-per-search", type=int, default=8)
     coscientist.add_argument("--reflection-concurrency", type=int, default=3)
     coscientist.add_argument(
+        "--proximity-merge-mode",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="How aggressively proximity synthesis should merge overlapping ideas.",
+    )
+    coscientist.add_argument(
+        "--proximity-granularity",
+        choices=["device_subtype", "application_family", "global"],
+        default="application_family",
+        help="What level of opportunity detail proximity synthesis should preserve.",
+    )
+    coscientist.add_argument(
         "--spawn-reflection-daemons",
         action="store_true",
         help=(
@@ -216,6 +228,16 @@ def add_coscientist_parser(subparsers: argparse._SubParsersAction) -> None:
     loop.add_argument("--results-per-query", type=int)
     loop.add_argument("--max-pages-per-search", type=int)
     loop.add_argument("--reflection-concurrency", type=int, default=3)
+    loop.add_argument(
+        "--proximity-merge-mode",
+        choices=["conservative", "balanced", "aggressive"],
+        help="Optional override for an existing project's proximity merge mode.",
+    )
+    loop.add_argument(
+        "--proximity-granularity",
+        choices=["device_subtype", "application_family", "global"],
+        help="Optional override for an existing project's proximity merge granularity.",
+    )
 
 
 def run_coscientist_command(
@@ -243,6 +265,8 @@ def run_coscientist_command(
         results_per_query=args.results_per_query,
         max_pages_per_search=args.max_pages_per_search,
         reflection_concurrency=args.reflection_concurrency,
+        proximity_merge_mode=getattr(args, "proximity_merge_mode", "balanced"),
+        proximity_granularity=getattr(args, "proximity_granularity", "application_family"),
         spawn_reflection_daemons=getattr(args, "spawn_reflection_daemons", False),
     )
     loop_result = None
@@ -265,6 +289,8 @@ def run_coscientist_command(
             results_per_query=args.results_per_query,
             max_pages_per_search=args.max_pages_per_search,
             reflection_concurrency=args.reflection_concurrency,
+            proximity_merge_mode=getattr(args, "proximity_merge_mode", None),
+            proximity_granularity=getattr(args, "proximity_granularity", None),
         )
     console.print(f"[bold]Project Name:[/bold] {result.research_id}")
     console.print(f"[bold]Generated hypotheses:[/bold] {result.generated_hypotheses}")
@@ -353,6 +379,8 @@ def run_coscientist_loop_command(
         results_per_query=args.results_per_query,
         max_pages_per_search=args.max_pages_per_search,
         reflection_concurrency=args.reflection_concurrency,
+        proximity_merge_mode=getattr(args, "proximity_merge_mode", None),
+        proximity_granularity=getattr(args, "proximity_granularity", None),
     )
     console.print(f"[bold]Project Name:[/bold] {result.research_id}")
     console.print(f"[bold]Rounds completed:[/bold] {result.rounds_completed}")

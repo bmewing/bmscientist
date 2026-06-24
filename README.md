@@ -131,6 +131,14 @@ Search local evidence:
 .\.venv\Scripts\python.exe -m bmscientist search --query "Where is PVC used in clear rigid applications?" --top-k 8
 ```
 
+Inspect and query the local graph with DuckDB:
+
+```powershell
+.\.venv\Scripts\python.exe -m bmscientist graph-schema
+.\.venv\Scripts\python.exe -m bmscientist graph-sql --sql "SELECT name, product_id FROM Product ORDER BY name LIMIT 20"
+.\.venv\Scripts\python.exe -m bmscientist graph-ask --question "Show me the material grades linked to Tritan"
+```
+
 Manually obtained files can be dropped into the configured data directory: `data/manually-obtained/`. Workflows ingest them and move processed files to `data/manually-obtained/processed/`.
 
 ### 2. Co-Scientist Workflow
@@ -138,8 +146,14 @@ Manually obtained files can be dropped into the configured data directory: `data
 Create a research goal, generate hypotheses from local evidence, and reflect on them immediately:
 
 ```powershell
-.\.venv\Scripts\python.exe -m bmscientist coscientist --goal "I want to find rapid drop-in/drop-out flywheel opportunities for PET against a target material of Styrenics..." --target-hypotheses 25 --regions "North America,Europe" --reflection-concurrency 4
+.\.venv\Scripts\python.exe -m bmscientist coscientist --goal "I want to find rapid drop-in/drop-out flywheel opportunities for PET against a target material of Styrenics..." --target-hypotheses 25 --regions "North America,Europe" --reflection-concurrency 4 --proximity-merge-mode balanced --proximity-granularity application_family
 ```
+
+`Proximity Check Agent` tuning now lives on the research goal:
+- `--proximity-merge-mode`: `conservative`, `balanced`, or `aggressive`
+- `--proximity-granularity`: `device_subtype`, `application_family`, or `global`
+
+Regions are always combined into synthesized hypotheses rather than split into separate regional variants.
 
 The `coscientist` command now defaults to in-process threaded reflection, which keeps RAM usage much lower than spawning multiple background reflector subprocesses. If you explicitly want the legacy subprocess behavior, add:
 
@@ -169,10 +183,10 @@ Each worker atomically claims hypotheses by renaming files from `generated/` to 
 Run the Ranking Agent, Proximity Check Agent, Meta-review Agent, Evolution Agent, feedback generation, and reflection loop over an existing research run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m bmscientist coscientist-loop --research-id YOUR_RESEARCH_ID --target-final-hypotheses 10 --max-rounds 2 --evolve-top-k 5 --evolved-per-round 5 --regenerated-per-round 5 --proximity-check-every 1 --max-synthesized-per-round 3 --max-gap-persistence-rounds 1 --reflection-concurrency 4
+.\.venv\Scripts\python.exe -m bmscientist coscientist-loop --research-id YOUR_RESEARCH_ID --target-final-hypotheses 10 --max-rounds 2 --evolve-top-k 5 --evolved-per-round 5 --regenerated-per-round 5 --proximity-check-every 1 --max-synthesized-per-round 3 --max-gap-persistence-rounds 1 --reflection-concurrency 4 --proximity-merge-mode aggressive --proximity-granularity application_family
 ```
 
-The loop ranks active reflected hypotheses, clusters concepts, synthesizes overlapping ideas, reflects on synthesized variants, and uses meta-review whitespace analysis to control loop continuation.
+The loop ranks active reflected hypotheses, clusters concepts, synthesizes overlapping ideas, reflects on synthesized variants, and uses meta-review whitespace analysis to control loop continuation. For existing projects, the proximity flags on `coscientist-loop` act as explicit policy overrides.
 
 ### 4. Human Feedback & Steering
 

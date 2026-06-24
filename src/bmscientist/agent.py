@@ -14,7 +14,12 @@ from bmscientist.classify import EvidenceClassifier
 from bmscientist.config import AppConfig
 from bmscientist.embeddings import LocalEmbedder
 from bmscientist.extract import PageFetcher, extract_domain
-from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_enrichment import (
+    GraphEnrichmentExpander,
+    GraphEnrichmentProposer,
+    GraphEnrichmentStore,
+    GraphEnrichmentValidator,
+)
 from bmscientist.llm import DeepSeekLLM
 from bmscientist.manual_ingest import ManualEvidenceIngestor
 from bmscientist.models import (
@@ -51,6 +56,10 @@ class DiscoveryState(TypedDict, total=False):
     chunk_records: list[ChunkRecord]
     graph_enrichment_proposals: list[GraphEnrichmentProposal]
     graph_enrichment_validations: list[GraphEnrichmentValidation]
+    graph_enrichment_follow_up_questions: list[dict[str, Any]]
+    graph_enrichment_expansion_proposals: list[GraphEnrichmentProposal]
+    graph_enrichment_expansion_validations: list[GraphEnrichmentValidation]
+    graph_enrichment_external_search_queries: list[str]
     graph_enrichment_accepted: int
     summary: DiscoverySummary
     skipped_pages: list[dict[str, Any]]
@@ -73,6 +82,7 @@ class DiscoveryAgent:
         self._store = LanceEvidenceStore(config.resolved_lancedb_path())
         self._graph_enrichment_proposer = GraphEnrichmentProposer(self._llm)
         self._graph_enrichment_validator = GraphEnrichmentValidator(self._llm)
+        self._graph_enrichment_expander = GraphEnrichmentExpander(self._llm)
         self._graph_enrichment_store = GraphEnrichmentStore()
         self._manual_ingestor = ManualEvidenceIngestor(
             config,
@@ -98,6 +108,7 @@ class DiscoveryAgent:
         graph.add_node("write_to_lancedb", self.write_to_lancedb)
         graph.add_node("propose_graph_enrichments", self.propose_graph_enrichments)
         graph.add_node("validate_graph_enrichments", self.validate_graph_enrichments)
+        graph.add_node("expand_graph_enrichments", self.expand_graph_enrichments)
         graph.add_node("write_graph_enrichments", self.write_graph_enrichments)
         graph.add_node("summarize_discoveries", self.summarize_discoveries)
 
@@ -112,7 +123,8 @@ class DiscoveryAgent:
         graph.add_edge("embed_chunks", "write_to_lancedb")
         graph.add_edge("write_to_lancedb", "propose_graph_enrichments")
         graph.add_edge("propose_graph_enrichments", "validate_graph_enrichments")
-        graph.add_edge("validate_graph_enrichments", "write_graph_enrichments")
+        graph.add_edge("validate_graph_enrichments", "expand_graph_enrichments")
+        graph.add_edge("expand_graph_enrichments", "write_graph_enrichments")
         graph.add_edge("write_graph_enrichments", "summarize_discoveries")
         graph.add_edge("summarize_discoveries", END)
         return graph.compile()
@@ -177,6 +189,7 @@ class DiscoveryAgent:
         state.update(self.write_to_lancedb(state))
         state.update(self.propose_graph_enrichments(state))
         state.update(self.validate_graph_enrichments(state))
+        state.update(self.expand_graph_enrichments(state))
         state.update(self.write_graph_enrichments(state))
         state.update(self.summarize_discoveries(state))
         return state["summary"]
@@ -373,11 +386,60 @@ class DiscoveryAgent:
             state.setdefault("errors", []).append(f"graph_enrichment_validation:{exc}")
             return {"graph_enrichment_validations": []}
 
-    def write_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+    def expand_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
         try:
-            accepted = self._graph_enrichment_store.write(
+            questions, proposals = self._graph_enrichment_expander.expand(
+                state["original_query"],
                 state.get("graph_enrichment_proposals", []),
                 state.get("graph_enrichment_validations", []),
+                state.get("chunk_records", []),
+            )
+            validations = self._graph_enrichment_validator.validate(proposals, state.get("chunk_records", [])) if proposals else []
+            external_queries = self._select_graph_follow_up_search_questions(
+                questions,
+                state.get("graph_enrichment_proposals", []),
+                state.get("graph_enrichment_validations", []),
+                proposals,
+                validations,
+            )
+            external_records = self._run_graph_follow_up_search(state, external_queries) if external_queries else []
+            external_proposals = self._graph_enrichment_proposer.propose(state["original_query"], external_records) if external_records else []
+            external_validations = (
+                self._graph_enrichment_validator.validate(external_proposals, external_records)
+                if external_proposals
+                else []
+            )
+            merged_chunk_records = self._merge_chunk_records(state.get("chunk_records", []), external_records)
+            return {
+                "graph_enrichment_follow_up_questions": [item.model_dump(mode="json") for item in questions],
+                "graph_enrichment_external_search_queries": [item.question for item in external_queries],
+                "graph_enrichment_expansion_proposals": [*proposals, *external_proposals],
+                "graph_enrichment_expansion_validations": [*validations, *external_validations],
+                "chunk_records": merged_chunk_records,
+            }
+        except Exception as exc:
+            LOGGER.exception("Graph enrichment expansion failed for run %s", state.get("run_id"))
+            state.setdefault("errors", []).append(f"graph_enrichment_expansion:{exc}")
+            return {
+                "graph_enrichment_follow_up_questions": [],
+                "graph_enrichment_external_search_queries": [],
+                "graph_enrichment_expansion_proposals": [],
+                "graph_enrichment_expansion_validations": [],
+            }
+
+    def write_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+        try:
+            proposals = [
+                *state.get("graph_enrichment_proposals", []),
+                *state.get("graph_enrichment_expansion_proposals", []),
+            ]
+            validations = [
+                *state.get("graph_enrichment_validations", []),
+                *state.get("graph_enrichment_expansion_validations", []),
+            ]
+            accepted = self._graph_enrichment_store.write(
+                proposals,
+                validations,
                 state["run_id"],
                 state["original_query"],
             )
@@ -387,12 +449,16 @@ class DiscoveryAgent:
                     {
                         "proposals": [
                             proposal.model_dump(mode="json")
-                            for proposal in state.get("graph_enrichment_proposals", [])
+                            for proposal in proposals
                         ],
                         "validations": [
                             validation.model_dump(mode="json")
-                            for validation in state.get("graph_enrichment_validations", [])
+                            for validation in validations
                         ],
+                        "follow_up_questions": state.get("graph_enrichment_follow_up_questions", []),
+                        "external_search_queries": state.get("graph_enrichment_external_search_queries", []),
+                        "initial_proposal_count": len(state.get("graph_enrichment_proposals", [])),
+                        "expansion_proposal_count": len(state.get("graph_enrichment_expansion_proposals", [])),
                         "accepted": accepted,
                     },
                     indent=2,
@@ -446,8 +512,12 @@ class DiscoveryAgent:
             fetched_pages=len(state.get("fetched_pages", [])),
             relevant_pages=len(state.get("classifications", [])),
             stored_chunks=len(state.get("chunk_records", [])),
-            graph_enrichment_proposals=len(state.get("graph_enrichment_proposals", [])),
+            graph_enrichment_proposals=len(state.get("graph_enrichment_proposals", []))
+            + len(state.get("graph_enrichment_expansion_proposals", [])),
             graph_enrichment_accepted=state.get("graph_enrichment_accepted", 0),
+            graph_enrichment_follow_up_questions=len(state.get("graph_enrichment_follow_up_questions", [])),
+            graph_enrichment_expansion_proposals=len(state.get("graph_enrichment_expansion_proposals", [])),
+            graph_enrichment_external_search_queries=len(state.get("graph_enrichment_external_search_queries", [])),
             opportunity_summary=narrative,
             notable_applications=notable_applications,
             evidence_gaps=[
@@ -513,10 +583,17 @@ class DiscoveryAgent:
         try:
             proposals = self._graph_enrichment_proposer.propose(original_query, records)
             validations = self._graph_enrichment_validator.validate(proposals, records)
-            accepted = self._graph_enrichment_store.write(proposals, validations, records[0].run_id if records else "manual", original_query)
+            _, expanded = self._graph_enrichment_expander.expand(original_query, proposals, validations, records)
+            expanded_validations = self._graph_enrichment_validator.validate(expanded, records) if expanded else []
+            accepted = self._graph_enrichment_store.write(
+                [*proposals, *expanded],
+                [*validations, *expanded_validations],
+                records[0].run_id if records else "manual",
+                original_query,
+            )
             LOGGER.info(
                 "Graph enrichment from manual evidence produced %s proposals and %s accepted claims",
-                len(proposals),
+                len(proposals) + len(expanded),
                 accepted,
             )
         except Exception:
@@ -533,6 +610,135 @@ class DiscoveryAgent:
     @property
     def llm(self) -> DeepSeekLLM:
         return self._llm
+
+    @staticmethod
+    def _merge_chunk_records(existing: list[ChunkRecord], additional: list[ChunkRecord]) -> list[ChunkRecord]:
+        merged: dict[str, ChunkRecord] = {record.id: record for record in existing}
+        for record in additional:
+            merged.setdefault(record.id, record)
+        return list(merged.values())
+
+    @staticmethod
+    def _accepted_edge_types(
+        proposals: list[GraphEnrichmentProposal],
+        validations: list[GraphEnrichmentValidation],
+    ) -> set[str]:
+        proposals_by_id = {proposal.proposal_id: proposal for proposal in proposals if proposal.proposal_id}
+        accepted: set[str] = set()
+        for validation in validations:
+            if not validation.accepted or validation.confidence_score < 0.6:
+                continue
+            proposal = proposals_by_id.get(validation.proposal_id)
+            if proposal is None:
+                continue
+            accepted.add(validation.corrected_edge_type or proposal.edge_type)
+        return accepted
+
+    def _select_graph_follow_up_search_questions(
+        self,
+        questions: list[Any],
+        initial_proposals: list[GraphEnrichmentProposal],
+        initial_validations: list[GraphEnrichmentValidation],
+        expansion_proposals: list[GraphEnrichmentProposal],
+        expansion_validations: list[GraphEnrichmentValidation],
+        limit: int = 4,
+    ) -> list[Any]:
+        present_edge_types = self._accepted_edge_types(initial_proposals, initial_validations) | self._accepted_edge_types(
+            expansion_proposals,
+            expansion_validations,
+        )
+        selected: list[Any] = []
+        seen_questions: set[str] = set()
+        for question in questions:
+            question_text = str(getattr(question, "question", "") or "").strip()
+            if not question_text:
+                continue
+            normalized = question_text.lower()
+            if normalized in seen_questions:
+                continue
+            targets = {str(item) for item in getattr(question, "target_edge_types", []) if item}
+            if targets and targets <= present_edge_types:
+                continue
+            selected.append(question)
+            seen_questions.add(normalized)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _run_graph_follow_up_search(self, state: DiscoveryState, questions: list[Any]) -> list[ChunkRecord]:
+        if not questions:
+            return []
+
+        all_results: list[SearchResultItem] = []
+        for question in questions:
+            query = str(getattr(question, "question", "") or "").strip()
+            if not query:
+                continue
+            try:
+                response = self._search.search(
+                    query=query,
+                    num_results=2,
+                    options=default_search_options(self._config, query),
+                )
+                all_results.extend(response.results)
+            except Exception as exc:
+                LOGGER.exception("Graph follow-up search failed for query %s", query)
+                state.setdefault("errors", []).append(f"graph_follow_up_search:{query}:{exc}")
+
+        if not all_results:
+            return []
+
+        unique_results = deduplicate_search_results(all_results)
+        retrieval = self._retriever.retrieve_pages(
+            state["original_query"],
+            unique_results[:6],
+            max_pages=6,
+        )
+        state["skipped_pages"] = list(state.get("skipped_pages", [])) + retrieval.skipped
+
+        question_text = " | ".join(str(getattr(item, "question", "") or "").strip() for item in questions if getattr(item, "question", None))
+        chunk_records: list[ChunkRecord] = []
+        for page in retrieval.pages:
+            if len(page.text) < self._config.min_snippet_characters:
+                continue
+            page_chunks = self._chunker.chunk_text(page.text)[:2]
+            for index, chunk in enumerate(page_chunks):
+                chunk_id = str(uuid5(NAMESPACE_URL, f"{state['run_id']}::graph-follow-up::{page.url}::{index}"))
+                chunk_records.append(
+                    ChunkRecord(
+                        id=chunk_id,
+                        run_id=state["run_id"],
+                        original_query=state["original_query"],
+                        search_query=page.search_query,
+                        source_title=page.title,
+                        source_url=str(page.url),
+                        source_domain=page.source_domain,
+                        retrieved_at=page.fetched_at,
+                        chunk_index=index,
+                        chunk_text=chunk,
+                        application=None,
+                        incumbent_material=None,
+                        candidate_materials=[],
+                        evidence_type="market or customer need",
+                        application_requirements=[],
+                        substitution_drivers=[],
+                        relevance_score=0.72,
+                        confidence_score=0.55,
+                        metadata={
+                            "graph_follow_up_search": True,
+                            "follow_up_questions": question_text,
+                            "page_metadata": page.metadata,
+                        },
+                    )
+                )
+
+        if not chunk_records:
+            return []
+
+        vectors = self._embedder.embed_texts([record.chunk_text for record in chunk_records])
+        embedded_records = [record.model_copy(update={"vector": vector}) for record, vector in zip(chunk_records, vectors, strict=False)]
+        self._store.add_chunks(embedded_records)
+        return embedded_records
 
 
 def build_opportunity_report(

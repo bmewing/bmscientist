@@ -10,6 +10,8 @@ HypothesisStatus = Literal["generated", "reflecting", "reflected", "evolve", "re
 HypothesisGenerationSource = Literal["initial", "evolved", "regenerated", "synthesized"]
 RankingAction = Literal["advance", "hold", "evolve", "reject"]
 GapShrinkageStatus = Literal["improved", "stable", "worse", "unknown"]
+ProximityMergeMode = Literal["conservative", "balanced", "aggressive"]
+ProximityGranularity = Literal["device_subtype", "application_family", "global"]
 ResearchMode = Literal[
     "materials_opportunity",
     "candidate_design",
@@ -537,6 +539,40 @@ class ToolRequest(BaseModel):
         return coerce_dict_list(value)
 
 
+class ProximityMergePolicy(BaseModel):
+    merge_mode: ProximityMergeMode = "balanced"
+    granularity: ProximityGranularity = "application_family"
+
+    @field_validator("merge_mode", mode="before")
+    @classmethod
+    def normalize_merge_mode(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return "balanced"
+        alias_map = {
+            "strict": "conservative",
+            "merged": "balanced",
+            "normal": "balanced",
+            "broad": "aggressive",
+        }
+        return alias_map.get(text, text)
+
+    @field_validator("granularity", mode="before")
+    @classmethod
+    def normalize_granularity(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return "application_family"
+        alias_map = {
+            "device": "device_subtype",
+            "subtype": "device_subtype",
+            "family": "application_family",
+            "application": "application_family",
+            "broad": "global",
+        }
+        return alias_map.get(text, text)
+
+
 class CandidateEvaluationResult(BaseModel):
     criterion_name: str
     value: str | float | bool | None = None
@@ -602,6 +638,7 @@ class ResearchGoalDocument(BaseModel):
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     search_strategy_notes: list[str] = Field(default_factory=list)
     strategic_fit_notes: str | None = None
+    proximity_merge_policy: ProximityMergePolicy = Field(default_factory=ProximityMergePolicy)
     whitespace_gap_notes: list[str] = Field(default_factory=list)
     whitespace_gap_persistence_count: int = Field(default=0, ge=0)
     meta_review_generation_guidance: list[str] = Field(default_factory=list)
@@ -640,6 +677,11 @@ class ResearchGoalDocument(BaseModel):
     @field_validator("candidate_artifact_schema", mode="before")
     @classmethod
     def default_candidate_artifact_schema(cls, value: Any) -> dict[str, Any]:
+        return coerce_metric_payload(value)
+
+    @field_validator("proximity_merge_policy", mode="before")
+    @classmethod
+    def default_proximity_merge_policy(cls, value: Any) -> dict[str, Any]:
         return coerce_metric_payload(value)
 
     @field_validator("evaluation_criteria", "tool_requests", mode="before")

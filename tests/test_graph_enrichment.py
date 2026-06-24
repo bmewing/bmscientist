@@ -5,11 +5,17 @@ from datetime import datetime, timezone
 
 import pyarrow.parquet as pq
 
-from bmscientist.graph_enrichment import GraphEnrichmentProposer, GraphEnrichmentStore, GraphEnrichmentValidator
+from bmscientist.graph_enrichment import (
+    GraphEnrichmentExpander,
+    GraphEnrichmentProposer,
+    GraphEnrichmentStore,
+    GraphEnrichmentValidator,
+)
 from bmscientist.graph_market import GraphMarketEvidence
 from bmscientist.coscientist_models import MarketVolumeEstimateOutput, ReflectionAssessment
 from bmscientist.models import (
     ChunkRecord,
+    GraphEnrichmentProposal,
     GraphEnrichmentValidationOutput,
 )
 from tests.test_coscientist import make_document, make_generic_document, make_hypothesis
@@ -205,11 +211,207 @@ def test_graph_enrichment_merges_product_aliases_without_collapsing_master_data(
     assert accepted == 1
     product_rows = pq.read_table(graph_path / "nodes" / "Product.parquet").to_pylist()
     assert product_rows[0]["product_id"] == "product:polystyrene"
-    assert product_rows[0]["name"] == "polystyrene"
+    assert product_rows[0]["name"] == "Polystyrene"
     assert json.loads(product_rows[0]["aliases_json"]) == ["PS"]
 
     claim_rows = pq.read_table(graph_path / "enrichment" / "GraphEnrichmentClaim.parquet").to_pylist()
-    assert json.loads(claim_rows[0]["product_aliases_json"]) == ["polystyrene"]
+    assert set(json.loads(claim_rows[0]["product_aliases_json"])) == {"polystyrene", "PS"}
+
+
+def test_graph_enrichment_normalizes_descriptor_heavy_product_names():
+    record = make_chunk().model_copy(
+        update={
+            "id": "chunk-pc-1",
+            "application": "extruded light diffusers",
+            "chunk_text": "Light diffusion polycarbonate is used in extruded light diffusers for uniform illumination.",
+            "candidate_materials": ["polycarbonate"],
+        }
+    )
+
+    class DescriptorProposalLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt):
+            return response_model.model_validate(
+                {
+                    "proposals": [
+                        {
+                            "edge_type": "Product_USED_IN_Application",
+                            "product_name": "light diffusion polycarbonate",
+                            "source_chunk_id": "chunk-pc-1",
+                            "supporting_quote": "Light diffusion polycarbonate is used in extruded light diffusers",
+                            "confidence_score": 0.77,
+                        }
+                    ]
+                }
+            )
+
+    proposals = GraphEnrichmentProposer(DescriptorProposalLLM()).propose(record.original_query, [record])
+
+    assert proposals[0].product_name == "Polycarbonate"
+    assert proposals[0].application_name == "extruded light diffusers"
+    assert "light diffusion polycarbonate" in proposals[0].product_aliases
+    assert proposals[0].material_family_name is None
+
+
+def test_graph_enrichment_normalizes_branded_product_to_material_family(tmp_path):
+    record = make_chunk().model_copy(
+        update={
+            "id": "chunk-exolon-1",
+            "application": "extruded light diffusers",
+            "chunk_text": "Exolon DX polycarbonate sheet is used in extruded light diffusers and is offered by Covestro.",
+            "candidate_materials": ["Exolon DX"],
+        }
+    )
+
+    class BrandProposalLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt):
+            return response_model.model_validate(
+                {
+                    "proposals": [
+                        {
+                            "edge_type": "Product_USED_IN_Application",
+                            "product_name": "Exolon DX polycarbonate",
+                            "company_name": "Covestro",
+                            "source_chunk_id": "chunk-exolon-1",
+                            "supporting_quote": "Exolon DX polycarbonate sheet is used in extruded light diffusers and is offered by Covestro.",
+                            "confidence_score": 0.8,
+                        },
+                        {
+                            "edge_type": "Company_PRODUCES_Product",
+                            "product_name": "Exolon DX polycarbonate",
+                            "company_name": "Covestro",
+                            "source_chunk_id": "chunk-exolon-1",
+                            "supporting_quote": "Exolon DX polycarbonate sheet is offered by Covestro.",
+                            "confidence_score": 0.79,
+                        },
+                    ]
+                }
+            )
+
+    proposals = GraphEnrichmentProposer(BrandProposalLLM()).propose(record.original_query, [record])
+    validations = GraphEnrichmentValidationOutput.model_validate(
+        {
+            "validations": [
+                {
+                    "proposal_id": proposals[0].proposal_id,
+                    "accepted": True,
+                    "confidence_score": 0.82,
+                    "rationale": "Directly supported product/application relationship.",
+                },
+                {
+                    "proposal_id": proposals[1].proposal_id,
+                    "accepted": True,
+                    "confidence_score": 0.81,
+                    "rationale": "Directly supported company/product relationship.",
+                    "corrected_relationship_role": "producer_or_supplier",
+                },
+            ]
+        }
+    ).validations
+
+    assert proposals[0].product_name == "Exolon DX"
+    assert proposals[0].material_family_name == "Polycarbonate"
+    assert "Exolon DX polycarbonate" in proposals[0].product_aliases
+
+    graph_path = tmp_path / "graph"
+    accepted = GraphEnrichmentStore(graph_path).write(proposals, validations, record.run_id, record.original_query)
+
+    assert accepted == 2
+    product_rows = pq.read_table(graph_path / "nodes" / "Product.parquet").to_pylist()
+    assert product_rows[0]["name"] == "Exolon DX"
+    assert product_rows[0]["product_family"] == "Polycarbonate"
+
+    family_rows = pq.read_table(graph_path / "nodes" / "MaterialFamily.parquet").to_pylist()
+    assert family_rows[0]["name"] == "Polycarbonate"
+
+    family_edges = pq.read_table(graph_path / "edges" / "Product_BELONGS_TO_MaterialFamily.parquet").to_pylist()
+    assert family_edges[0]["product_id"] == "product:exolon-dx"
+    assert family_edges[0]["material_family_id"] == "material_family:polycarbonate"
+
+    company_edges = pq.read_table(graph_path / "edges" / "Company_PRODUCES_Product.parquet").to_pylist()
+    assert company_edges[0]["company_id"] == "company:covestro"
+    assert company_edges[0]["product_id"] == "product:exolon-dx"
+
+
+def test_graph_enrichment_expander_recovers_follow_up_edges_from_same_chunk():
+    record = make_chunk().model_copy(
+        update={
+            "id": "chunk-expand-1",
+            "application": "extruded light diffusers",
+            "chunk_text": "Exolon DX polycarbonate sheet is used in extruded light diffusers and is offered by Covestro.",
+            "candidate_materials": ["Exolon DX"],
+        }
+    )
+
+    proposals = GraphEnrichmentProposer._normalize_proposals(
+        [
+            GraphEnrichmentProposal.model_validate(
+                {
+                    "edge_type": "Product_USED_IN_Application",
+                    "product_name": "Exolon DX polycarbonate",
+                    "application_name": "extruded light diffusers",
+                    "source_chunk_id": "chunk-expand-1",
+                    "source_url": "https://example.com/exolon",
+                    "source_title": "Exolon DX",
+                    "supporting_quote": "Exolon DX polycarbonate sheet is used in extruded light diffusers.",
+                    "confidence_score": 0.78,
+                }
+            )
+        ],
+        [record],
+    )
+    validations = GraphEnrichmentValidationOutput.model_validate(
+        {
+            "validations": [
+                {
+                    "proposal_id": proposals[0].proposal_id,
+                    "accepted": True,
+                    "confidence_score": 0.81,
+                    "rationale": "Directly supported product/application relationship.",
+                }
+            ]
+        }
+    ).validations
+
+    class ExpansionLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt):
+            assert "Already accepted proposals" in user_prompt
+            return response_model.model_validate(
+                {
+                    "follow_up_questions": [
+                        {
+                            "source_chunk_id": "chunk-expand-1",
+                            "question": "Does the chunk explicitly identify the company behind Exolon DX?",
+                            "rationale": "The accepted proposal has a branded product and likely supplier information.",
+                            "target_edge_types": ["Company_PRODUCES_Product"],
+                        }
+                    ],
+                    "proposals": [
+                        {
+                            "edge_type": "Company_PRODUCES_Product",
+                            "product_name": "Exolon DX polycarbonate",
+                            "company_name": "Covestro",
+                            "application_name": "extruded light diffusers",
+                            "source_chunk_id": "chunk-expand-1",
+                            "source_url": "https://example.com/exolon",
+                            "source_title": "Exolon DX",
+                            "supporting_quote": "Exolon DX polycarbonate sheet is offered by Covestro.",
+                            "confidence_score": 0.77,
+                        }
+                    ],
+                }
+            )
+
+    questions, expanded = GraphEnrichmentExpander(ExpansionLLM()).expand(
+        record.original_query,
+        proposals,
+        validations,
+        [record],
+    )
+
+    assert questions[0].question.startswith("Does the chunk explicitly identify the company")
+    assert expanded[0].edge_type == "Company_PRODUCES_Product"
+    assert expanded[0].product_name == "Exolon DX"
+    assert expanded[0].company_name == "Covestro"
 
 
 def test_promote_hypothesis_writes_to_graph(tmp_path):
@@ -464,3 +666,101 @@ def test_promote_generic_candidate_design_hypothesis_writes_flexible_graph(tmp_p
     edge_types = {row["metadata"]["edge_type"] for row in evidence_rows}
     assert "Product_HAS_Endpoint" in edge_types
     assert "Product_TARGETS_BinderSystem" in edge_types
+
+
+def test_material_grade_and_ctq_edges_are_available_to_graph_evidence(tmp_path):
+    graph_path = tmp_path / "graph"
+    store = GraphEnrichmentStore(graph_path)
+
+    product_id = store._ensure_node("Product", "Tritan", "product_id", "product", aliases=["Eastman Tritan"])
+    family_id = store.ensure_material_family(
+        "Copolyester",
+        canonical_name="Copolyester",
+        family_type="polymer",
+        aliases=["copolyester resin"],
+    )
+    grade_id = store.ensure_material_grade(
+        "Eastman Tritan TX1001",
+        record_type="commercial_grade",
+        source_url="https://example.com/tritan-tx1001",
+        source_record_id="tx1001",
+        manufacturer_name="Eastman Chemical Company",
+        trade_name="Tritan",
+        grade_name="TX1001",
+        material_family_name="Copolyester",
+        applications=["reusable food containers"],
+    )
+    application_id = store._ensure_node("Application", "reusable food containers", "application_id", "application")
+    ctq_id = store.ensure_critical_to_quality(
+        "dishwasher_safe",
+        requirement_type="thermal",
+        aliases=["dishwasher safe"],
+        description="Retains dimensional stability and performance through repeated dishwasher cycles.",
+    )
+    endpoint_id = store._ensure_node(
+        "Endpoint",
+        "glass_transition_temperature",
+        "endpoint_id",
+        None,
+        extra_fields={"endpoint_category": "performance"},
+    )
+
+    store.append_product_material_grade_edge(product_id, grade_id, source_url="https://example.com/tritan-tx1001")
+    store.append_material_grade_family_edge(grade_id, family_id, source_url="https://example.com/tritan-tx1001")
+    store.append_material_grade_endpoint_edge(
+        grade_id,
+        endpoint_id,
+        value_numeric=109.0,
+        unit="C",
+        original_property_name="Glass Transition Temp",
+        original_value_text="109 C",
+        source_url="https://example.com/tritan-tx1001",
+        source_title="Tritan TX1001",
+    )
+    store.append_application_ctq_edge(
+        application_id,
+        ctq_id,
+        requirement_text="Dishwasher Safe",
+        property_requirements={
+            "glass_transition_temperature": {
+                "bound": "min",
+                "value": 100,
+                "unit": "C",
+                "basis": "hot water exposure proxy",
+                "confidence": 0.55,
+            }
+        },
+        source_url="https://example.com/container-requirements",
+        source_title="Container requirements",
+    )
+    store.append_ctq_endpoint_edge(
+        ctq_id,
+        endpoint_id,
+        direction="higher_is_better",
+        default_threshold_value=100.0,
+        unit="C",
+        rationale="Higher Tg generally improves resistance to dishwasher heat softening.",
+        source_url="https://example.com/container-requirements",
+        source_title="Container requirements",
+    )
+
+    document = make_document().model_copy(
+        update={
+            "material_scope": ["Tritan", "Copolyester"],
+            "application_scope": ["reusable food containers"],
+        }
+    )
+    hypothesis = make_hypothesis().model_copy(
+        update={
+            "candidate_material": "Tritan",
+            "application": "reusable food containers",
+            "application_requirements": ["dishwasher safe"],
+        }
+    )
+
+    evidence_rows = GraphMarketEvidence(graph_path).build_evidence_rows(document, hypothesis, limit=12)
+    edge_types = {row["metadata"]["edge_type"] for row in evidence_rows}
+
+    assert "MaterialGrade_HAS_Endpoint" in edge_types
+    assert "Application_REQUIRES_CriticalToQuality" in edge_types
+    assert "CriticalToQuality_INDICATED_BY_Endpoint" in edge_types

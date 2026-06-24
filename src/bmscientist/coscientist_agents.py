@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ from bmscientist.coscientist_models import (
     MarketVolumeEstimateOutput,
     PriceMetric,
     ProximityConcept,
+    ProximityMergePolicy,
     ProximityReviewOutput,
     ProximityRound,
     RankingAction,
@@ -556,6 +558,7 @@ class ResearchPlanningAgent:
         strategic_fit_notes: str | None,
         preferred_evidence_recency_days: int,
         reflection_search_limits: ReflectionSearchLimits,
+        proximity_merge_policy: ProximityMergePolicy | None = None,
     ) -> ResearchGoalDocument:
         system_prompt = PROMPTS.render("research_planning_agent", "create_research_goal.system")
         user_prompt = PROMPTS.render(
@@ -594,6 +597,7 @@ class ResearchPlanningAgent:
             tool_requests=draft.tool_requests,
             search_strategy_notes=draft.search_strategy_notes,
             strategic_fit_notes=strategic_fit_notes,
+            proximity_merge_policy=proximity_merge_policy or ProximityMergePolicy(),
         )
 
     def update_research_goal(
@@ -637,7 +641,7 @@ class ResearchPlanningAgent:
 
 
 class GenerationAgent:
-    _batch_size = 5
+    _minimum_batch_size = 5
 
     def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever, graph_evidence: GraphMarketEvidence | None = None):
         self._llm = llm
@@ -646,7 +650,11 @@ class GenerationAgent:
 
     @property
     def batch_size(self) -> int:
-        return self._batch_size
+        return self._minimum_batch_size
+
+    def batch_size_for(self, requested_hypotheses: int) -> int:
+        requested = max(0, requested_hypotheses)
+        return max(self._minimum_batch_size, (requested + 3) // 4)
 
     def generate(
         self,
@@ -754,7 +762,7 @@ class GenerationAgent:
         **extra_context: Any,
     ) -> list[Hypothesis]:
         hypotheses: "OrderedDict[str, Hypothesis]" = OrderedDict()
-        batch_size = max(1, min(self._batch_size, limit))
+        batch_size = max(1, min(self.batch_size_for(limit), limit))
         max_attempts = max(2, ((limit + batch_size - 1) // batch_size) * 2)
         attempts_without_progress = 0
 
@@ -771,7 +779,7 @@ class GenerationAgent:
                 target_hypotheses_generated=batch_target,
                 target_count=batch_target,
                 existing_hypotheses_json=json.dumps(
-                    self._existing_hypothesis_prompt_payload(list(hypotheses.values())),
+                    self._existing_hypothesis_prompt_payload(document, list(hypotheses.values())),
                     indent=2,
                 ),
                 **extra_context,
@@ -789,6 +797,8 @@ class GenerationAgent:
             for hypothesis in batch_hypotheses:
                 if hypothesis.hypothesis_id in hypotheses:
                     continue
+                if self._duplicates_existing_opportunity(document, hypothesis, hypotheses.values()):
+                    continue
                 hypotheses[hypothesis.hypothesis_id] = hypothesis
                 new_hypotheses.append(hypothesis)
 
@@ -804,19 +814,71 @@ class GenerationAgent:
 
         return list(hypotheses.values())[:limit]
 
+    @classmethod
+    def _existing_hypothesis_prompt_payload(
+        cls,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+    ) -> list[str]:
+        return [cls._hypothesis_duplicate_signature(document, hypothesis) for hypothesis in hypotheses]
+
     @staticmethod
-    def _existing_hypothesis_prompt_payload(hypotheses: list[Hypothesis]) -> list[dict[str, Any]]:
-        return [
-            {
-                "title": hypothesis.title,
-                "application": hypothesis.application,
-                "market_segment": hypothesis.market_segment,
-                "candidate_material": hypothesis.candidate_material,
-                "incumbent_material": hypothesis.incumbent_material,
-                "candidate_artifact": hypothesis.candidate_artifact,
-            }
-            for hypothesis in hypotheses
+    def _duplicates_existing_opportunity(
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        existing_hypotheses: Any,
+    ) -> bool:
+        return any(
+            ProximityCheckAgent._should_cluster(document, existing, hypothesis)
+            for existing in existing_hypotheses
+        )
+
+    @classmethod
+    def _hypothesis_duplicate_signature(
+        cls,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> str:
+        candidate = cls._compact_prompt_text(hypothesis.candidate_material)
+        if not candidate:
+            candidate = cls._compact_prompt_text(cls._primary_artifact_identifier(document, hypothesis))
+        incumbent = cls._compact_prompt_text(hypothesis.incumbent_material)
+        artifact_identifier = cls._compact_prompt_text(cls._primary_artifact_identifier(document, hypothesis))
+        parts = [
+            cls._compact_prompt_text(hypothesis.title),
+            f"app={cls._compact_prompt_text(hypothesis.application or hypothesis.product_type)}",
+            f"market={cls._compact_prompt_text(hypothesis.market_segment or hypothesis.buyer_type)}",
         ]
+        if candidate and incumbent:
+            parts.append(f"{candidate} -> {incumbent}")
+        elif candidate:
+            parts.append(f"candidate={candidate}")
+        elif incumbent:
+            parts.append(f"incumbent={incumbent}")
+        if artifact_identifier and artifact_identifier not in {candidate, cls._compact_prompt_text(hypothesis.title)}:
+            parts.append(f"artifact={artifact_identifier}")
+        compact_parts = [part for part in parts if part and not part.endswith("=")]
+        return " | ".join(compact_parts) or hypothesis.hypothesis_id
+
+    @staticmethod
+    def _primary_artifact_identifier(document: ResearchGoalDocument, hypothesis: Hypothesis) -> str:
+        artifact = hypothesis.candidate_artifact or {}
+        primary_field = document.candidate_artifact_schema.primary_identifier_field
+        if primary_field:
+            value = artifact.get(primary_field)
+            if value not in (None, "", []):
+                return str(value)
+        for fallback_field in ("name_or_label", "candidate_material", "application"):
+            value = artifact.get(fallback_field)
+            if value not in (None, "", []):
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _compact_prompt_text(value: Any) -> str:
+        if value in (None, "", []):
+            return ""
+        return " ".join(str(value).split())
 
     @staticmethod
     def _seeds_to_hypotheses(
@@ -1287,6 +1349,65 @@ class EvolutionAgent:
 
 
 class ProximityCheckAgent:
+    _STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "in",
+        "of",
+        "on",
+        "the",
+        "to",
+        "with",
+    }
+    _REGION_TOKENS = {
+        "apac",
+        "asia",
+        "america",
+        "americas",
+        "emea",
+        "eu",
+        "europe",
+        "european",
+        "global",
+        "latin",
+        "latam",
+        "na",
+        "north",
+        "pacific",
+        "south",
+        "worldwide",
+    }
+    _FAMILY_GENERIC_TOKENS = {
+        "application",
+        "applications",
+        "clear",
+        "clinical",
+        "conversion",
+        "device",
+        "devices",
+        "format",
+        "formats",
+        "hospital",
+        "market",
+        "markets",
+        "medical",
+        "packaging",
+        "primary",
+        "product",
+        "products",
+        "rigid",
+        "secondary",
+        "segment",
+        "segments",
+        "sterile",
+        "surgical",
+        "thermoform",
+        "thermoformed",
+        "transparent",
+    }
+
     def __init__(self, llm: DeepSeekLLM):
         self._llm = llm
 
@@ -1302,63 +1423,109 @@ class ProximityCheckAgent:
             for hypothesis in hypotheses
             if hypothesis.status == "reflected" and hypothesis.is_active
         ]
-        if not active_reflected:
+        return self._review_candidates(
+            document=document,
+            candidates=active_reflected,
+            round_index=round_index,
+            max_synthesized_hypotheses=max_synthesized_hypotheses,
+            empty_note="No active reflected hypotheses available for proximity review.",
+        )
+
+    def review_generated(
+        self,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+        round_index: int,
+        max_synthesized_hypotheses: int,
+    ) -> tuple[ProximityRound, list[Hypothesis], list[Hypothesis]]:
+        active_generated = [
+            hypothesis
+            for hypothesis in hypotheses
+            if hypothesis.status == "generated" and hypothesis.is_active
+        ]
+        return self._review_candidates(
+            document=document,
+            candidates=active_generated,
+            round_index=round_index,
+            max_synthesized_hypotheses=max_synthesized_hypotheses,
+            empty_note="No active generated hypotheses available for pre-reflection proximity review.",
+        )
+
+    def _review_candidates(
+        self,
+        document: ResearchGoalDocument,
+        candidates: list[Hypothesis],
+        round_index: int,
+        max_synthesized_hypotheses: int,
+        empty_note: str,
+    ) -> tuple[ProximityRound, list[Hypothesis], list[Hypothesis]]:
+        if not candidates:
             proximity_round = ProximityRound(
                 proximity_round_id=str(uuid4()),
                 research_id=document.research_id,
                 round_index=round_index,
-                notes=["No active reflected hypotheses available for proximity review."],
+                notes=[empty_note],
+            )
+            return proximity_round, [], []
+        clusters = self._deterministic_clusters(document, candidates)
+        if not clusters:
+            policy = self._policy_for(document)
+            proximity_round = ProximityRound(
+                proximity_round_id=str(uuid4()),
+                research_id=document.research_id,
+                round_index=round_index,
+                notes=[
+                    (
+                        "No overlapping hypothesis clusters found under proximity policy "
+                        f"{policy.merge_mode}/{policy.granularity}."
+                    )
+                ],
             )
             return proximity_round, [], []
 
-        try:
-            output = self._llm_review(document, active_reflected, max_synthesized_hypotheses)
-        except Exception as exc:
-            LOGGER.warning("Proximity review failed (%s); falling back to deterministic concept grouping", exc)
-            output = self._fallback_review(active_reflected)
-
-        concepts = [concept for concept in output.concepts if concept.member_hypothesis_ids]
-        concepts_by_member: dict[str, list[ProximityConcept]] = {}
-        for concept in concepts:
-            for hypothesis_id in concept.member_hypothesis_ids:
-                concepts_by_member.setdefault(hypothesis_id, []).append(concept)
-
+        active_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in candidates}
         updated_hypotheses: list[Hypothesis] = []
-        active_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in active_reflected}
-        for hypothesis in active_reflected:
-            member_concepts = concepts_by_member.get(hypothesis.hypothesis_id, [])
-            if not member_concepts:
-                continue
-            labels = list(
-                OrderedDict.fromkeys(
-                    hypothesis.concept_labels + [concept.concept_label for concept in member_concepts]
-                )
-            )
-            updated_hypotheses.append(
-                hypothesis.model_copy(
-                    update={
-                        "concept_labels": labels,
-                        "concept_cluster_id": hypothesis.concept_cluster_id or member_concepts[0].concept_label,
-                    }
-                )
-            )
-
         synthesized_hypotheses: list[Hypothesis] = []
+        concepts: list[ProximityConcept] = []
         retired_hypothesis_ids: list[str] = []
-        labeled_hypothesis_ids = [hypothesis.hypothesis_id for hypothesis in updated_hypotheses]
-        for seed in output.synthesized_hypotheses[:max_synthesized_hypotheses]:
-            member_ids = [item for item in seed.merged_from_hypothesis_ids if item in active_by_id]
-            if len(member_ids) < 2:
+        labeled_hypothesis_ids: list[str] = []
+        notes = [
+            (
+                "Applied proximity policy "
+                f"{self._policy_for(document).merge_mode}/{self._policy_for(document).granularity} "
+                "with region union enabled for synthesized hypotheses."
+            )
+        ]
+
+        for index, cluster in enumerate(clusters):
+            concept, seed, cluster_notes = self._review_cluster(
+                document=document,
+                cluster=cluster,
+                synthesize=index < max(0, max_synthesized_hypotheses),
+            )
+            concepts.append(concept)
+            notes.extend(cluster_notes)
+            cluster_ids = [hypothesis.hypothesis_id for hypothesis in cluster]
+            labeled_hypothesis_ids.extend(cluster_ids)
+            for hypothesis in cluster:
+                labels = list(OrderedDict.fromkeys(hypothesis.concept_labels + [concept.concept_label]))
+                updated_hypotheses.append(
+                    hypothesis.model_copy(
+                        update={
+                            "concept_labels": labels,
+                            "concept_cluster_id": hypothesis.concept_cluster_id or concept.concept_label,
+                        }
+                    )
+                )
+            if seed is None:
                 continue
-            synthesized = self._seed_to_hypothesis(document, seed, round_index, member_ids)
+            synthesized = self._seed_to_hypothesis(document, seed, round_index, cluster_ids, cluster)
             synthesized_hypotheses.append(synthesized)
-            for member_id in member_ids:
+            for member_id in cluster_ids:
                 retired_hypothesis_ids.append(member_id)
                 member = active_by_id[member_id]
                 merged_labels = list(
-                    OrderedDict.fromkeys(
-                        member.concept_labels + ([seed.concept_label] if seed.concept_label else [])
-                    )
+                    OrderedDict.fromkeys(member.concept_labels + [concept.concept_label])
                 )
                 updated_hypotheses.append(
                     member.model_copy(
@@ -1368,7 +1535,7 @@ class ProximityCheckAgent:
                             "retired_reason": "merged_into_synthesized_hypothesis",
                             "superseded_by_hypothesis_id": synthesized.hypothesis_id,
                             "concept_labels": merged_labels,
-                            "concept_cluster_id": member.concept_cluster_id or seed.concept_label,
+                            "concept_cluster_id": member.concept_cluster_id or concept.concept_label,
                         }
                     )
                 )
@@ -1381,12 +1548,52 @@ class ProximityCheckAgent:
             synthesized_hypothesis_ids=[hypothesis.hypothesis_id for hypothesis in synthesized_hypotheses],
             retired_hypothesis_ids=list(OrderedDict.fromkeys(retired_hypothesis_ids)),
             labeled_hypothesis_ids=list(OrderedDict.fromkeys(labeled_hypothesis_ids)),
-            notes=output.notes,
+            notes=list(OrderedDict.fromkeys(notes)),
         )
         deduped_updates: "OrderedDict[str, Hypothesis]" = OrderedDict()
         for hypothesis in updated_hypotheses:
             deduped_updates[hypothesis.hypothesis_id] = hypothesis
         return proximity_round, list(deduped_updates.values()), synthesized_hypotheses
+
+    def _review_cluster(
+        self,
+        document: ResearchGoalDocument,
+        cluster: list[Hypothesis],
+        synthesize: bool,
+    ) -> tuple[ProximityConcept, SynthesizedHypothesisSeed | None, list[str]]:
+        cluster_ids = [hypothesis.hypothesis_id for hypothesis in cluster]
+        output: ProximityReviewOutput | None = None
+        notes: list[str] = []
+        if synthesize:
+            try:
+                output = self._llm_review(document, cluster, max_synthesized_hypotheses=1)
+                notes.extend(output.notes)
+            except Exception as exc:
+                LOGGER.warning("Proximity review failed for cluster %s (%s); falling back to deterministic synthesis", cluster_ids, exc)
+                notes.append(f"Used deterministic synthesis fallback for cluster {', '.join(cluster_ids)}.")
+        concept_label = self._concept_label_from_output(output) or self._fallback_concept_label(document, cluster)
+        concept_description = self._concept_description_from_output(output) or (
+            "Deterministic overlap cluster using the project proximity merge policy."
+        )
+        concept = ProximityConcept(
+            concept_label=concept_label,
+            description=concept_description,
+            member_hypothesis_ids=cluster_ids,
+        )
+        if not synthesize:
+            return concept, None, notes
+
+        seed = self._synthesized_seed_from_output(output)
+        if seed is None:
+            seed = self._fallback_synthesized_seed(document, cluster, concept)
+        else:
+            seed = seed.model_copy(
+                update={
+                    "merged_from_hypothesis_ids": cluster_ids,
+                    "concept_label": concept.concept_label,
+                }
+            )
+        return concept, seed, notes
 
     def _llm_review(
         self,
@@ -1401,8 +1608,13 @@ class ProximityCheckAgent:
                 "summary": hypothesis.summary,
                 "application": hypothesis.application,
                 "market_segment": hypothesis.market_segment,
+                "region_scope": hypothesis.region_scope,
                 "candidate_material": hypothesis.candidate_material,
                 "incumbent_material": hypothesis.incumbent_material,
+                "product_type": hypothesis.product_type,
+                "buyer_type": hypothesis.buyer_type,
+                "application_requirements": hypothesis.application_requirements,
+                "substitution_drivers": hypothesis.substitution_drivers,
                 "concept_labels": hypothesis.concept_labels,
                 "ranking_score": hypothesis.ranking_score,
                 "reflection": RankingAgent._assessment_payload(hypothesis.reflection_assessment),
@@ -1420,32 +1632,352 @@ class ProximityCheckAgent:
         )
         return self._llm.complete_json(ProximityReviewOutput, system_prompt, user_prompt)
 
+    @classmethod
+    def _deterministic_clusters(
+        cls,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+    ) -> list[list[Hypothesis]]:
+        if len(hypotheses) < 2:
+            return []
+
+        parent = list(range(len(hypotheses)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            root_left = find(left)
+            root_right = find(right)
+            if root_left != root_right:
+                parent[root_right] = root_left
+
+        for left in range(len(hypotheses)):
+            for right in range(left + 1, len(hypotheses)):
+                if cls._should_cluster(document, hypotheses[left], hypotheses[right]):
+                    union(left, right)
+
+        grouped: dict[int, list[Hypothesis]] = {}
+        for index, hypothesis in enumerate(hypotheses):
+            grouped.setdefault(find(index), []).append(hypothesis)
+        clusters = [group for group in grouped.values() if len(group) >= 2]
+        clusters.sort(key=cls._cluster_sort_key)
+        return clusters
+
+    @classmethod
+    def _should_cluster(
+        cls,
+        document: ResearchGoalDocument,
+        left: Hypothesis,
+        right: Hypothesis,
+    ) -> bool:
+        if not cls._same_core_opportunity(document, left, right):
+            return False
+
+        policy = cls._policy_for(document)
+        family_overlap = bool(cls._family_tokens(left) & cls._family_tokens(right))
+        market_overlap = bool(cls._market_tokens(left) & cls._market_tokens(right))
+        support_overlap = cls._supporting_overlap(left, right)
+        similarity = cls._token_similarity(cls._context_tokens(left), cls._context_tokens(right))
+
+        if policy.granularity == "device_subtype":
+            return cls._application_signature(left) == cls._application_signature(right) != ""
+
+        if policy.granularity == "application_family":
+            if family_overlap:
+                if policy.merge_mode == "conservative":
+                    return support_overlap or similarity >= 0.35
+                return True
+            return policy.merge_mode == "aggressive" and market_overlap and similarity >= 0.45
+
+        if policy.merge_mode == "conservative":
+            return family_overlap and (market_overlap or support_overlap)
+        if policy.merge_mode == "balanced":
+            return family_overlap or market_overlap
+        return family_overlap or market_overlap or similarity >= 0.45
+
+    @classmethod
+    def _same_core_opportunity(
+        cls,
+        document: ResearchGoalDocument,
+        left: Hypothesis,
+        right: Hypothesis,
+    ) -> bool:
+        left_candidate = cls._candidate_key(document, left)
+        right_candidate = cls._candidate_key(document, right)
+        left_incumbent = cls._normalize_text_key(left.incumbent_material)
+        right_incumbent = cls._normalize_text_key(right.incumbent_material)
+        if left_candidate and right_candidate and left_candidate != right_candidate:
+            return False
+        if left_incumbent and right_incumbent and left_incumbent != right_incumbent:
+            return False
+        return bool(left_candidate or right_candidate or left_incumbent or right_incumbent)
+
+    @classmethod
+    def _candidate_key(cls, document: ResearchGoalDocument, hypothesis: Hypothesis) -> str:
+        candidate = hypothesis.candidate_material or GenerationAgent._primary_artifact_identifier(document, hypothesis)
+        return cls._material_family_key(candidate)
+
     @staticmethod
-    def _fallback_review(hypotheses: list[Hypothesis]) -> ProximityReviewOutput:
-        grouped: dict[tuple[str, str], list[str]] = {}
-        for hypothesis in hypotheses:
-            key = (
-                (hypothesis.application or "unknown").strip().lower(),
-                (hypothesis.candidate_material or "unknown").strip().lower(),
-            )
-            grouped.setdefault(key, []).append(hypothesis.hypothesis_id)
-        fallback_concepts: list[ProximityConcept] = []
-        for (application, candidate_material), member_ids in grouped.items():
-            if len(member_ids) < 2:
-                continue
-            label = f"{(candidate_material or 'material').upper()} in {application.title()}"
-            fallback_concepts.append(
-                ProximityConcept(
-                    concept_label=label,
-                    description="Deterministic grouping by application and candidate material.",
-                    member_hypothesis_ids=member_ids,
-                )
-            )
-        return ProximityReviewOutput(
-            concepts=fallback_concepts,
-            synthesized_hypotheses=[],
-            notes=["Used deterministic proximity grouping fallback."],
+    def _policy_for(document: ResearchGoalDocument) -> ProximityMergePolicy:
+        return ProximityMergePolicy.model_validate(document.proximity_merge_policy)
+
+    @classmethod
+    def _application_signature(cls, hypothesis: Hypothesis) -> str:
+        tokens = cls._token_set(
+            [hypothesis.application, hypothesis.product_type],
+            drop_family_generic=False,
         )
+        return " ".join(sorted(tokens))
+
+    @classmethod
+    def _family_tokens(cls, hypothesis: Hypothesis) -> set[str]:
+        tokens = cls._token_set(
+            [hypothesis.application, hypothesis.product_type],
+            drop_family_generic=True,
+        )
+        if tokens:
+            return tokens
+        return cls._token_set([hypothesis.application, hypothesis.product_type], drop_family_generic=False)
+
+    @classmethod
+    def _market_tokens(cls, hypothesis: Hypothesis) -> set[str]:
+        tokens = cls._token_set(
+            [hypothesis.market_segment, hypothesis.buyer_type],
+            drop_family_generic=True,
+        )
+        if tokens:
+            return tokens
+        return cls._token_set([hypothesis.market_segment, hypothesis.buyer_type], drop_family_generic=False)
+
+    @classmethod
+    def _context_tokens(cls, hypothesis: Hypothesis) -> set[str]:
+        return cls._token_set(
+            [
+                hypothesis.application,
+                hypothesis.product_type,
+                hypothesis.market_segment,
+                hypothesis.buyer_type,
+                " ".join(hypothesis.application_requirements),
+                " ".join(hypothesis.substitution_drivers),
+            ],
+            drop_family_generic=False,
+        )
+
+    @classmethod
+    def _supporting_overlap(cls, left: Hypothesis, right: Hypothesis) -> bool:
+        left_support = cls._token_set(
+            [" ".join(left.application_requirements), " ".join(left.substitution_drivers)],
+            drop_family_generic=False,
+        )
+        right_support = cls._token_set(
+            [" ".join(right.application_requirements), " ".join(right.substitution_drivers)],
+            drop_family_generic=False,
+        )
+        return bool(left_support & right_support)
+
+    @classmethod
+    def _token_set(cls, values: list[str | None], drop_family_generic: bool) -> set[str]:
+        tokens: set[str] = set()
+        for value in values:
+            for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+                normalized = cls._singularize_token(token)
+                if not normalized or normalized in cls._STOPWORDS or normalized in cls._REGION_TOKENS:
+                    continue
+                if drop_family_generic and normalized in cls._FAMILY_GENERIC_TOKENS:
+                    continue
+                tokens.add(normalized)
+        return tokens
+
+    @staticmethod
+    def _singularize_token(token: str) -> str:
+        if len(token) > 4 and token.endswith("ies"):
+            return token[:-3] + "y"
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            return token[:-1]
+        return token
+
+    @staticmethod
+    def _token_similarity(left_tokens: set[str], right_tokens: set[str]) -> float:
+        if not left_tokens or not right_tokens:
+            return 0.0
+        intersection = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        return intersection / union if union else 0.0
+
+    @classmethod
+    def _cluster_sort_key(cls, cluster: list[Hypothesis]) -> tuple[float, float, str]:
+        mean_score = sum(hypothesis.ranking_score or 0.0 for hypothesis in cluster) / len(cluster)
+        title_key = min(hypothesis.title for hypothesis in cluster)
+        return (-len(cluster), -mean_score, title_key)
+
+    @staticmethod
+    def _concept_label_from_output(output: ProximityReviewOutput | None) -> str:
+        if output is None:
+            return ""
+        for concept in output.concepts:
+            if concept.concept_label.strip():
+                return concept.concept_label.strip()
+        return ""
+
+    @staticmethod
+    def _concept_description_from_output(output: ProximityReviewOutput | None) -> str:
+        if output is None:
+            return ""
+        for concept in output.concepts:
+            if concept.description.strip():
+                return concept.description.strip()
+        return ""
+
+    @staticmethod
+    def _synthesized_seed_from_output(output: ProximityReviewOutput | None) -> SynthesizedHypothesisSeed | None:
+        if output is None or not output.synthesized_hypotheses:
+            return None
+        return output.synthesized_hypotheses[0]
+
+    @classmethod
+    def _fallback_concept_label(
+        cls,
+        document: ResearchGoalDocument,
+        cluster: list[Hypothesis],
+    ) -> str:
+        candidate = cls._cluster_candidate_label(document, cluster) or "candidate"
+        focus = cls._cluster_focus_label(cluster) or "opportunity"
+        return f"{candidate} {focus} cluster".strip()
+
+    @classmethod
+    def _fallback_synthesized_seed(
+        cls,
+        document: ResearchGoalDocument,
+        cluster: list[Hypothesis],
+        concept: ProximityConcept,
+    ) -> SynthesizedHypothesisSeed:
+        candidate = cls._cluster_candidate_label(document, cluster) or "Candidate"
+        incumbent = cls._most_common_text([hypothesis.incumbent_material for hypothesis in cluster])
+        focus = cls._cluster_focus_label(cluster) or "opportunity"
+        application = cls._synthesized_application(cluster, focus)
+        market_segment = cls._most_common_text([hypothesis.market_segment for hypothesis in cluster])
+        title = f"{candidate} platform for {application}".strip()
+        summary = (
+            f"A merged opportunity covering overlapping {focus} variants that share the same core replacement thesis."
+        )
+        if market_segment:
+            summary = f"{summary} The combined opportunity is anchored in {market_segment}."
+        return SynthesizedHypothesisSeed(
+            title=title,
+            summary=summary,
+            application=application,
+            market_segment=market_segment or None,
+            candidate_material=cls._most_common_text([hypothesis.candidate_material for hypothesis in cluster]) or None,
+            incumbent_material=incumbent or None,
+            next_best_competitive_alternative=cls._most_common_text(
+                [hypothesis.next_best_competitive_alternative for hypothesis in cluster]
+            )
+            or None,
+            incumbent_form=cls._most_common_text([hypothesis.incumbent_form for hypothesis in cluster]) or None,
+            candidate_form=cls._most_common_text([hypothesis.candidate_form for hypothesis in cluster]) or None,
+            conversion_process=cls._most_common_text([hypothesis.conversion_process for hypothesis in cluster]) or None,
+            product_type=cls._most_common_text([hypothesis.product_type for hypothesis in cluster]) or None,
+            buyer_type=cls._most_common_text([hypothesis.buyer_type for hypothesis in cluster]) or None,
+            application_requirements=cls._union_lists(hypothesis.application_requirements for hypothesis in cluster),
+            substitution_drivers=cls._union_lists(hypothesis.substitution_drivers for hypothesis in cluster),
+            strategic_rationale=(
+                "Synthesizes overlapping reflected hypotheses into a single opportunity family and "
+                "combines regional scope into one thesis."
+            ),
+            supporting_chunk_ids=cls._union_lists(hypothesis.supporting_chunk_ids for hypothesis in cluster),
+            supporting_urls=cls._union_lists(hypothesis.supporting_urls for hypothesis in cluster),
+            assumptions=cls._union_lists(hypothesis.assumptions for hypothesis in cluster),
+            unknowns=cls._union_lists(hypothesis.unknowns for hypothesis in cluster),
+            candidate_artifact=cls._first_non_empty_artifact(cluster),
+            evaluation_results=[],
+            generation_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    sum(hypothesis.generation_confidence for hypothesis in cluster) / len(cluster),
+                ),
+            ),
+            merged_from_hypothesis_ids=[hypothesis.hypothesis_id for hypothesis in cluster],
+            concept_label=concept.concept_label,
+            synthesis_rationale="Deterministic synthesis for a policy-defined overlap cluster.",
+        )
+
+    @classmethod
+    def _cluster_candidate_label(
+        cls,
+        document: ResearchGoalDocument,
+        cluster: list[Hypothesis],
+    ) -> str:
+        candidates = [
+            hypothesis.candidate_material or GenerationAgent._primary_artifact_identifier(document, hypothesis)
+            for hypothesis in cluster
+        ]
+        return cls._most_common_text(candidates)
+
+    @classmethod
+    def _cluster_focus_label(cls, cluster: list[Hypothesis]) -> str:
+        family_sets = [cls._family_tokens(hypothesis) for hypothesis in cluster if cls._family_tokens(hypothesis)]
+        if family_sets:
+            shared = set.intersection(*family_sets)
+            if shared:
+                return " ".join(sorted(shared))
+        return (
+            cls._most_common_text([hypothesis.application for hypothesis in cluster])
+            or cls._most_common_text([hypothesis.product_type for hypothesis in cluster])
+            or cls._most_common_text([hypothesis.market_segment for hypothesis in cluster])
+            or "opportunity"
+        )
+
+    @classmethod
+    def _synthesized_application(cls, cluster: list[Hypothesis], focus: str) -> str:
+        application = cls._most_common_text([hypothesis.application for hypothesis in cluster])
+        if application:
+            return application
+        if focus == "opportunity":
+            return "combined opportunity"
+        return f"{focus} opportunities"
+
+    @staticmethod
+    def _most_common_text(values: list[str | None]) -> str:
+        filtered = [str(value).strip() for value in values if str(value or "").strip()]
+        if not filtered:
+            return ""
+        counts = Counter(filtered)
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    @staticmethod
+    def _union_lists(values: list[list[str]] | Any) -> list[str]:
+        merged: list[str] = []
+        for items in values:
+            for item in items:
+                if item and item not in merged:
+                    merged.append(item)
+        return merged
+
+    @staticmethod
+    def _first_non_empty_artifact(cluster: list[Hypothesis]) -> dict[str, Any]:
+        for hypothesis in cluster:
+            if hypothesis.candidate_artifact:
+                return dict(hypothesis.candidate_artifact)
+        return {}
+
+    @staticmethod
+    def _normalize_text_key(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    @classmethod
+    def _material_family_key(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        text = re.sub(r"\([^)]*\)", " ", text)
+        text = re.sub(r"\b(?:e\.?g\.?|grade|grades|injection|molding|extrusion|resin|series|type)\b", " ", text)
+        text = re.sub(r"\b[a-z]{1,4}\d{2,}[a-z0-9-]*\b", " ", text)
+        return cls._normalize_text_key(text)
 
     @staticmethod
     def _seed_to_hypothesis(
@@ -1453,6 +1985,7 @@ class ProximityCheckAgent:
         seed: SynthesizedHypothesisSeed,
         round_index: int,
         member_ids: list[str],
+        members: list[Hypothesis],
     ) -> Hypothesis:
         hypothesis_id = str(
             uuid5(
@@ -1471,7 +2004,7 @@ class ProximityCheckAgent:
             summary=seed.summary,
             application=seed.application,
             market_segment=seed.market_segment,
-            region_scope=document.regions,
+            region_scope=ProximityCheckAgent._union_lists([member.region_scope for member in members]) or document.regions,
             candidate_material=seed.candidate_material,
             incumbent_material=seed.incumbent_material,
             next_best_competitive_alternative=seed.next_best_competitive_alternative,
@@ -1487,6 +2020,8 @@ class ProximityCheckAgent:
             supporting_urls=seed.supporting_urls,
             assumptions=seed.assumptions,
             unknowns=seed.unknowns,
+            candidate_artifact=seed.candidate_artifact or ProximityCheckAgent._first_non_empty_artifact(members),
+            evaluation_results=seed.evaluation_results,
             generation_confidence=seed.generation_confidence,
             round_index=round_index,
             generation_source="synthesized",
@@ -2721,6 +3256,8 @@ class CoScientistRunner:
         results_per_query: int = 5,
         max_pages_per_search: int = 8,
         reflection_concurrency: int = 3,
+        proximity_merge_mode: str = "balanced",
+        proximity_granularity: str = "application_family",
         spawn_reflection_daemons: bool = False,
     ) -> CoScientistRunResult:
         limits = ReflectionSearchLimits(
@@ -2739,6 +3276,10 @@ class CoScientistRunner:
             strategic_fit_notes=strategic_fit_notes,
             preferred_evidence_recency_days=preferred_evidence_recency_days,
             reflection_search_limits=limits,
+            proximity_merge_policy=ProximityMergePolicy(
+                merge_mode=proximity_merge_mode,
+                granularity=proximity_granularity,
+            ),
         )
         research_goal_path = self._artifact_store.save_research_goal(document)
         self._progress_reporter.complete("planning", "Goal processed")
@@ -2747,9 +3288,15 @@ class CoScientistRunner:
         generated_lock = Lock()
         stop_reflection_monitor: Callable[[], None] | None = None
         if spawn_reflection_daemons:
+            batch_size_for = getattr(self._generation_agent, "batch_size_for", None)
+            generation_batch_size = (
+                batch_size_for(document.target_hypotheses_generated)
+                if callable(batch_size_for)
+                else self._generation_agent.batch_size
+            )
             self._spawn_reflection_daemons(
                 research_id=document.research_id,
-                worker_count=min(max(1, self._generation_agent.batch_size), document.target_hypotheses_generated),
+                worker_count=min(max(1, generation_batch_size), document.target_hypotheses_generated),
                 preferred_evidence_recency_days=preferred_evidence_recency_days,
                 max_reflection_searches_per_hypothesis=max_reflection_searches_per_hypothesis,
                 results_per_query=results_per_query,
@@ -2796,6 +3343,9 @@ class CoScientistRunner:
             if hypothesis.hypothesis_id not in persisted_ids:
                 self._artifact_store.append_hypothesis_snapshot(hypothesis)
                 persisted_ids.add(hypothesis.hypothesis_id)
+
+        if not spawn_reflection_daemons:
+            generated = self._apply_pre_reflection_proximity(document, generated, round_index=0)
 
         if spawn_reflection_daemons:
             try:
@@ -2864,6 +3414,8 @@ class CoScientistRunner:
         results_per_query: int | None = None,
         max_pages_per_search: int | None = None,
         reflection_concurrency: int = 3,
+        proximity_merge_mode: str | None = None,
+        proximity_granularity: str | None = None,
     ) -> CoScientistLoopResult:
         self._seed_cost_tracking_for_research(research_id)
         self._progress_reporter.start("loop_load", "Loading research run")
@@ -2875,7 +3427,42 @@ class CoScientistRunner:
             results_per_query=results_per_query,
             max_pages_per_search=max_pages_per_search,
         )
+        updated_proximity_document = self._with_proximity_overrides(
+            document=document,
+            proximity_merge_mode=proximity_merge_mode,
+            proximity_granularity=proximity_granularity,
+        )
+        if updated_proximity_document != document:
+            document = updated_proximity_document
+            self._artifact_store.save_research_goal(document)
         self._progress_reporter.complete("loop_load", "Research run loaded")
+        
+        # Self-healing: check if there are generated hypotheses in queue that need reflection
+        generated_dir = self._artifact_store.hypotheses_dir(research_id) / "generated"
+        generated_files = list(generated_dir.glob("*.json")) if generated_dir.exists() else []
+        latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
+        unreflected = [
+            h for h in latest_hypotheses
+            if h.status in ("generated", "generation", "reflecting")
+        ]
+        
+        if generated_files or unreflected:
+            self._progress_reporter.start(
+                "reflection", 
+                "Resuming reflection on queued ideas", 
+                max(len(generated_files), len(unreflected))
+            )
+            self._reflect_from_queue(
+                document=document,
+                research_id=research_id,
+                concurrency=reflection_concurrency,
+                daemon=False,
+                phase="reflection",
+                progress_message="Reflecting on ideas"
+            )
+            # Reload latest hypotheses to reflect status changes
+            latest_hypotheses = self._artifact_store.latest_hypotheses(research_id)
+
         target_final = target_final_hypotheses or document.target_hypotheses_final
         rounds_completed = 0
         total_evolved = 0
@@ -3063,9 +3650,13 @@ class CoScientistRunner:
                 self._artifact_store.append_hypothesis_snapshot(parent.model_copy(update={"status": "reflected"}))
             for hypothesis in new_hypotheses:
                 self._artifact_store.append_hypothesis_snapshot(hypothesis)
+            new_hypotheses = self._apply_pre_reflection_proximity(document, new_hypotheses, round_index=round_index)
             total_evolved += len([hypothesis for hypothesis in new_hypotheses if hypothesis.generation_source == "evolved"])
             total_regenerated += len(
                 [hypothesis for hypothesis in new_hypotheses if hypothesis.generation_source == "regenerated"]
+            )
+            total_synthesized += len(
+                [hypothesis for hypothesis in new_hypotheses if hypothesis.generation_source == "synthesized"]
             )
             reflected_new, run_count = self._reflect_and_append(
                 document,
@@ -3113,6 +3704,44 @@ class CoScientistRunner:
             stop_reason=stop_reason,
             cost_path=cost_path,
         )
+
+    def _apply_pre_reflection_proximity(
+        self,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+        round_index: int,
+    ) -> list[Hypothesis]:
+        if len(hypotheses) < 2 or not hasattr(self, "_proximity_agent"):
+            return hypotheses
+
+        proximity_round, proximity_updates, synthesized_hypotheses = self._proximity_agent.review_generated(
+            document=document,
+            hypotheses=hypotheses,
+            round_index=round_index,
+            max_synthesized_hypotheses=len(hypotheses),
+        )
+        if not proximity_updates and not synthesized_hypotheses:
+            return hypotheses
+
+        if hasattr(self._artifact_store, "append_proximity_round"):
+            self._artifact_store.append_proximity_round(proximity_round)
+        for hypothesis in proximity_updates:
+            self._artifact_store.append_hypothesis_snapshot(hypothesis)
+        for hypothesis in synthesized_hypotheses:
+            self._artifact_store.append_hypothesis_snapshot(hypothesis)
+
+        retired_ids = {
+            hypothesis.hypothesis_id
+            for hypothesis in proximity_updates
+            if hypothesis.status == "retired" or not hypothesis.is_active
+        }
+        active_by_id: "OrderedDict[str, Hypothesis]" = OrderedDict()
+        for hypothesis in hypotheses:
+            if hypothesis.hypothesis_id not in retired_ids and hypothesis.status == "generated" and hypothesis.is_active:
+                active_by_id[hypothesis.hypothesis_id] = hypothesis
+        for hypothesis in synthesized_hypotheses:
+            active_by_id[hypothesis.hypothesis_id] = hypothesis
+        return list(active_by_id.values())
 
     @staticmethod
     def _loop_round_label(round_index: int, max_rounds: int | None) -> str:
@@ -3578,6 +4207,23 @@ class CoScientistRunner:
                 "reflection_search_limits": limits,
             }
         )
+
+    @staticmethod
+    def _with_proximity_overrides(
+        document: ResearchGoalDocument,
+        proximity_merge_mode: str | None,
+        proximity_granularity: str | None,
+    ) -> ResearchGoalDocument:
+        current_policy = ProximityMergePolicy.model_validate(document.proximity_merge_policy)
+        next_policy = current_policy.model_copy(
+            update={
+                "merge_mode": proximity_merge_mode or current_policy.merge_mode,
+                "granularity": proximity_granularity or current_policy.granularity,
+            }
+        )
+        if next_policy == current_policy:
+            return document
+        return document.model_copy(update={"proximity_merge_policy": next_policy})
 
     @staticmethod
     def _dedupe_new_hypotheses(

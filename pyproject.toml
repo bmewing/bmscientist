@@ -14,6 +14,7 @@ authors = [
 ]
 dependencies = [
   "beautifulsoup4>=4.12.3",
+  "duckdb>=1.5.4",
   "langgraph>=0.2.34",
   "lancedb>=0.24.0",
   "openai>=1.51.0",

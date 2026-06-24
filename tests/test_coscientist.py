@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from bmscientist.coscientist_models import (
     HypothesisGenerationOutput,
     MetaReviewOutput,
     PriceMetric,
+    ProximityMergePolicy,
     ProximityReviewOutput,
     RankedHypothesis,
     RankingOutput,
@@ -401,6 +403,11 @@ class ProximityLLM:
         )
 
 
+class FailingProximityLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        raise RuntimeError("proximity llm unavailable")
+
+
 class MetaReviewLLM:
     def __init__(self, gaps=None, coverage_sufficient=False):
         self.gaps = gaps if gaps is not None else ["Need stronger coverage in non-medical rigid clear applications."]
@@ -681,6 +688,89 @@ def test_generation_reports_batch_progress_for_large_targets():
 
     assert len(hypotheses) == 6
     assert progress_updates == [(5, 6)]
+
+
+def test_generation_uses_quarter_sized_batches_for_large_targets():
+    class BatchSizingLLM:
+        def __init__(self):
+            self.requested_targets = []
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            match = re.search(r"Generate (\d+) additional distinct hypotheses", user_prompt)
+            assert match is not None
+            batch_target = int(match.group(1))
+            self.requested_targets.append(batch_target)
+            batch_number = len(self.requested_targets)
+            payload = {
+                "hypotheses": [
+                    {
+                        "title": f"Batch {batch_number} idea {index}",
+                        "summary": "Idea",
+                        "candidate_material": "PETG",
+                    }
+                    for index in range(1, batch_target + 1)
+                ]
+            }
+            return response_model.model_validate(payload)
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    llm = BatchSizingLLM()
+    agent = GenerationAgent(llm, retriever)
+
+    hypotheses = agent.generate(make_document().model_copy(update={"target_hypotheses_generated": 24}))
+
+    assert len(hypotheses) == 24
+    assert llm.requested_targets == [6, 6, 6, 6]
+
+
+def test_generation_existing_hypothesis_payload_is_compact():
+    payload = GenerationAgent._existing_hypothesis_prompt_payload(make_document(), [make_hypothesis()])
+
+    assert payload == [
+        "PETG for rigid medical trays | app=medical trays | market=medical packaging | PETG -> PVC"
+    ]
+
+
+def test_generation_dedupes_material_grade_variants_before_reflection():
+    class DuplicateCuvetteLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "Tritan Copolyester for Injection-Molded Transparent Laboratory Cuvettes and Microcuvettes (UV-Vis) Replacing Polystyrene",
+                            "summary": "Tritan copolyester can replace polystyrene in UV-Vis laboratory cuvettes.",
+                            "application": "laboratory UV-Vis cuvettes and microcuvettes",
+                            "market_segment": "laboratory consumables",
+                            "candidate_material": "Tritan copolyester",
+                            "incumbent_material": "Polystyrene",
+                            "application_requirements": ["optical clarity", "injection molding"],
+                            "substitution_drivers": ["durability"],
+                            "generation_confidence": 0.55,
+                        },
+                        {
+                            "title": "Tritan Copolyester for Injection-Molded Laboratory UV-Vis Cuvettes Displacing Polystyrene",
+                            "summary": "Injection molding grades of Tritan can replace polystyrene cuvettes.",
+                            "application": "laboratory UV-Vis cuvettes",
+                            "market_segment": "laboratory consumables",
+                            "candidate_material": "Tritan copolyester (injection molding grade, e.g., TX1001 or TX1501)",
+                            "incumbent_material": "Polystyrene",
+                            "application_requirements": ["optical clarity", "injection molding"],
+                            "substitution_drivers": ["durability"],
+                            "generation_confidence": 0.55,
+                        },
+                    ]
+                }
+            )
+
+    document = make_document().model_copy(update={"target_hypotheses_generated": 2})
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    agent = GenerationAgent(DuplicateCuvetteLLM(), retriever)
+
+    hypotheses = agent.generate(document)
+
+    assert len(hypotheses) == 1
+    assert hypotheses[0].candidate_material == "Tritan copolyester"
 
 
 def test_generation_from_meta_review_uses_only_meta_review_guidance():
@@ -1541,6 +1631,139 @@ def test_proximity_agent_labels_and_synthesizes_overlapping_hypotheses():
     assert "PETG medical tray conversion cluster" in updates_by_id["hyp-1"].concept_labels
     assert updates_by_id["hyp-2"].retired_reason == "merged_into_synthesized_hypothesis"
     assert updates_by_id["hyp-2"].status == "retired"
+
+
+def test_proximity_agent_application_family_merges_device_variants_and_regions():
+    document = make_document().model_copy(
+        update={
+            "proximity_merge_policy": ProximityMergePolicy(
+                merge_mode="balanced",
+                granularity="application_family",
+            )
+        }
+    )
+    hyp_1 = make_reflected_hypothesis("hyp-1", "PETG for sterile catheter trays").model_copy(
+        update={
+            "application": "sterile catheter trays",
+            "product_type": "tray",
+            "region_scope": ["North America"],
+        }
+    )
+    hyp_2 = make_reflected_hypothesis("hyp-2", "PETG for sterile orthopedic trays").model_copy(
+        update={
+            "application": "sterile orthopedic trays",
+            "product_type": "tray",
+            "region_scope": ["Europe"],
+        }
+    )
+    agent = ProximityCheckAgent(FailingProximityLLM())
+
+    proximity_round, updated, synthesized = agent.review(document, [hyp_1, hyp_2], 1, 2)
+
+    assert len(proximity_round.concepts) == 1
+    assert len(synthesized) == 1
+    assert synthesized[0].merged_from_hypothesis_ids == ["hyp-1", "hyp-2"]
+    assert synthesized[0].region_scope == ["North America", "Europe"]
+    updates_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in updated}
+    assert updates_by_id["hyp-1"].status == "retired"
+    assert updates_by_id["hyp-2"].status == "retired"
+
+
+def test_proximity_agent_device_subtype_merges_regions_but_keeps_other_subtypes_separate():
+    document = make_document().model_copy(
+        update={
+            "proximity_merge_policy": ProximityMergePolicy(
+                merge_mode="balanced",
+                granularity="device_subtype",
+            )
+        }
+    )
+    hyp_1 = make_reflected_hypothesis("hyp-1", "PETG for sterile catheter trays").model_copy(
+        update={
+            "application": "sterile catheter trays",
+            "product_type": "tray",
+            "region_scope": ["North America"],
+        }
+    )
+    hyp_2 = make_reflected_hypothesis("hyp-2", "PETG for sterile catheter trays EU").model_copy(
+        update={
+            "application": "sterile catheter trays",
+            "product_type": "tray",
+            "region_scope": ["Europe"],
+        }
+    )
+    hyp_3 = make_reflected_hypothesis("hyp-3", "PETG for sterile orthopedic trays").model_copy(
+        update={
+            "application": "sterile orthopedic trays",
+            "product_type": "tray",
+            "region_scope": ["Europe"],
+        }
+    )
+    agent = ProximityCheckAgent(FailingProximityLLM())
+
+    proximity_round, updated, synthesized = agent.review(document, [hyp_1, hyp_2, hyp_3], 1, 2)
+
+    assert len(proximity_round.concepts) == 1
+    assert len(synthesized) == 1
+    assert synthesized[0].merged_from_hypothesis_ids == ["hyp-1", "hyp-2"]
+    assert synthesized[0].region_scope == ["North America", "Europe"]
+    updates_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in updated}
+    assert updates_by_id["hyp-1"].status == "retired"
+    assert updates_by_id["hyp-2"].status == "retired"
+    assert "hyp-3" not in updates_by_id
+
+
+def test_runner_applies_proximity_before_reflecting_generated_duplicates(tmp_path):
+    document = make_document()
+    hyp_1 = make_hypothesis().model_copy(
+        update={
+            "hypothesis_id": "hyp-1",
+            "title": "Tritan Copolyester for Injection-Molded Transparent Laboratory Cuvettes and Microcuvettes (UV-Vis) Replacing Polystyrene",
+            "application": "laboratory UV-Vis cuvettes and microcuvettes",
+            "market_segment": "laboratory consumables",
+            "candidate_material": "Tritan copolyester",
+            "incumbent_material": "Polystyrene",
+            "region_scope": ["North America"],
+        }
+    )
+    hyp_2 = make_hypothesis().model_copy(
+        update={
+            "hypothesis_id": "hyp-2",
+            "title": "Tritan Copolyester for Injection-Molded Laboratory UV-Vis Cuvettes Displacing Polystyrene",
+            "application": "laboratory UV-Vis cuvettes",
+            "market_segment": "laboratory consumables",
+            "candidate_material": "Tritan copolyester (injection molding grade, e.g., TX1001 or TX1501)",
+            "incumbent_material": "Polystyrene",
+            "region_scope": ["Europe"],
+        }
+    )
+
+    class FakeArtifactStore:
+        def __init__(self):
+            self.saved = []
+            self.proximity_rounds = []
+
+        def append_proximity_round(self, proximity_round):
+            self.proximity_rounds.append(proximity_round)
+
+        def append_hypothesis_snapshot(self, hypothesis):
+            self.saved.append(hypothesis)
+            return tmp_path / f"{hypothesis.hypothesis_id}.json"
+
+    runner = object.__new__(CoScientistRunner)
+    runner._artifact_store = FakeArtifactStore()
+    runner._proximity_agent = ProximityCheckAgent(FailingProximityLLM())
+
+    active = runner._apply_pre_reflection_proximity(document, [hyp_1, hyp_2], round_index=0)
+
+    assert len(active) == 1
+    assert active[0].generation_source == "synthesized"
+    assert active[0].merged_from_hypothesis_ids == ["hyp-1", "hyp-2"]
+    assert active[0].region_scope == ["North America", "Europe"]
+    saved_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in runner._artifact_store.saved}
+    assert saved_by_id["hyp-1"].status == "retired"
+    assert saved_by_id["hyp-2"].status == "retired"
+    assert runner._artifact_store.proximity_rounds
 
 
 def test_meta_review_tracks_gap_persistence_and_requests_one_last_loop():
