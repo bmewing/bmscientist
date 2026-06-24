@@ -43,4 +43,5 @@ Rules:
 - If a previous gap still appears unresolved, keep it visible in the updated gap list rather than replacing it with a vaguer statement.
 - Treat portfolio quality as a combination of coverage breadth, evidence quality, reflection strength, and practical commercial promise.
 - Consider the user feedback (`user_feedback_status` and `user_feedback_comment`) on the hypotheses. If the user accepted or edited certain directions, prioritize those directions, build upon them, and suggest ways to evolve them in the next generation pass. If the user rejected certain directions, treat them as gaps/whitespace constraints and guide the next generation away from those ideas.
+- If the research configuration requires novel or de novo candidates, call out generation drift toward known substitutions or known commercial materials as a substantive gap and guide the next pass away from those answers.
 - Generation guidance should be specific enough to drive better search-grounded hypotheses.

@@ -137,8 +137,12 @@ class LocalEvidenceRetriever:
         queries = [document.raw_goal]
         queries.extend(document.material_scope[:3])
         queries.extend(document.application_scope[:3])
-        queries.extend(document.target_incumbent_materials[:2])
-        queries.extend(document.preferred_candidate_materials[:2])
+        if not self._requires_novel_candidates(document):
+            queries.extend(document.target_incumbent_materials[:2])
+            queries.extend(document.preferred_candidate_materials[:2])
+        else:
+            queries.extend(document.novelty_requirements[:2])
+            queries.extend(document.known_candidate_exclusion_terms[:2])
         queries.extend(document.recycling_or_sustainability_angles[:2])
         queries.extend(self._goal_queries_from_contract(document))
         return self.search_many(queries, top_k_per_query=6, max_results=max_results)
@@ -167,6 +171,10 @@ class LocalEvidenceRetriever:
             queries.append(schema.artifact_type)
         if schema.primary_identifier_field:
             queries.append(f"{document.raw_goal} {schema.primary_identifier_field}")
+        if LocalEvidenceRetriever._requires_novel_candidates(document):
+            queries.extend(document.novelty_requirements[:2])
+            if schema.primary_identifier_field:
+                queries.append(f"{document.raw_goal} novel {schema.primary_identifier_field}")
         queries.extend(document.search_strategy_notes[:3])
         for criterion in document.evaluation_criteria[:5]:
             queries.append(criterion.name)
@@ -183,6 +191,9 @@ class LocalEvidenceRetriever:
         primary_value = artifact.get(primary_field)
         if primary_value:
             queries.append(str(primary_value))
+            if LocalEvidenceRetriever._requires_novel_candidates(document):
+                queries.append(f"{primary_value} known chemical")
+                queries.append(f"{primary_value} PubChem")
         for key, value in artifact.items():
             text = str(value).strip()
             if text:
@@ -198,6 +209,10 @@ class LocalEvidenceRetriever:
         if hypothesis.reflection_assessment is not None:
             queries.extend(hypothesis.reflection_assessment.evidence_gap_notes[:3])
         return queries
+
+    @staticmethod
+    def _requires_novel_candidates(document: ResearchGoalDocument) -> bool:
+        return document.candidate_origin_policy in {"novel_candidates", "novel_analogs", "de_novo_design"}
 
     @staticmethod
     def citations_from_rows(rows: list[dict[str, Any]], limit: int = 12) -> list[EvidenceCitation]:
@@ -490,6 +505,9 @@ class ReflectionSearchPlanner:
                 queries[f"{primary_value} {criterion.name}".strip()] = None
                 if criterion.description:
                     queries[f"{primary_value} {criterion.description}".strip()] = None
+                if document.candidate_origin_policy in {"novel_candidates", "novel_analogs", "de_novo_design"}:
+                    queries[f"{primary_value} known chemical".strip()] = None
+                    queries[f"{primary_value} PubChem".strip()] = None
             elif hypothesis.title:
                 queries[f"{hypothesis.title} {criterion.name}".strip()] = None
             if region_text:
@@ -542,6 +560,42 @@ class ReflectionSearchPlanner:
 
 
 class ResearchPlanningAgent:
+    _NOVEL_DESIGN_CUES = (
+        "brand-new",
+        "brand new",
+        "never before seen",
+        "never-before-seen",
+        "de novo",
+        "de-novo",
+        "invent",
+        "novel structure",
+        "novel structures",
+        "design molecule",
+        "design molecules",
+        "generate smiles",
+        "smiles strings",
+        "smiles string",
+        "not existing materials",
+        "not existing material",
+        "not looking for substitution",
+        "not looking for substitutions",
+        "not substitutions",
+    )
+    _NOVEL_ANALOG_CUES = ("analog", "analogs", "analogue", "analogues")
+    _STRUCTURE_CUES = ("smiles", "molecule", "molecules", "structure", "structures")
+    _SUBSTITUTION_CUES = (
+        "replacement",
+        "replace",
+        "substitute",
+        "substitution",
+        "drop-in",
+        "drop in",
+        "alternative to",
+        "commercially available",
+        "supplier",
+        "qualified material",
+    )
+
     def __init__(self, llm: DeepSeekLLM):
         self._llm = llm
 
@@ -570,6 +624,7 @@ class ResearchPlanningAgent:
             strategic_fit_notes=strategic_fit_notes or "",
         )
         draft = self._llm.complete_json(ResearchPlanDraft, system_prompt, user_prompt)
+        draft = self._stabilize_plan_draft(raw_goal, draft)
         return ResearchGoalDocument(
             research_id=research_id,
             raw_goal=raw_goal,
@@ -581,6 +636,10 @@ class ResearchPlanningAgent:
             target_incumbent_materials=draft.target_incumbent_materials,
             preferred_candidate_materials=draft.preferred_candidate_materials,
             candidate_material_preferences=draft.candidate_material_preferences,
+            candidate_origin_policy=draft.candidate_origin_policy,
+            novelty_requirements=draft.novelty_requirements,
+            known_candidate_exclusion_terms=draft.known_candidate_exclusion_terms,
+            novelty_check_policy=draft.novelty_check_policy,
             recycling_or_sustainability_angles=draft.recycling_or_sustainability_angles,
             preferred_evidence_recency_days=preferred_evidence_recency_days,
             reflection_search_limits=reflection_search_limits,
@@ -613,6 +672,7 @@ class ResearchPlanningAgent:
             feedback=feedback,
         )
         updated = self._llm.complete_json(UpdatedResearchPlan, system_prompt, user_prompt)
+        updated = self._stabilize_updated_plan(updated.raw_goal or document.raw_goal, updated, feedback)
         return document.model_copy(
             update={
                 "raw_goal": updated.raw_goal,
@@ -622,6 +682,10 @@ class ResearchPlanningAgent:
                 "target_incumbent_materials": updated.target_incumbent_materials,
                 "preferred_candidate_materials": updated.preferred_candidate_materials,
                 "candidate_material_preferences": updated.candidate_material_preferences,
+                "candidate_origin_policy": updated.candidate_origin_policy,
+                "novelty_requirements": updated.novelty_requirements,
+                "known_candidate_exclusion_terms": updated.known_candidate_exclusion_terms,
+                "novelty_check_policy": updated.novelty_check_policy,
                 "recycling_or_sustainability_angles": updated.recycling_or_sustainability_angles,
                 "material_scope": updated.material_scope,
                 "application_scope": updated.application_scope,
@@ -638,6 +702,143 @@ class ResearchPlanningAgent:
                 "strategic_fit_notes": updated.strategic_fit_notes,
             }
         )
+
+    @classmethod
+    def _stabilize_plan_draft(cls, raw_goal: str, draft: ResearchPlanDraft) -> ResearchPlanDraft:
+        origin_policy = cls._resolved_candidate_origin_policy(
+            raw_goal=raw_goal,
+            research_mode=draft.research_mode,
+            primary_identifier_field=draft.candidate_artifact_schema.primary_identifier_field,
+            current_policy=draft.candidate_origin_policy,
+        )
+        novelty_check_policy = cls._resolved_novelty_check_policy(
+            primary_identifier_field=draft.candidate_artifact_schema.primary_identifier_field,
+            candidate_origin_policy=origin_policy,
+            current_policy=draft.novelty_check_policy,
+        )
+        candidate_artifact_schema = cls._stabilize_candidate_artifact_schema(
+            draft.candidate_artifact_schema,
+            origin_policy,
+        )
+        novelty_requirements = cls._resolved_novelty_requirements(
+            current_requirements=draft.novelty_requirements,
+            candidate_origin_policy=origin_policy,
+            primary_identifier_field=candidate_artifact_schema.primary_identifier_field,
+        )
+        return draft.model_copy(
+            update={
+                "candidate_origin_policy": origin_policy,
+                "novelty_check_policy": novelty_check_policy,
+                "novelty_requirements": novelty_requirements,
+                "candidate_artifact_schema": candidate_artifact_schema,
+            }
+        )
+
+    @classmethod
+    def _stabilize_updated_plan(
+        cls,
+        raw_goal: str,
+        updated: UpdatedResearchPlan,
+        feedback: str,
+    ) -> UpdatedResearchPlan:
+        combined_goal = " ".join(part for part in [raw_goal, feedback] if part).strip()
+        origin_policy = cls._resolved_candidate_origin_policy(
+            raw_goal=combined_goal,
+            research_mode=updated.research_mode,
+            primary_identifier_field=updated.candidate_artifact_schema.primary_identifier_field,
+            current_policy=updated.candidate_origin_policy,
+        )
+        novelty_check_policy = cls._resolved_novelty_check_policy(
+            primary_identifier_field=updated.candidate_artifact_schema.primary_identifier_field,
+            candidate_origin_policy=origin_policy,
+            current_policy=updated.novelty_check_policy,
+        )
+        candidate_artifact_schema = cls._stabilize_candidate_artifact_schema(
+            updated.candidate_artifact_schema,
+            origin_policy,
+        )
+        novelty_requirements = cls._resolved_novelty_requirements(
+            current_requirements=updated.novelty_requirements,
+            candidate_origin_policy=origin_policy,
+            primary_identifier_field=candidate_artifact_schema.primary_identifier_field,
+        )
+        return updated.model_copy(
+            update={
+                "candidate_origin_policy": origin_policy,
+                "novelty_check_policy": novelty_check_policy,
+                "novelty_requirements": novelty_requirements,
+                "candidate_artifact_schema": candidate_artifact_schema,
+            }
+        )
+
+    @classmethod
+    def _resolved_candidate_origin_policy(
+        cls,
+        raw_goal: str,
+        research_mode: str,
+        primary_identifier_field: str,
+        current_policy: str,
+    ) -> str:
+        if current_policy and current_policy != "unspecified":
+            return current_policy
+        goal_text = str(raw_goal or "").lower()
+        has_novel_cue = any(cue in goal_text for cue in cls._NOVEL_DESIGN_CUES)
+        has_structure_cue = any(cue in goal_text for cue in cls._STRUCTURE_CUES)
+        has_substitution_cue = any(cue in goal_text for cue in cls._SUBSTITUTION_CUES)
+        has_analog_cue = any(cue in goal_text for cue in cls._NOVEL_ANALOG_CUES)
+        if has_novel_cue or (has_structure_cue and not has_substitution_cue):
+            return "novel_analogs" if has_analog_cue else "de_novo_design"
+        if research_mode == "materials_opportunity" or has_substitution_cue:
+            return "known_candidates"
+        if research_mode == "candidate_design" and primary_identifier_field.strip().lower() == "smiles":
+            return "unspecified"
+        return "unspecified"
+
+    @staticmethod
+    def _resolved_novelty_check_policy(
+        primary_identifier_field: str,
+        candidate_origin_policy: str,
+        current_policy: str,
+    ) -> str:
+        if current_policy and current_policy != "none":
+            return current_policy
+        if candidate_origin_policy not in {"novel_candidates", "novel_analogs", "de_novo_design"}:
+            return "none"
+        if primary_identifier_field.strip().lower() == "smiles":
+            return "identifier_lookup"
+        return "name_only"
+
+    @staticmethod
+    def _stabilize_candidate_artifact_schema(schema, candidate_origin_policy: str):
+        required_fields = list(schema.required_fields)
+        primary_field = schema.primary_identifier_field.strip()
+        if (
+            candidate_origin_policy in {"novel_candidates", "novel_analogs", "de_novo_design"}
+            and primary_field
+            and primary_field not in required_fields
+        ):
+            required_fields.append(primary_field)
+        return schema.model_copy(update={"required_fields": required_fields})
+
+    @staticmethod
+    def _resolved_novelty_requirements(
+        current_requirements: list[str],
+        candidate_origin_policy: str,
+        primary_identifier_field: str,
+    ) -> list[str]:
+        requirements = list(current_requirements)
+        if candidate_origin_policy not in {"novel_candidates", "novel_analogs", "de_novo_design"}:
+            return requirements
+        defaults = [
+            "Do not return existing commercial materials or direct substitution recommendations as final candidates.",
+            "Use known materials as constraints, benchmarks, or exclusions rather than as the final answer.",
+        ]
+        if primary_identifier_field.strip().lower() == "smiles":
+            defaults.append("Provide explicit SMILES strings for each candidate.")
+        for item in defaults:
+            if item not in requirements:
+                requirements.append(item)
+        return requirements
 
 
 class GenerationAgent:
@@ -807,6 +1008,9 @@ class GenerationAgent:
             before_count = len(hypotheses)
             new_hypotheses: list[Hypothesis] = []
             for hypothesis in batch_hypotheses:
+                hypothesis = self._prepare_hypothesis(document, hypothesis)
+                if hypothesis is None:
+                    continue
                 if hypothesis.hypothesis_id in hypotheses:
                     continue
                 if self._duplicates_existing_opportunity(document, hypothesis, hypotheses.values()):
@@ -868,7 +1072,8 @@ class GenerationAgent:
         existing_hypotheses: Any,
     ) -> bool:
         return any(
-            ProximityCheckAgent._should_cluster(document, existing, hypothesis)
+            GenerationAgent._same_primary_artifact(document, existing, hypothesis)
+            or ProximityCheckAgent._should_cluster(document, existing, hypothesis)
             for existing in existing_hypotheses
         )
 
@@ -918,6 +1123,121 @@ class GenerationAgent:
         if value in (None, "", []):
             return ""
         return " ".join(str(value).split())
+
+    @classmethod
+    def _prepare_hypothesis(
+        cls,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> Hypothesis | None:
+        artifact = dict(hypothesis.candidate_artifact or {})
+        primary_field = document.candidate_artifact_schema.primary_identifier_field.strip()
+        if primary_field:
+            primary_value = artifact.get(primary_field)
+            if primary_field.lower() == "smiles":
+                normalized_identifier = cls._normalize_smiles_identifier(primary_value)
+                if normalized_identifier:
+                    artifact[primary_field] = normalized_identifier
+            elif primary_value not in (None, "", []):
+                artifact[primary_field] = cls._compact_prompt_text(primary_value)
+        missing_fields = [
+            field
+            for field in document.candidate_artifact_schema.required_fields
+            if artifact.get(field) in (None, "", [])
+        ]
+        if missing_fields:
+            return None
+        prepared = hypothesis.model_copy(update={"candidate_artifact": artifact})
+        if cls._violates_candidate_origin_policy(document, prepared):
+            if cls._requires_novel_candidates(document):
+                artifact["novelty_check_status"] = "failed_known_substance_check"
+            return None
+        if cls._requires_novel_candidates(document):
+            artifact["novelty_check_status"] = "passed_exact_identifier_check"
+        return prepared.model_copy(update={"candidate_artifact": artifact})
+
+    @staticmethod
+    def _requires_novel_candidates(document: ResearchGoalDocument) -> bool:
+        return document.candidate_origin_policy in {"novel_candidates", "novel_analogs", "de_novo_design"}
+
+    @classmethod
+    def _violates_candidate_origin_policy(
+        cls,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> bool:
+        if not cls._requires_novel_candidates(document):
+            return False
+        exclusion_terms = [cls._normalize_text_key(item) for item in document.known_candidate_exclusion_terms if item]
+        if not exclusion_terms:
+            return False
+        candidate_texts = [
+            hypothesis.candidate_material,
+            hypothesis.title,
+            (hypothesis.candidate_artifact or {}).get("name_or_label"),
+        ]
+        for value in candidate_texts:
+            normalized_value = cls._normalize_text_key(value)
+            if normalized_value and any(
+                normalized_value == exclusion or normalized_value in exclusion or exclusion in normalized_value
+                for exclusion in exclusion_terms
+            ):
+                return True
+        primary_key = cls._artifact_identifier_key(document, hypothesis)
+        if not primary_key:
+            return False
+        if document.candidate_artifact_schema.primary_identifier_field.strip().lower() == "smiles":
+            normalized_exclusions = {cls._normalize_smiles_identifier(item) for item in document.known_candidate_exclusion_terms if item}
+        else:
+            normalized_exclusions = {cls._normalize_text_key(item) for item in document.known_candidate_exclusion_terms if item}
+        return primary_key in normalized_exclusions
+
+    @classmethod
+    def _same_primary_artifact(
+        cls,
+        document: ResearchGoalDocument,
+        left: Hypothesis,
+        right: Hypothesis,
+    ) -> bool:
+        primary_field = document.candidate_artifact_schema.primary_identifier_field.strip().lower()
+        if not primary_field or primary_field == "candidate_material":
+            return False
+        left_key = cls._artifact_identifier_key(document, left)
+        right_key = cls._artifact_identifier_key(document, right)
+        return bool(left_key and right_key and left_key == right_key)
+
+    @classmethod
+    def _artifact_identifier_key(
+        cls,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> str:
+        value = cls._primary_artifact_identifier(document, hypothesis)
+        if not value:
+            return ""
+        if document.candidate_artifact_schema.primary_identifier_field.strip().lower() == "smiles":
+            return cls._normalize_smiles_identifier(value)
+        return cls._normalize_text_key(value)
+
+    @staticmethod
+    def _normalize_text_key(value: Any) -> str:
+        text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+        return " ".join(text.split())
+
+    @staticmethod
+    def _normalize_smiles_identifier(value: Any) -> str:
+        text = "".join(str(value or "").split())
+        if not text:
+            return ""
+        try:
+            from rdkit import Chem
+
+            molecule = Chem.MolFromSmiles(text)
+            if molecule is None:
+                return ""
+            return Chem.MolToSmiles(molecule, canonical=True)
+        except Exception:
+            return text
 
     @staticmethod
     def _seeds_to_hypotheses(
@@ -987,7 +1307,7 @@ class GenerationAgent:
             "application": seed.application,
         }
         primary_field = document.candidate_artifact_schema.primary_identifier_field
-        if primary_field and primary_field not in artifact:
+        if primary_field and primary_field not in artifact and primary_field.strip().lower() != "smiles":
             if getattr(seed, "candidate_material", None):
                 artifact[primary_field] = seed.candidate_material
             elif getattr(seed, "title", None):
@@ -1715,6 +2035,8 @@ class ProximityCheckAgent:
     ) -> bool:
         if not cls._same_core_opportunity(document, left, right):
             return False
+        if GenerationAgent._same_primary_artifact(document, left, right):
+            return True
 
         policy = cls._policy_for(document)
         family_overlap = bool(cls._family_tokens(left) & cls._family_tokens(right))
@@ -1757,6 +2079,12 @@ class ProximityCheckAgent:
 
     @classmethod
     def _candidate_key(cls, document: ResearchGoalDocument, hypothesis: Hypothesis) -> str:
+        if document.research_mode != "materials_opportunity":
+            identifier = GenerationAgent._artifact_identifier_key(document, hypothesis)
+            if identifier:
+                return identifier
+            candidate = hypothesis.candidate_material
+            return cls._normalize_text_key(candidate)
         candidate = hypothesis.candidate_material or GenerationAgent._primary_artifact_identifier(document, hypothesis)
         return cls._material_family_key(candidate)
 
