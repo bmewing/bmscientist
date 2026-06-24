@@ -37,6 +37,7 @@ from bmscientist.coscientist_models import (
     ProximityReviewOutput,
     RankedHypothesis,
     RankingOutput,
+    RankingRound,
     ReflectionAssessment,
     ReflectionReviewOutput,
     ReflectionSearchLimits,
@@ -803,6 +804,66 @@ def test_generation_from_meta_review_uses_only_meta_review_guidance():
 
     assert len(generated) == 1
     assert generated[0].application == "consumer trays"
+
+
+def test_generation_from_meta_review_includes_rejected_context_and_filters_repeats():
+    class RejectRepeatingLLM:
+        def __init__(self):
+            self.user_prompt = None
+
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            self.user_prompt = user_prompt
+            return response_model.model_validate(
+                {
+                    "hypotheses": [
+                        {
+                            "title": "PETG for rigid medical trays",
+                            "summary": "Repeats a previously rejected thesis.",
+                            "application": "medical trays",
+                            "market_segment": "medical packaging",
+                            "candidate_material": "PETG",
+                            "incumbent_material": "PVC",
+                            "application_requirements": ["clarity"],
+                            "substitution_drivers": ["PVC reduction"],
+                            "generation_confidence": 0.45,
+                        }
+                    ]
+                }
+            )
+
+    retriever = LocalEvidenceRetriever(FakeStore([make_row("chunk-1")]), FakeEmbedder())
+    llm = RejectRepeatingLLM()
+    agent = GenerationAgent(llm, retriever)
+    rejected = make_reflected_hypothesis().model_copy(
+        update={
+            "status": "retired",
+            "is_active": False,
+            "retired_reason": "ranking_rejected",
+            "ranking_rationale": "Weak evidence and narrow commercial upside.",
+        }
+    )
+    from bmscientist.coscientist_models import MetaReviewRound
+
+    generated = agent.generate_from_meta_review(
+        make_document(),
+        MetaReviewRound(
+            meta_review_round_id="meta-1",
+            research_id="research-1",
+            round_index=1,
+            whitespace_gaps=["Need stronger coverage outside medical trays."],
+            generation_guidance=["Explore adjacent rigid clear packaging segments."],
+            coverage_assessment="Coverage remains concentrated.",
+            coverage_sufficient=False,
+        ),
+        target_count=1,
+        round_index=1,
+        avoid_hypotheses=[rejected],
+    )
+
+    assert generated == []
+    assert "Previously rejected ideas to avoid regenerating" in llm.user_prompt
+    assert "PETG for rigid medical trays" in llm.user_prompt
+    assert "Weak evidence and narrow commercial upside." in llm.user_prompt
 
 
 def test_hypothesis_generation_output_accepts_loose_llm_aliases():
@@ -1595,6 +1656,33 @@ def test_ranking_agent_scores_and_marks_ranked_snapshots():
     assert ranking_round.best_patterns == ["fast activation"]
     assert ranked_hypotheses[0].ranking_score == 0.82
     assert ranked_hypotheses[0].ranking_status == "evolve"
+
+
+def test_runner_applies_ranking_rejections_to_hypothesis_lifecycle():
+    advance = make_reflected_hypothesis("hyp-1", "Advance idea").model_copy(
+        update={"ranking_status": "advance", "ranking_rationale": "Keep developing."}
+    )
+    reject = make_reflected_hypothesis("hyp-2", "Reject idea").model_copy(
+        update={"ranking_status": "reject", "ranking_rationale": "Weak evidence."}
+    )
+    ranking_round = RankingRound(
+        ranking_round_id="ranking-1",
+        research_id="research-1",
+        round_index=1,
+        candidate_count=2,
+        target_final_count=1,
+        ranked_hypothesis_ids=["hyp-1", "hyp-2"],
+        rejected_hypothesis_ids=["hyp-2"],
+    )
+
+    updated = CoScientistRunner._apply_ranking_outcomes([advance, reject], ranking_round)
+    updated_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in updated}
+
+    assert updated_by_id["hyp-1"].status == "reflected"
+    assert updated_by_id["hyp-1"].is_active is True
+    assert updated_by_id["hyp-2"].status == "retired"
+    assert updated_by_id["hyp-2"].is_active is False
+    assert updated_by_id["hyp-2"].retired_reason == "ranking_rejected"
 
 
 def test_evolution_agent_creates_parent_linked_generated_variant():

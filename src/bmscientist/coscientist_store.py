@@ -652,7 +652,13 @@ class CoScientistStore:
             update_dict.update({
                 "evolution_notes": notes,
                 "is_active": True,
+                "retired_reason": None,
             })
+            if target.status == "retired" or target.retired_reason or not target.is_active:
+                update_dict.update({
+                    "status": "reflected",
+                    "superseded_by_hypothesis_id": None,
+                })
             
         target = target.model_copy(update=update_dict)
         self.save_hypothesis(target)

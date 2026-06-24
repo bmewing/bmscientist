@@ -29,6 +29,9 @@ $gap_persistence_count
 Active reflected hypotheses:
 $hypotheses_json
 
+User feedback context across accepted, rejected, and edited hypotheses:
+$feedback_hypotheses_json
+
 Tasks:
 1. Review whether the previous whitespace gaps were addressed in the current reflected portfolio.
 2. Identify remaining or newly discovered gaps in reasoning or opportunity space versus the research goal.

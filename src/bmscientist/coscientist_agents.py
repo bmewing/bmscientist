@@ -661,6 +661,7 @@ class GenerationAgent:
         document: ResearchGoalDocument,
         on_progress: Callable[[int, int], None] | None = None,
         on_batch: Callable[[list[Hypothesis]], None] | None = None,
+        avoid_hypotheses: list[Hypothesis] | None = None,
     ) -> list[Hypothesis]:
         evidence_rows = self._retriever.retrieve_for_goal(
             document,
@@ -699,6 +700,7 @@ class GenerationAgent:
             progress_total=document.target_hypotheses_generated,
             on_progress=on_progress,
             on_batch=on_batch,
+            avoid_hypotheses=avoid_hypotheses,
         )
 
     def generate_from_meta_review(
@@ -709,6 +711,7 @@ class GenerationAgent:
         round_index: int,
         on_progress: Callable[[int, int], None] | None = None,
         on_batch: Callable[[list[Hypothesis]], None] | None = None,
+        avoid_hypotheses: list[Hypothesis] | None = None,
     ) -> list[Hypothesis]:
         if target_count <= 0:
             return []
@@ -745,6 +748,7 @@ class GenerationAgent:
             generation_guidance_json=json.dumps(meta_review_round.generation_guidance, indent=2),
             whitespace_gaps_json=json.dumps(meta_review_round.whitespace_gaps, indent=2),
             on_batch=on_batch,
+            avoid_hypotheses=avoid_hypotheses,
         )
 
     def _generate_in_batches(
@@ -759,9 +763,11 @@ class GenerationAgent:
         progress_total: int,
         on_progress: Callable[[int, int], None] | None = None,
         on_batch: Callable[[list[Hypothesis]], None] | None = None,
+        avoid_hypotheses: list[Hypothesis] | None = None,
         **extra_context: Any,
     ) -> list[Hypothesis]:
         hypotheses: "OrderedDict[str, Hypothesis]" = OrderedDict()
+        avoided = list(avoid_hypotheses or [])
         batch_size = max(1, min(self.batch_size_for(limit), limit))
         max_attempts = max(2, ((limit + batch_size - 1) // batch_size) * 2)
         attempts_without_progress = 0
@@ -782,6 +788,10 @@ class GenerationAgent:
                     self._existing_hypothesis_prompt_payload(document, list(hypotheses.values())),
                     indent=2,
                 ),
+                avoided_hypotheses_json=json.dumps(
+                    self._avoided_hypothesis_prompt_payload(document, avoided),
+                    indent=2,
+                ),
                 **extra_context,
             )
             output = self._llm.complete_json(HypothesisGenerationOutput, system_prompt, user_prompt)
@@ -798,6 +808,8 @@ class GenerationAgent:
                 if hypothesis.hypothesis_id in hypotheses:
                     continue
                 if self._duplicates_existing_opportunity(document, hypothesis, hypotheses.values()):
+                    continue
+                if self._duplicates_existing_opportunity(document, hypothesis, avoided):
                     continue
                 hypotheses[hypothesis.hypothesis_id] = hypothesis
                 new_hypotheses.append(hypothesis)
@@ -821,6 +833,31 @@ class GenerationAgent:
         hypotheses: list[Hypothesis],
     ) -> list[str]:
         return [cls._hypothesis_duplicate_signature(document, hypothesis) for hypothesis in hypotheses]
+
+    @classmethod
+    def _avoided_hypothesis_prompt_payload(
+        cls,
+        document: ResearchGoalDocument,
+        hypotheses: list[Hypothesis],
+    ) -> list[dict[str, str]]:
+        payload: list[dict[str, str]] = []
+        seen_signatures: set[str] = set()
+        for hypothesis in hypotheses:
+            signature = cls._hypothesis_duplicate_signature(document, hypothesis)
+            if not signature or signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            payload.append(
+                {
+                    "signature": signature,
+                    "reason": cls._compact_prompt_text(
+                        hypothesis.user_feedback_comment
+                        or hypothesis.ranking_rationale
+                        or hypothesis.retired_reason
+                    ),
+                }
+            )
+        return payload
 
     @staticmethod
     def _duplicates_existing_opportunity(
@@ -2051,11 +2088,16 @@ class MetaReviewAgent:
             for hypothesis in hypotheses
             if hypothesis.status == "reflected" and hypothesis.is_active
         ]
+        feedback_hypotheses = [
+            hypothesis
+            for hypothesis in hypotheses
+            if hypothesis.user_feedback_status is not None or hypothesis.user_feedback_comment
+        ]
         try:
-            output = self._llm_review(document, active_reflected, ranking_round)
+            output = self._llm_review(document, active_reflected, ranking_round, feedback_hypotheses)
         except Exception as exc:
             LOGGER.warning("Meta-review failed (%s); falling back to deterministic gap review", exc)
-            output = self._fallback_review(document, active_reflected, ranking_round)
+            output = self._fallback_review(document, active_reflected, ranking_round, feedback_hypotheses)
 
         previous_gaps = document.whitespace_gap_notes
         current_gaps = output.whitespace_gaps
@@ -2117,6 +2159,7 @@ class MetaReviewAgent:
         document: ResearchGoalDocument,
         hypotheses: list[Hypothesis],
         ranking_round: RankingRound,
+        feedback_hypotheses: list[Hypothesis],
     ) -> MetaReviewOutput:
         payload = [
             {
@@ -2138,6 +2181,23 @@ class MetaReviewAgent:
             }
             for hypothesis in hypotheses
         ]
+        feedback_payload = [
+            {
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "title": hypothesis.title,
+                "application": hypothesis.application,
+                "market_segment": hypothesis.market_segment,
+                "candidate_material": hypothesis.candidate_material,
+                "incumbent_material": hypothesis.incumbent_material,
+                "status": hypothesis.status,
+                "is_active": hypothesis.is_active,
+                "ranking_status": hypothesis.ranking_status,
+                "user_feedback_status": hypothesis.user_feedback_status,
+                "user_feedback_comment": hypothesis.user_feedback_comment,
+                "retired_reason": hypothesis.retired_reason,
+            }
+            for hypothesis in feedback_hypotheses
+        ]
         system_prompt = PROMPTS.render("meta_review_agent", "review.system")
         user_prompt = PROMPTS.render(
             "meta_review_agent",
@@ -2150,6 +2210,7 @@ class MetaReviewAgent:
             previous_guidance_json=json.dumps(document.meta_review_generation_guidance, indent=2),
             gap_persistence_count=document.whitespace_gap_persistence_count,
             hypotheses_json=json.dumps(payload, indent=2),
+            feedback_hypotheses_json=json.dumps(feedback_payload, indent=2),
         )
         return self._llm.complete_json(MetaReviewOutput, system_prompt, user_prompt)
 
@@ -2158,6 +2219,7 @@ class MetaReviewAgent:
         document: ResearchGoalDocument,
         hypotheses: list[Hypothesis],
         ranking_round: RankingRound,
+        feedback_hypotheses: list[Hypothesis],
     ) -> MetaReviewOutput:
         active_concepts = sorted(
             {
@@ -2173,6 +2235,24 @@ class MetaReviewAgent:
                 + ["Explore applications, regions, or buyer types not represented in the current reflected set."]
             )
         )
+        accepted_or_edited = [
+            hypothesis
+            for hypothesis in feedback_hypotheses
+            if hypothesis.user_feedback_status in {"accepted", "edited"}
+        ]
+        rejected = [
+            hypothesis
+            for hypothesis in feedback_hypotheses
+            if hypothesis.user_feedback_status in {"rejected", "retired"}
+        ]
+        if accepted_or_edited:
+            guidance.append(
+                "Build on user-endorsed directions and sharpen the edited hypotheses with stronger evidence and narrower activation plans."
+            )
+        if rejected:
+            guidance.append(
+                "Avoid regenerating ideas that match user-rejected directions unless new evidence materially changes the thesis."
+            )
         gaps = []
         if len(active_concepts) < max(1, min(3, document.target_hypotheses_final // 2)):
             gaps.append("Broaden concept diversity beyond the currently concentrated application clusters.")
@@ -3506,6 +3586,7 @@ class CoScientistRunner:
             )
             latest_ranking = ranking_round
             self._artifact_store.append_ranking_round(ranking_round)
+            ranked_hypotheses = self._apply_ranking_outcomes(ranked_hypotheses, ranking_round)
             for hypothesis in ranked_hypotheses:
                 self._artifact_store.append_hypothesis_snapshot(hypothesis)
             rounds_completed += 1
@@ -3621,11 +3702,15 @@ class CoScientistRunner:
                 f"Generating replacement ideas ({round_label})",
                 regenerated_per_round,
             )
+            rejected_hypotheses = self._generation_avoid_hypotheses(
+                self._artifact_store.latest_hypotheses(research_id)
+            )
             regenerated = self._generation_agent.generate_from_meta_review(
                 document=document,
                 meta_review_round=meta_review_round,
                 target_count=regenerated_per_round,
                 round_index=round_index,
+                avoid_hypotheses=rejected_hypotheses,
                 on_progress=lambda completed, total, round_index=round_index: self._progress_reporter.advance(
                     "regeneration",
                     f"Generating replacement ideas ({self._loop_round_label(round_index, max_rounds)})",
@@ -3748,6 +3833,36 @@ class CoScientistRunner:
         if max_rounds is None:
             return f"round {round_index}"
         return f"round {round_index}/{max_rounds}"
+
+    @staticmethod
+    def _apply_ranking_outcomes(
+        ranked_hypotheses: list[Hypothesis],
+        ranking_round: RankingRound,
+    ) -> list[Hypothesis]:
+        rejected_ids = set(ranking_round.rejected_hypothesis_ids)
+        updated: list[Hypothesis] = []
+        for hypothesis in ranked_hypotheses:
+            if hypothesis.hypothesis_id in rejected_ids and hypothesis.user_feedback_status != "accepted":
+                hypothesis = hypothesis.model_copy(
+                    update={
+                        "status": "retired",
+                        "is_active": False,
+                        "retired_reason": "ranking_rejected",
+                    }
+                )
+            updated.append(hypothesis)
+        return updated
+
+    @staticmethod
+    def _generation_avoid_hypotheses(hypotheses: list[Hypothesis]) -> list[Hypothesis]:
+        avoided: list[Hypothesis] = []
+        for hypothesis in hypotheses:
+            if hypothesis.user_feedback_status == "rejected":
+                avoided.append(hypothesis)
+                continue
+            if hypothesis.retired_reason == "ranking_rejected":
+                avoided.append(hypothesis)
+        return avoided
 
     def reflect_existing(
         self,
