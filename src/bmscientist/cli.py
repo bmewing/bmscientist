@@ -267,7 +267,11 @@ def run_graph_ask(args: argparse.Namespace, config: AppConfig) -> int:
 
 
 def run_graph_estimate(args: argparse.Namespace, config: AppConfig) -> int:
-    llm = DeepSeekLLM(config)
+    llm = DeepSeekLLM(
+        config,
+        request_profile=config.market_volume_estimation_chat_profile,
+        client_name="graph_estimate",
+    )
     engine = DuckDBGraphQueryEngine(config.data_dir / "graph")
     agent = GraphEstimateAgent(llm, engine)
     result = agent.run(args.question, limit=args.limit, persist=not args.dry_run)

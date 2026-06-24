@@ -492,6 +492,13 @@ class EvaluationCriterion(BaseModel):
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
 
+    @field_validator("target_value", mode="before")
+    @classmethod
+    def coerce_target_value_field(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return coerce_text_value(value)
+
     @field_validator("evidence_mode", mode="before")
     @classmethod
     def normalize_evidence_mode_field(cls, value: Any) -> str:
