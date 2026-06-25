@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -218,6 +219,30 @@ def short_title_from_text(text: Any) -> str:
         return "Untitled hypothesis"
     first_sentence = cleaned.split(".")[0].strip()
     return (first_sentence or cleaned)[:120]
+
+
+def compact_model_payload(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+    if isinstance(value, dict):
+        compacted: dict[str, Any] = {}
+        for key, raw_value in value.items():
+            normalized = compact_model_payload(raw_value)
+            if normalized is not None:
+                compacted[str(key)] = normalized
+        return compacted or None
+    if isinstance(value, list):
+        compacted_list = [item for item in (compact_model_payload(item) for item in value) if item is not None]
+        return compacted_list or None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return value
+
+
+def compact_model_json(model: BaseModel, *, indent: int = 2) -> str:
+    payload = compact_model_payload(model) or {}
+    return json.dumps(payload, indent=indent)
 
 
 def coerce_text_value(value: Any) -> str:
@@ -788,6 +813,12 @@ class ResearchGoalDocument(BaseModel):
     def default_collection_payloads(cls, value: Any) -> list[dict[str, Any]]:
         return coerce_dict_list(value)
 
+    def compact_dump(self) -> dict[str, Any]:
+        return compact_model_payload(self) or {}
+
+    def compact_json(self, *, indent: int = 2) -> str:
+        return compact_model_json(self, indent=indent)
+
 
 class ResearchPlanDraft(BaseModel):
     research_mode: ResearchMode = "materials_opportunity"
@@ -1088,6 +1119,12 @@ class ReflectionAssessment(BaseModel):
     def default_list_fields(cls, value: Any) -> list[str]:
         return coerce_string_list(value)
 
+    def compact_dump(self) -> dict[str, Any]:
+        return compact_model_payload(self) or {}
+
+    def compact_json(self, *, indent: int = 2) -> str:
+        return compact_model_json(self, indent=indent)
+
 
 class ReflectionReviewOutput(BaseModel):
     assessment: ReflectionAssessment = Field(default_factory=ReflectionAssessment)
@@ -1199,6 +1236,12 @@ class Hypothesis(BaseModel):
     @classmethod
     def normalize_generation_confidence(cls, value: Any) -> float:
         return normalize_confidence_value(value)
+
+    def compact_dump(self) -> dict[str, Any]:
+        return compact_model_payload(self) or {}
+
+    def compact_json(self, *, indent: int = 2) -> str:
+        return compact_model_json(self, indent=indent)
 
 
 class HypothesisSeed(BaseModel):

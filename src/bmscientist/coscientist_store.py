@@ -201,7 +201,7 @@ class CoScientistStore:
     def save_research_goal(self, document: ResearchGoalDocument) -> Path:
         self.ensure_run_directories(document.research_id)
         path = self.research_goal_path(document.research_id)
-        path.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+        path.write_text(document.compact_json(indent=2), encoding="utf-8")
         return path
 
     def load_research_goal(self, research_id: str) -> ResearchGoalDocument:
@@ -215,7 +215,7 @@ class CoScientistStore:
         self.ensure_run_directories(hypothesis.research_id)
         path = self.hypothesis_file_path(hypothesis)
         tmp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-        tmp_path.write_text(hypothesis.model_dump_json(indent=2), encoding="utf-8")
+        tmp_path.write_text(hypothesis.compact_json(indent=2), encoding="utf-8")
         self._remove_hypothesis_from_other_stages(hypothesis, keep_stage=path.parent.name)
         tmp_path.replace(path)
 

@@ -1,6 +1,6 @@
 # bmscientist
 
-See [CHANGELOG.md](C:/Users/bmark/PycharmProjects/bmscientist/CHANGELOG.md) for release notes.
+See [CHANGELOG.md](./CHANGELOG.md) for release notes.
 
 Agentic framework for scientific materials discovery — hypothesis generation, evidence retrieval, and knowledge graph enrichment.
 
@@ -17,6 +17,22 @@ Use the local virtual environment for all Python commands on this project:
 ```
 
 Create a `.env` from `.env.example` and add your API keys.
+
+## What Is New In 0.9.1
+
+The project now has a typed chemistry skill layer that can be used by planning, generation, reflection, and graph enrichment.
+
+Current active molecule-oriented skills include:
+
+* `molecule_identity_pubchem` for canonical identifier and CID resolution
+* `rdkit_profile` for local descriptor calculation
+* `pubchem_profile` for external computed properties
+* `safety_triage` for deterministic hazard-style checks
+* `molecule_availability` for PubChem source/vendor signals
+* `epa_episuite` for predicted physicochemical and ecotoxicity endpoints
+* `rxn4chemistry_retrosynthesis` for optional retrosynthesis support during hypothesis evaluation
+
+The graph enrichment workflow can now use those skills too. In practice that means enrichment can resolve molecule names into canonical identifiers, derive SMILES-backed properties, and persist those material facts into the graph as governed product and endpoint data while still keeping relationship edges behind the existing propose/validate/write flow.
 
 ## Environment & Configuration
 
@@ -37,6 +53,16 @@ BMSCIENTIST_DATA_DIR=./data
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 REQUEST_TIMEOUT_SECONDS=60
 SKIP_FETCH_DOMAINS=sciencedirect.com
+
+# Optional chemistry skill integrations
+EPISUITE_API_BASE_URL=https://episuite.dev
+RXN4CHEMISTRY_API_KEY=
+RXN4CHEMISTRY_PROJECT_ID=
+# Optional: if PROJECT_ID is omitted, the RXN skill can reuse or create this project name.
+RXN4CHEMISTRY_PROJECT_NAME=bmscientist
+RXN4CHEMISTRY_BASE_URL=https://rxn.res.ibm.com
+# Optional retrosynthesis model release string. Leave blank to use the wrapper default (`2020-07-01`).
+RXN4CHEMISTRY_RETROSYNTHESIS_MODEL=
 
 # Exa retrieval controls
 EXA_SEARCH_CONTENT_TEXT_CHARS=8000
@@ -84,6 +110,8 @@ MARKET_VOLUME_ESTIMATION_CHAT_PROFILE={"model":"deepseek-v4-pro","thinking":{"en
 
 * `DEEPSEEK_API_KEY` (**Required**): Your DeepSeek API key for all LLM-backed reasoning.
 * `EXA_API_KEY` (**Required**): Your Exa search API key for web discovery and page retrieval.
+* `EPISUITE_API_BASE_URL` (*Optional*): Override for the hosted EPA EPISuite API used by the molecule enrichment and reflection skills.
+* `RXN4CHEMISTRY_*` (*Optional*): Credentials and project settings for the hosted RXN retrosynthesis skill. `RXN4CHEMISTRY_RETROSYNTHESIS_MODEL` is the wrapper's `ai_model` release string and can be left blank to use the current default.
 * `EXA_*` retrieval settings (*Optional*): Tune how much Exa text/highlight content is requested at search time, when deeper `/contents` follow-ups happen, how stale cached content can be, and how aggressively direct HTTP fetch is used as a fallback.
 * `BMSCIENTIST_DATA_DIR` (*Optional*): Base directory for raw data, caches, graphs, and co-scientist run outputs.
 * `LANCEDB_PATH` (*Optional*): Explicit LanceDB directory override. Defaults to `BMSCIENTIST_DATA_DIR/lancedb`.
@@ -101,6 +129,9 @@ Co-scientist runs now write `reports/cost.json` with `total_exa_usd`, `total_dee
 
 Exa retrieval note:
 Discovery and reflection search now use Exa search-time extracted content first, preserve Exa highlights and request metadata, and only escalate to `/contents` follow-ups for high-value or truncated pages. Direct HTTP fetch is now a fallback path rather than the default source of truth.
+
+Chemistry skill note:
+The first-wave molecule stack is currently PubChem, RDKit, EPISuite, and RXN4Chemistry. `ChemSpace` pricing is not an active runtime skill right now.
 
 
 ## Usage
@@ -138,6 +169,8 @@ Inspect and query the local graph with DuckDB:
 .\.venv\Scripts\python.exe -m bmscientist graph-sql --sql "SELECT name, product_id FROM Product ORDER BY name LIMIT 20"
 .\.venv\Scripts\python.exe -m bmscientist graph-ask --question "Show me the material grades linked to Tritan"
 ```
+
+Discovery runs now also support molecule-aware graph enrichment. When chunk classification surfaces identifiable materials, the enrichment phase can call the chemistry skill layer to resolve molecule identities, compute descriptors, and write product/endpoint facts back into the graph before normal graph relationship validation completes.
 
 Manually obtained files can be dropped into the configured data directory: `data/manually-obtained/`. Workflows ingest them and move processed files to `data/manually-obtained/processed/`.
 
@@ -235,3 +268,4 @@ For a given `research_id`, the cost report is cumulative across `coscientist`, `
 
 * Evidence remains cumulative in LanceDB.
 * The system preserves source URLs and chunk IDs, avoids invented citations, and keeps confidence scores conservative when evidence is incomplete.
+* Molecule skills can enrich product records and endpoint edges directly, but relationship-style graph claims still go through the governed propose/validate/write pipeline.

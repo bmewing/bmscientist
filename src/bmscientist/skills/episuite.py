@@ -82,7 +82,8 @@ class EPISuiteSkill:
         self._spec = SkillSpec(
             skill_id=EPISUITE_TOOL_ID,
             description="Predict physicochemical, fate, and ecotoxicity endpoints from SMILES using the EPA EPISuite API.",
-            phases=("reflection",),
+            phases=("reflection", "enrichment"),
+            aliases=("episuite", "epa_episuite_api"),
             supported_research_modes=("candidate_design", "generic_screening", "formulation_design"),
             required_candidate_fields=("smiles",),
             expected_outputs=tuple(spec.criterion_name for spec in ENDPOINT_SPECS),
@@ -97,6 +98,7 @@ class EPISuiteSkill:
                 "bcf",
             ),
             provider="http_api",
+            priority=80,
         )
 
     @property

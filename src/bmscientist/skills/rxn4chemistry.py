@@ -78,6 +78,7 @@ class RXN4ChemistryRetrosynthesisSkill:
                 "Use when reflection needs synthesis-feasibility, route-complexity, or makeability signals."
             ),
             phases=("reflection",),
+            aliases=tuple(sorted(RXN4CHEMISTRY_TOOL_ALIASES - {RXN4CHEMISTRY_TOOL_ID})),
             supported_research_modes=("candidate_design", "generic_screening", "formulation_design"),
             required_candidate_fields=("smiles",),
             expected_outputs=(
@@ -95,6 +96,8 @@ class RXN4ChemistryRetrosynthesisSkill:
                 "precursor",
             ),
             provider="python_package",
+            priority=90,
+            requires_safety_review=True,
         )
 
     @property

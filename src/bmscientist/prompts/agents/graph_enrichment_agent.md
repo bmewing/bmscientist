@@ -10,6 +10,12 @@ $original_query
 Evidence chunks:
 $evidence_json
 
+Available enrichment skills:
+$available_skills_json
+
+Existing skill outputs tied to these materials/chunks:
+$skill_outputs_json
+
 Extract candidate graph enrichments that would help future materials-opportunity reasoning.
 
 Allowed edge_type values:
@@ -47,6 +53,8 @@ Rules:
 - Every proposal must cite one source_chunk_id from the provided evidence.
 - Every proposal must include a short supporting_quote copied from the evidence chunk.
 - Prefer specific product/application/market/company names.
+- You may use the skill outputs to canonicalize product names, aliases, identifiers, and material-family hints when they clearly match the cited material.
+- Do not invent a graph relationship from a skill output alone. The cited chunk still needs to support the product/application/company/market linkage.
 - Use product_name for the best canonical material/product name supported by the evidence, and product_aliases for alternate names found in the same evidence.
 - If a phrase mixes a material with an application or performance descriptor, split them instead of collapsing them into product_name.
   - Example: "light diffusion polycarbonate" should usually become product_name = "polycarbonate" and application_name = "light diffusers" or the cited application context.
@@ -160,6 +168,9 @@ $proposals_json
 Source evidence chunks:
 $evidence_json
 
+Relevant enrichment skill outputs:
+$skill_outputs_json
+
 For each proposal, decide whether the relationship is directly supported by the cited evidence.
 
 Acceptance rules:
@@ -170,6 +181,7 @@ Acceptance rules:
 - Accept metrics only when values and units are explicit in the evidence.
 - Accept product aliases only when the cited evidence explicitly states the alias, expansion, acronym, brand variant, or parenthetical name.
 - Keep material_family_name only when the cited evidence explicitly identifies the product's underlying material family.
+- You may use skill outputs to tighten canonical naming or identifier consistency, but not to replace missing evidence for the relationship itself.
 - Keep critical-to-quality terms only when the evidence supports them as requirements or selection criteria.
 - You may provide corrected_edge_type, corrected_relationship_role, corrected_product_aliases, corrected_material_family_name, corrected_metrics, or corrected_critical_to_quality when the relationship is real but the proposal needs tightening.
 

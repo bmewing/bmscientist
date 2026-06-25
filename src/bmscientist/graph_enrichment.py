@@ -11,6 +11,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
 
 import pyarrow as pa
@@ -28,6 +29,7 @@ from bmscientist.models import (
     GraphEnrichmentValidationOutput,
 )
 from bmscientist.prompt_library import PROMPTS
+from bmscientist.skills.base import SkillRunResult
 
 
 LOGGER = logging.getLogger(__name__)
@@ -81,7 +83,15 @@ class GraphEnrichmentProposer:
     def __init__(self, llm):
         self._llm = llm
 
-    def propose(self, original_query: str, records: list[ChunkRecord], limit: int = 24) -> list[GraphEnrichmentProposal]:
+    def propose(
+        self,
+        original_query: str,
+        records: list[ChunkRecord],
+        limit: int = 24,
+        *,
+        available_skills: list[dict[str, Any]] | None = None,
+        skill_outputs: list[dict[str, Any]] | None = None,
+    ) -> list[GraphEnrichmentProposal]:
         evidence_rows = [self._evidence_row(record) for record in records[:limit]]
         if not evidence_rows:
             return []
@@ -91,6 +101,8 @@ class GraphEnrichmentProposer:
             "propose.user",
             original_query=original_query,
             evidence_json=json.dumps(evidence_rows, indent=2),
+            available_skills_json=json.dumps(available_skills or [], indent=2),
+            skill_outputs_json=json.dumps(skill_outputs or [], indent=2),
         )
         output = self._llm.complete_json(GraphEnrichmentProposalOutput, system_prompt, user_prompt)
         return self._normalize_proposals(output.proposals, records)
@@ -145,6 +157,8 @@ class GraphEnrichmentValidator:
         self,
         proposals: list[GraphEnrichmentProposal],
         records: list[ChunkRecord],
+        *,
+        skill_outputs: list[dict[str, Any]] | None = None,
     ) -> list[GraphEnrichmentValidation]:
         if not proposals:
             return []
@@ -161,6 +175,7 @@ class GraphEnrichmentValidator:
             "validate.user",
             proposals_json=json.dumps(proposal_rows, indent=2),
             evidence_json=json.dumps(evidence_rows, indent=2),
+            skill_outputs_json=json.dumps(skill_outputs or [], indent=2),
         )
         output = self._llm.complete_json(GraphEnrichmentValidationOutput, system_prompt, user_prompt)
         known_ids = {proposal.proposal_id for proposal in proposals if proposal.proposal_id}
@@ -261,6 +276,81 @@ class GraphEnrichmentStore:
             self._write_accepted_edge(proposal, validation)
             accepted_count += 1
         return accepted_count
+
+    def write_skill_enrichments(
+        self,
+        *,
+        candidate_artifact: dict[str, Any],
+        skill_results: list[SkillRunResult],
+        source_chunk_id: str,
+        source_url: str,
+        source_title: str,
+        supporting_quote: str,
+        confidence: float = 0.9,
+    ) -> int:
+        completed_results = [result for result in skill_results if result.status == "completed"]
+        if not completed_results:
+            return 0
+
+        self._nodes_path.mkdir(parents=True, exist_ok=True)
+        self._edges_path.mkdir(parents=True, exist_ok=True)
+        self._enrichment_path.mkdir(parents=True, exist_ok=True)
+
+        enriched_artifact = self._merged_skill_artifact(candidate_artifact, completed_results)
+        candidate_name = self._candidate_label(SimpleNamespace(candidate_material=None), enriched_artifact)
+        if not candidate_name:
+            return 0
+
+        aliases = self._skill_aliases(enriched_artifact, completed_results, candidate_name)
+        product_id = self._ensure_node(
+            "Product",
+            candidate_name,
+            "product_id",
+            "product",
+            aliases=aliases,
+            extra_fields={
+                "canonical_smiles": self._first_artifact_value(enriched_artifact, "canonical_smiles", "smiles"),
+                "inchi_key": self._first_artifact_value(enriched_artifact, "inchi_key", "inchikey"),
+                "cas_number": self._first_artifact_value(enriched_artifact, "cas_number", "cas"),
+                "product_family": self._first_artifact_value(
+                    enriched_artifact,
+                    "chemistry_class",
+                    "chemistry_family",
+                    "chemical_family",
+                ),
+            },
+        )
+
+        now = now_iso()
+        wrote = 1
+        for skill_result in completed_results:
+            evidence_hash = hashlib.sha256(
+                f"{source_chunk_id}:{candidate_name}:{skill_result.skill_id}".encode("utf-8")
+            ).hexdigest()
+            for result in skill_result.criterion_results:
+                endpoint_name = str(result.criterion_name or "").strip()
+                if not endpoint_name:
+                    continue
+                endpoint_id = self._ensure_node(
+                    "Endpoint",
+                    endpoint_name,
+                    "endpoint_id",
+                    None,
+                    extra_fields={"endpoint_category": self._endpoint_category(endpoint_name)},
+                )
+                self._append_product_endpoint_edge(
+                    product_id,
+                    endpoint_id,
+                    result,
+                    source_chunk_id,
+                    source_url,
+                    source_title,
+                    evidence_hash,
+                    confidence,
+                    now,
+                )
+                wrote += 1
+        return wrote
 
     def _append_claim_rows(
         self,
@@ -2007,6 +2097,53 @@ class GraphEnrichmentStore:
             [row],
             CTQ_ENDPOINT_SCHEMA,
             "edge_id",
+        )
+
+    @staticmethod
+    def _merged_skill_artifact(candidate_artifact: dict[str, Any], skill_results: list[SkillRunResult]) -> dict[str, Any]:
+        merged = dict(candidate_artifact or {})
+        for skill_result in skill_results:
+            for key, value in skill_result.resolved_identifiers.items():
+                if value not in (None, "", []):
+                    merged[key] = value
+            if skill_result.metadata.get("cid") not in (None, "", []):
+                merged["cid"] = skill_result.metadata["cid"]
+        if "inchikey" in merged and "inchi_key" not in merged:
+            merged["inchi_key"] = merged["inchikey"]
+        if "canonical_smiles" in merged and "smiles" not in merged:
+            merged["smiles"] = merged["canonical_smiles"]
+        return merged
+
+    @staticmethod
+    def _skill_aliases(
+        candidate_artifact: dict[str, Any],
+        skill_results: list[SkillRunResult],
+        candidate_name: str,
+    ) -> list[str]:
+        aliases = {
+            str(value).strip()
+            for value in (
+                candidate_artifact.get("trade_name"),
+                candidate_artifact.get("common_name"),
+                candidate_artifact.get("name"),
+                candidate_artifact.get("name_or_label"),
+                candidate_artifact.get("candidate_material"),
+            )
+            if value and str(value).strip()
+        }
+        for skill_result in skill_results:
+            for alias in skill_result.metadata.get("synonyms", []) or []:
+                text = str(alias).strip()
+                if text:
+                    aliases.add(text)
+        normalized_name = normalize_name(candidate_name)
+        return sorted(
+            {
+                alias
+                for alias in aliases
+                if normalize_name(alias) != normalized_name
+            },
+            key=str.lower,
         )
 
     @staticmethod

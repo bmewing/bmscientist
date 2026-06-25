@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2665,6 +2666,62 @@ def test_coscientist_store_moves_hypothesis_file_between_stage_folders(tmp_path)
     assert not generated_path.exists()
     assert reflected_path.exists()
     assert snapshots[0].status == "reflected"
+
+
+def test_coscientist_store_saves_compact_candidate_design_hypothesis_json(tmp_path):
+    store = CoScientistStore(tmp_path / "coscientist")
+    hypothesis = Hypothesis(
+        hypothesis_id="hyp-mol-1",
+        research_id="research-mol-1",
+        status="generated",
+        title="Designed coalescent A",
+        summary="Novel small-molecule coalescent candidate.",
+        candidate_artifact={
+            "name_or_label": "Designed coalescent A",
+            "smiles": "CCOC(=O)OCC",
+        },
+        generation_confidence=0.62,
+    )
+
+    path = store.save_hypothesis(hypothesis)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["candidate_artifact"]["smiles"] == "CCOC(=O)OCC"
+    assert "next_best_competitive_alternative" not in payload
+    assert "incumbent_material" not in payload
+    assert "application_requirements" not in payload
+    assert "unknowns" not in payload
+
+
+def test_local_evidence_retriever_candidate_design_queries_omit_price_boilerplate():
+    retriever = LocalEvidenceRetriever(FakeStore([]), FakeEmbedder())
+    document = make_novel_smiles_document()
+    hypothesis = Hypothesis(
+        hypothesis_id="hyp-mol-1",
+        research_id=document.research_id,
+        status="generated",
+        title="Designed coalescent A",
+        summary="Novel coalescent candidate.",
+        application="waterborne coatings",
+        candidate_artifact={
+            "name_or_label": "Designed coalescent A",
+            "smiles": "CCOC(=O)OCC",
+            "intended_binder_system": "acrylic latex",
+        },
+    )
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_search_many(queries, top_k_per_query=5, max_results=16):
+        captured["queries"] = list(queries)
+        return []
+
+    retriever.search_many = fake_search_many
+    retriever.retrieve_for_hypothesis(document, hypothesis)
+
+    assert captured["queries"]
+    assert not any("price usd kg" in query for query in captured["queries"])
+    assert any("CCOC(=O)OCC" in query for query in captured["queries"])
 
 
 def test_coscientist_store_load_hypothesis_snapshots_tolerates_transient_missing_files(tmp_path, monkeypatch):
