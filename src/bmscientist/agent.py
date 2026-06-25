@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TypedDict
 from uuid import uuid4, uuid5, NAMESPACE_URL
 
@@ -35,10 +36,30 @@ from bmscientist.models import (
 from bmscientist.prompt_library import PROMPTS
 from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_search_result, compose_partial_text
 from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options, load_search_results_file
+from bmscientist.skills import (
+    EPISuiteSkill,
+    MoleculeAvailabilitySkill,
+    MoleculeIdentityPubChemSkill,
+    PubChemProfileSkill,
+    RDKitProfileSkill,
+    SafetyTriageSkill,
+    SkillContext,
+    SkillRegistry,
+    SkillRunner,
+)
 from bmscientist.store import LanceEvidenceStore
 
 
 LOGGER = logging.getLogger(__name__)
+
+GRAPH_ENRICHMENT_SKILL_IDS = (
+    "molecule_identity_pubchem",
+    "rdkit_profile",
+    "pubchem_profile",
+    "safety_triage",
+    "molecule_availability",
+    "epa_episuite",
+)
 
 
 class DiscoveryState(TypedDict, total=False):
@@ -60,6 +81,8 @@ class DiscoveryState(TypedDict, total=False):
     graph_enrichment_expansion_proposals: list[GraphEnrichmentProposal]
     graph_enrichment_expansion_validations: list[GraphEnrichmentValidation]
     graph_enrichment_external_search_queries: list[str]
+    graph_enrichment_skill_outputs: list[dict[str, Any]]
+    graph_enrichment_skill_writes: int
     graph_enrichment_accepted: int
     summary: DiscoverySummary
     skipped_pages: list[dict[str, Any]]
@@ -84,6 +107,18 @@ class DiscoveryAgent:
         self._graph_enrichment_validator = GraphEnrichmentValidator(self._llm)
         self._graph_enrichment_expander = GraphEnrichmentExpander(self._llm)
         self._graph_enrichment_store = GraphEnrichmentStore()
+        self._graph_skill_runner = SkillRunner(
+            SkillRegistry(
+                [
+                    SafetyTriageSkill(config),
+                    MoleculeIdentityPubChemSkill(config),
+                    RDKitProfileSkill(config),
+                    PubChemProfileSkill(config),
+                    MoleculeAvailabilitySkill(config),
+                    EPISuiteSkill(config),
+                ]
+            )
+        )
         self._manual_ingestor = ManualEvidenceIngestor(
             config,
             self._classifier,
@@ -106,6 +141,7 @@ class DiscoveryAgent:
         graph.add_node("chunk_content", self.chunk_content)
         graph.add_node("embed_chunks", self.embed_chunks)
         graph.add_node("write_to_lancedb", self.write_to_lancedb)
+        graph.add_node("run_enrichment_skills", self.run_enrichment_skills)
         graph.add_node("propose_graph_enrichments", self.propose_graph_enrichments)
         graph.add_node("validate_graph_enrichments", self.validate_graph_enrichments)
         graph.add_node("expand_graph_enrichments", self.expand_graph_enrichments)
@@ -121,7 +157,8 @@ class DiscoveryAgent:
         graph.add_edge("classify_evidence", "chunk_content")
         graph.add_edge("chunk_content", "embed_chunks")
         graph.add_edge("embed_chunks", "write_to_lancedb")
-        graph.add_edge("write_to_lancedb", "propose_graph_enrichments")
+        graph.add_edge("write_to_lancedb", "run_enrichment_skills")
+        graph.add_edge("run_enrichment_skills", "propose_graph_enrichments")
         graph.add_edge("propose_graph_enrichments", "validate_graph_enrichments")
         graph.add_edge("validate_graph_enrichments", "expand_graph_enrichments")
         graph.add_edge("expand_graph_enrichments", "write_graph_enrichments")
@@ -362,11 +399,41 @@ class DiscoveryAgent:
         LOGGER.info("Stored %s chunks in LanceDB", stored_count)
         return state
 
-    def propose_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+    def run_enrichment_skills(self, state: DiscoveryState) -> DiscoveryState:
         try:
-            proposals = self._graph_enrichment_proposer.propose(
+            available_skills, skill_outputs, write_count = self._run_graph_enrichment_skills_for_records(
                 state["original_query"],
                 state.get("chunk_records", []),
+            )
+            LOGGER.info(
+                "Graph enrichment skills produced %s outputs and %s graph writes",
+                len(skill_outputs),
+                write_count,
+            )
+            return {
+                "graph_enrichment_skill_outputs": skill_outputs,
+                "graph_enrichment_skill_writes": write_count,
+            }
+        except Exception as exc:
+            LOGGER.exception("Graph enrichment skill run failed for run %s", state.get("run_id"))
+            state.setdefault("errors", []).append(f"graph_enrichment_skills:{exc}")
+            return {
+                "graph_enrichment_skill_outputs": [],
+                "graph_enrichment_skill_writes": 0,
+            }
+
+    def propose_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
+        try:
+            available_skills = self._available_enrichment_skill_catalog()
+            skill_outputs = self._filter_skill_outputs_for_records(
+                state.get("graph_enrichment_skill_outputs", []),
+                state.get("chunk_records", []),
+            )
+            proposals = self._propose_with_skill_context(
+                state["original_query"],
+                state.get("chunk_records", []),
+                available_skills,
+                skill_outputs,
             )
             return {"graph_enrichment_proposals": proposals}
         except Exception as exc:
@@ -376,9 +443,14 @@ class DiscoveryAgent:
 
     def validate_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
         try:
-            validations = self._graph_enrichment_validator.validate(
+            skill_outputs = self._filter_skill_outputs_for_records(
+                state.get("graph_enrichment_skill_outputs", []),
+                state.get("chunk_records", []),
+            )
+            validations = self._validate_with_skill_context(
                 state.get("graph_enrichment_proposals", []),
                 state.get("chunk_records", []),
+                skill_outputs,
             )
             return {"graph_enrichment_validations": validations}
         except Exception as exc:
@@ -388,13 +460,25 @@ class DiscoveryAgent:
 
     def expand_graph_enrichments(self, state: DiscoveryState) -> DiscoveryState:
         try:
+            current_skill_outputs = self._filter_skill_outputs_for_records(
+                state.get("graph_enrichment_skill_outputs", []),
+                state.get("chunk_records", []),
+            )
             questions, proposals = self._graph_enrichment_expander.expand(
                 state["original_query"],
                 state.get("graph_enrichment_proposals", []),
                 state.get("graph_enrichment_validations", []),
                 state.get("chunk_records", []),
             )
-            validations = self._graph_enrichment_validator.validate(proposals, state.get("chunk_records", [])) if proposals else []
+            validations = (
+                self._validate_with_skill_context(
+                    proposals,
+                    state.get("chunk_records", []),
+                    current_skill_outputs,
+                )
+                if proposals
+                else []
+            )
             external_queries = self._select_graph_follow_up_search_questions(
                 questions,
                 state.get("graph_enrichment_proposals", []),
@@ -403,18 +487,41 @@ class DiscoveryAgent:
                 validations,
             )
             external_records = self._run_graph_follow_up_search(state, external_queries) if external_queries else []
-            external_proposals = self._graph_enrichment_proposer.propose(state["original_query"], external_records) if external_records else []
+            external_skill_outputs: list[dict[str, Any]] = []
+            external_skill_writes = 0
+            if external_records:
+                _available_skills, external_skill_outputs, external_skill_writes = self._run_graph_enrichment_skills_for_records(
+                    state["original_query"],
+                    external_records,
+                )
+            external_proposals = (
+                self._propose_with_skill_context(
+                    state["original_query"],
+                    external_records,
+                    self._available_enrichment_skill_catalog(),
+                    external_skill_outputs,
+                )
+                if external_records
+                else []
+            )
             external_validations = (
-                self._graph_enrichment_validator.validate(external_proposals, external_records)
+                self._validate_with_skill_context(
+                    external_proposals,
+                    external_records,
+                    external_skill_outputs,
+                )
                 if external_proposals
                 else []
             )
             merged_chunk_records = self._merge_chunk_records(state.get("chunk_records", []), external_records)
+            merged_skill_outputs = [*state.get("graph_enrichment_skill_outputs", []), *external_skill_outputs]
             return {
                 "graph_enrichment_follow_up_questions": [item.model_dump(mode="json") for item in questions],
                 "graph_enrichment_external_search_queries": [item.question for item in external_queries],
                 "graph_enrichment_expansion_proposals": [*proposals, *external_proposals],
                 "graph_enrichment_expansion_validations": [*validations, *external_validations],
+                "graph_enrichment_skill_outputs": merged_skill_outputs,
+                "graph_enrichment_skill_writes": state.get("graph_enrichment_skill_writes", 0) + external_skill_writes,
                 "chunk_records": merged_chunk_records,
             }
         except Exception as exc:
@@ -457,6 +564,8 @@ class DiscoveryAgent:
                         ],
                         "follow_up_questions": state.get("graph_enrichment_follow_up_questions", []),
                         "external_search_queries": state.get("graph_enrichment_external_search_queries", []),
+                        "skill_outputs": state.get("graph_enrichment_skill_outputs", []),
+                        "skill_writes": state.get("graph_enrichment_skill_writes", 0),
                         "initial_proposal_count": len(state.get("graph_enrichment_proposals", [])),
                         "expansion_proposal_count": len(state.get("graph_enrichment_expansion_proposals", [])),
                         "accepted": accepted,
@@ -579,12 +688,223 @@ class DiscoveryAgent:
     def _compose_partial_text(result: SearchResultItem) -> str:
         return compose_partial_text(result)
 
+    def _run_graph_enrichment_skills_for_records(
+        self,
+        original_query: str,
+        records: list[ChunkRecord],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        available_skills = self._available_enrichment_skill_catalog()
+        if not hasattr(self, "_graph_skill_runner"):
+            return available_skills, [], 0
+        outputs: list[dict[str, Any]] = []
+        writes = 0
+        for record, candidate_artifact in self._iter_enrichment_candidates(records):
+            context = self._build_enrichment_skill_context(original_query, record, candidate_artifact)
+            skill_results = self._graph_skill_runner.run_auto(context)
+            completed_results = [result for result in skill_results if result.status == "completed"]
+            if not completed_results:
+                continue
+            enriched_artifact = self._merge_candidate_artifact(candidate_artifact, completed_results)
+            outputs.append(
+                {
+                    "source_chunk_id": record.id,
+                    "source_url": record.source_url,
+                    "source_title": record.source_title,
+                    "candidate_artifact": enriched_artifact,
+                    "skill_results": [result.as_prompt_dict() for result in skill_results],
+                }
+            )
+            writes += self._graph_enrichment_store.write_skill_enrichments(
+                candidate_artifact=enriched_artifact,
+                skill_results=completed_results,
+                source_chunk_id=record.id,
+                source_url=record.source_url,
+                source_title=record.source_title,
+                supporting_quote=record.chunk_text[:1200],
+                confidence=max(0.7, float(record.confidence_score or 0.0)),
+            )
+        return available_skills, outputs, writes
+
+    def _available_enrichment_skill_catalog(self) -> list[dict[str, Any]]:
+        if not hasattr(self, "_graph_skill_runner"):
+            return []
+        return [
+            item
+            for item in self._graph_skill_runner.all_skill_catalog()
+            if "enrichment" in item.get("phases", [])
+        ]
+
+    def _filter_skill_outputs_for_records(
+        self,
+        skill_outputs: list[dict[str, Any]],
+        records: list[ChunkRecord],
+    ) -> list[dict[str, Any]]:
+        if not skill_outputs or not records:
+            return []
+        chunk_ids = {record.id for record in records}
+        return [row for row in skill_outputs if row.get("source_chunk_id") in chunk_ids]
+
+    def _propose_with_skill_context(
+        self,
+        original_query: str,
+        records: list[ChunkRecord],
+        available_skills: list[dict[str, Any]],
+        skill_outputs: list[dict[str, Any]],
+    ) -> list[GraphEnrichmentProposal]:
+        try:
+            return self._graph_enrichment_proposer.propose(
+                original_query,
+                records,
+                available_skills=available_skills,
+                skill_outputs=skill_outputs,
+            )
+        except TypeError:
+            return self._graph_enrichment_proposer.propose(original_query, records)
+
+    def _validate_with_skill_context(
+        self,
+        proposals: list[GraphEnrichmentProposal],
+        records: list[ChunkRecord],
+        skill_outputs: list[dict[str, Any]],
+    ) -> list[GraphEnrichmentValidation]:
+        try:
+            return self._graph_enrichment_validator.validate(
+                proposals,
+                records,
+                skill_outputs=skill_outputs,
+            )
+        except TypeError:
+            return self._graph_enrichment_validator.validate(proposals, records)
+
+    def _iter_enrichment_candidates(self, records: list[ChunkRecord]) -> list[tuple[ChunkRecord, dict[str, Any]]]:
+        candidates: list[tuple[ChunkRecord, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            metadata = record.metadata or {}
+            explicit_artifacts = metadata.get("candidate_artifacts")
+            if isinstance(explicit_artifacts, list):
+                for item in explicit_artifacts:
+                    if not isinstance(item, dict):
+                        continue
+                    artifact = dict(item)
+                    label = self._artifact_label(artifact)
+                    if not label:
+                        continue
+                    key = (record.id, json.dumps(artifact, sort_keys=True, default=str))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append((record, artifact))
+            for name in [*record.candidate_materials, record.incumbent_material]:
+                text = str(name or "").strip()
+                if not text:
+                    continue
+                artifact = {"name_or_label": text}
+                key = (record.id, text.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append((record, artifact))
+        return candidates
+
+    def _build_enrichment_skill_context(
+        self,
+        original_query: str,
+        record: ChunkRecord,
+        candidate_artifact: dict[str, Any],
+    ) -> SkillContext:
+        primary_identifier_field = "name_or_label"
+        if candidate_artifact.get("canonical_smiles") or candidate_artifact.get("smiles"):
+            primary_identifier_field = "smiles"
+        elif candidate_artifact.get("inchi"):
+            primary_identifier_field = "inchi"
+        elif candidate_artifact.get("cas_number") or candidate_artifact.get("cas"):
+            primary_identifier_field = "cas_number"
+        document = SimpleNamespace(
+            research_mode="candidate_design",
+            candidate_artifact_schema=SimpleNamespace(primary_identifier_field=primary_identifier_field),
+            evaluation_criteria=[],
+            reflection_guidance=[],
+            novelty_check_policy="",
+            known_candidate_exclusion_terms=[],
+        )
+        hypothesis = SimpleNamespace(
+            title=self._artifact_label(candidate_artifact) or record.incumbent_material or "Candidate",
+            summary=record.chunk_text[:1200],
+            candidate_material=self._artifact_label(candidate_artifact),
+            application=record.application,
+            incumbent_material=record.incumbent_material,
+            candidate_artifact=dict(candidate_artifact),
+        )
+        return SkillContext(
+            phase="enrichment",
+            document=document,
+            hypothesis=hypothesis,
+            purpose=f"Enrich graph material nodes for query: {original_query}",
+            requested_skill_ids=GRAPH_ENRICHMENT_SKILL_IDS,
+            evidence_rows=(
+                {
+                    "id": record.id,
+                    "source_url": record.source_url,
+                    "source_title": record.source_title,
+                    "application": record.application,
+                    "incumbent_material": record.incumbent_material,
+                    "candidate_materials": record.candidate_materials,
+                    "relevance_score": record.relevance_score,
+                    "chunk_text": record.chunk_text[:1800],
+                    "metadata": record.metadata,
+                },
+            ),
+            metadata={"source_chunk_id": record.id},
+        )
+
+    @staticmethod
+    def _merge_candidate_artifact(candidate_artifact: dict[str, Any], skill_results: list[Any]) -> dict[str, Any]:
+        merged = dict(candidate_artifact)
+        for result in skill_results:
+            for key, value in getattr(result, "resolved_identifiers", {}).items():
+                if value not in (None, "", []):
+                    merged[key] = value
+            cid = getattr(result, "metadata", {}).get("cid")
+            if cid not in (None, "", []):
+                merged["cid"] = cid
+        if "inchikey" in merged and "inchi_key" not in merged:
+            merged["inchi_key"] = merged["inchikey"]
+        if "canonical_smiles" in merged and "smiles" not in merged:
+            merged["smiles"] = merged["canonical_smiles"]
+        return merged
+
+    @staticmethod
+    def _artifact_label(candidate_artifact: dict[str, Any]) -> str:
+        for key in ("name_or_label", "trade_name", "name", "candidate_material", "canonical_smiles", "smiles"):
+            value = candidate_artifact.get(key)
+            if value not in (None, "", []):
+                return str(value).strip()
+        return ""
+
     def _enrich_manual_records(self, original_query: str, records: list[ChunkRecord]) -> None:
         try:
-            proposals = self._graph_enrichment_proposer.propose(original_query, records)
-            validations = self._graph_enrichment_validator.validate(proposals, records)
+            available_skills, skill_outputs, _write_count = self._run_graph_enrichment_skills_for_records(
+                original_query,
+                records,
+            )
+            proposals = self._propose_with_skill_context(
+                original_query,
+                records,
+                available_skills,
+                skill_outputs,
+            )
+            validations = self._validate_with_skill_context(
+                proposals,
+                records,
+                skill_outputs,
+            )
             _, expanded = self._graph_enrichment_expander.expand(original_query, proposals, validations, records)
-            expanded_validations = self._graph_enrichment_validator.validate(expanded, records) if expanded else []
+            expanded_validations = (
+                self._validate_with_skill_context(expanded, records, skill_outputs)
+                if expanded
+                else []
+            )
             accepted = self._graph_enrichment_store.write(
                 [*proposals, *expanded],
                 [*validations, *expanded_validations],

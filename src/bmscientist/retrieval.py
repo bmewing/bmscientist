@@ -180,22 +180,6 @@ class ExaPageRetriever:
                     direct_fallback_candidates.append((result, decision))
 
         for result, decision in direct_fallback_candidates:
-            if self._fetcher.should_skip_direct_fetch(str(result.url)):
-                page = build_partial_page_from_search_result(result, "blocked_domain")
-                if page:
-                    pages.append(page)
-                    stats["pages_by_source"]["search_snippet_partial"] += 1
-                else:
-                    skipped.append(
-                        {
-                            "url": str(result.url),
-                            "search_query": result.search_query,
-                            "reason": "blocked_domain",
-                            "note": "Direct fetch skipped by policy after Exa content was insufficient.",
-                        }
-                    )
-                continue
-
             stats["direct_fetch_attempted"] += 1
             page, error = self._fetcher.safe_fetch(result)
             if page:

@@ -11,6 +11,9 @@ Target final hypotheses: $target_hypotheses_final
 Regions: $regions
 Strategic fit notes: $strategic_fit_notes
 
+Available skills:
+$available_skills_json
+
 Return JSON with:
 - research_mode (one of: materials_opportunity, candidate_design, formulation_design, process_design, literature_map, generic_screening)
 - strategic_fit_criteria (array of strings)
@@ -37,7 +40,9 @@ Return JSON with:
 
 Rules:
 - Be concise and specific. Do not invent constraints not implied by the goal.
+- Keep the plan tight. Do not pad it with empty or generic fields that are not useful for the requested research mode.
 - Infer the right candidate representation for the goal. For molecule discovery or screening, prefer an artifact schema with identifiers such as `smiles`.
+- When `suggested_tool_ids` or `tool_requests` map naturally to listed available skills, prefer those real skill IDs or aliases instead of inventing imaginary capabilities.
 - Detect whether the user wants known substitutions or newly designed candidates. Phrases such as "brand-new", "never before seen", "invent", "generate SMILES", or "not substitutions" should push toward `candidate_design` plus `candidate_origin_policy = de_novo_design` or `novel_analogs`.
 - If the user asks for existing replacements, drop-in substitutes, suppliers, or commercially available alternatives, keep the contract oriented toward `materials_opportunity` and `known_candidates`.
 - Keep `research_mode` as `materials_opportunity` when the goal is clearly about incumbent-material replacement in applications.
@@ -46,6 +51,7 @@ Rules:
 - Evaluation criteria should explain what makes a good candidate and what evidence would be convincing.
 - Tool requests should be concrete capability requests, not instructions to execute code. Do not assume requested tools are installed.
 - Reflection guidance should help downstream reviewers know what to validate, what to falsify, and what missing evidence matters most.
+- For molecule-design or screening goals, avoid unnecessary materials-opportunity boilerplate such as incumbent-market replacement framing unless the user actually asked for that comparison.
 
 ## update_research_goal.system
 You are a research planning agent. Update an existing structured research goal and plan based on new user feedback/direction. Return strict JSON only.
@@ -56,6 +62,9 @@ $current_goal_json
 
 User feedback / new direction:
 $feedback
+
+Available skills:
+$available_skills_json
 
 Tasks:
 1. Update the overall research goal config to reflect the new direction/feedback.
@@ -93,4 +102,6 @@ Return JSON with:
 Rules:
 - Keep unmodified aspects of the original goals unless they conflict with the new feedback.
 - Preserve the existing research mode and generic contract unless the feedback clearly changes what kind of candidates or evaluation logic is needed.
+- Keep the updated plan tight and mode-appropriate rather than preserving generic boilerplate fields that are no longer useful.
+- When revising `suggested_tool_ids` or `tool_requests`, prefer the listed available skill IDs or aliases when they fit the requested capability.
 - If the feedback changes the request from substitution search to invention of new structures, update `candidate_origin_policy` accordingly and add novelty requirements instead of leaving the plan in replacement mode.

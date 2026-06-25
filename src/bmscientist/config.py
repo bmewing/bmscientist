@@ -143,7 +143,6 @@ class AppConfig(BaseModel):
     min_relevance_score: float = Field(default=0.6, ge=0.0, le=1.0)
     min_page_characters: int = Field(default=600, ge=100)
     min_snippet_characters: int = Field(default=120, ge=20)
-    skip_fetch_domains: list[str] = Field(default_factory=lambda: ["sciencedirect.com"])
     exa_search_content_text_chars: int = Field(default=8000, ge=500, le=50000)
     exa_contents_initial_text_chars: int = Field(default=12000, ge=500, le=100000)
     exa_contents_deep_text_chars: int = Field(default=50000, ge=1000, le=200000)
@@ -201,11 +200,6 @@ class AppConfig(BaseModel):
             "data_dir": Path(os.getenv("BMSCIENTIST_DATA_DIR") or os.getenv("DATA_DIR", "data")),
             "embedding_model": os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5"),
             "request_timeout_seconds": int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
-            "skip_fetch_domains": [
-                item.strip()
-                for item in os.getenv("SKIP_FETCH_DOMAINS", "sciencedirect.com").split(",")
-                if item.strip()
-            ],
             "exa_search_content_text_chars": int(os.getenv("EXA_SEARCH_CONTENT_TEXT_CHARS", "8000")),
             "exa_contents_initial_text_chars": int(os.getenv("EXA_CONTENTS_INITIAL_TEXT_CHARS", "12000")),
             "exa_contents_deep_text_chars": int(os.getenv("EXA_CONTENTS_DEEP_TEXT_CHARS", "50000")),

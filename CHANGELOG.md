@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.2
+
+### Fixed
+- Removed the legacy `SKIP_FETCH_DOMAINS` direct-fetch denylist so retrieval stays lean and Exa-guided fallback no longer carries stale domain-specific policy.
+- Simplified the Exa retrieval fallback path to always attempt direct fetch when configured, while still preserving partial evidence when direct access fails.
+- Cleaned the public configuration examples and docs to match the slimmer retrieval model.
+
+## 0.9.1
+
+### Fixed
+- Tightened saved `research_goal.json` and hypothesis JSON so candidate-design and molecule-discovery runs no longer persist large amounts of empty or irrelevant materials-opportunity boilerplate by default.
+- Made generation and planning prompts more mode-aware so molecule-design workflows stop overproducing substitution/commercial-comparison fields unless those details are actually relevant to the task.
+- Updated local hypothesis retrieval to avoid automatically manufacturing price-comparison style search queries for non-`materials_opportunity` research modes.
+
+## 0.9.0
+
+### Added
+- Added a phase-aware chemistry skill layer for molecule-first workflows, including PubChem identity resolution, RDKit descriptor profiling, PubChem property profiling, safety triage, availability screening, EPISuite integration, RXN4Chemistry retrosynthesis support, novelty screening, and molecule-neighbor seed expansion.
+- Added skill registry aliases, per-skill priorities, deterministic safety gating, and prompt-visible skill catalogs so planning, generation, and reflection can request real capabilities instead of inventing tool names.
+- Added graph-enrichment access to the skill layer so discovery-time enrichment can resolve molecule identifiers, derive SMILES-backed properties, and persist product and endpoint facts into the graph.
+- Added regression coverage for molecule-skill chaining, graph skill writeback, prompt rendering, and safety-gated chemistry workflows.
+
+### Changed
+- Expanded the hybrid agent-plus-skills architecture so planning, generation, reflection, and graph enrichment all share the same typed skill runtime.
+- Updated generation and planning prompts to include available skill catalogs and generation-phase molecule seed candidates.
+- Updated graph-enrichment prompts so LLM proposal and validation steps can use skill outputs for canonical naming and identifier consistency without bypassing evidence-based relationship validation.
+- Refined the active runtime catalog to keep chemistry enrichment focused on PubChem, RDKit, EPISuite, RXN4Chemistry, safety, and availability, while leaving deferred integrations such as ChemSpace pricing out of the live skill set for now.
+
 ## 0.8.0
 
 ### Added

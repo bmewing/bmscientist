@@ -38,6 +38,9 @@ def test_prompt_library_uses_repo_prompt_files():
         generation_guidance_json="[]",
         whitespace_gaps_json="[]",
         evidence_payload_json="[]",
+        available_skills_json="[]",
+        generation_skill_outputs_json="[]",
+        seed_candidates_json="[]",
         existing_hypotheses_json="[]",
         avoided_hypotheses_json="[]",
         target_count=3,
@@ -56,6 +59,9 @@ def test_prompt_library_generation_prompt_mentions_candidate_origin_policy():
         research_goal="Goal",
         document_json="{}",
         evidence_payload_json="[]",
+        available_skills_json="[]",
+        generation_skill_outputs_json="[]",
+        seed_candidates_json="[]",
         existing_hypotheses_json="[]",
         avoided_hypotheses_json="[]",
         target_hypotheses_generated=3,
@@ -75,7 +81,24 @@ def test_prompt_library_research_planning_prompt_mentions_novelty_fields():
         target_hypotheses_final=3,
         regions="[]",
         strategic_fit_notes="",
+        available_skills_json="[]",
     )
 
     assert "candidate_origin_policy" in rendered
     assert "novelty_check_policy" in rendered
+
+
+def test_prompt_library_graph_enrichment_prompt_mentions_skill_context():
+    library = PromptLibrary(base_dir=Path(__file__).resolve().parents[1] / "src" / "bmscientist" / "prompts" / "agents")
+
+    rendered = library.render(
+        "graph_enrichment_agent",
+        "propose.user",
+        original_query="Goal",
+        evidence_json="[]",
+        available_skills_json="[]",
+        skill_outputs_json="[]",
+    )
+
+    assert "Available enrichment skills" in rendered
+    assert "Existing skill outputs tied to these materials/chunks" in rendered

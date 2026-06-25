@@ -20,12 +20,8 @@ class FakeSearchClient:
 
 class FakeFetcher:
     def __init__(self):
-        self.should_skip_urls: set[str] = set()
         self.safe_fetch_calls: list[str] = []
         self.safe_fetch_result: tuple[PageContent | None, dict | None] = (None, None)
-
-    def should_skip_direct_fetch(self, url: str) -> bool:
-        return url in self.should_skip_urls
 
     def safe_fetch(self, result: SearchResultItem):
         self.safe_fetch_calls.append(str(result.url))
@@ -115,18 +111,17 @@ def test_retriever_uses_contents_followup_before_direct_fetch():
     assert search.calls[0]["urls"] == ["https://polymart.info/news"]
 
 
-def test_retriever_keeps_blocked_domains_off_direct_fetch():
+def test_retriever_attempts_direct_fetch_when_exa_content_is_insufficient():
     config = make_config()
     search = FakeSearchClient(contents_response=None)
     fetcher = FakeFetcher()
-    fetcher.should_skip_urls.add("https://blocked.example.com/page")
     retriever = ExaPageRetriever(config, search, fetcher)
     result = SearchResultItem(
-        title="Blocked page",
+        title="Sparse page",
         url="https://blocked.example.com/page",
         search_query="blocked domain query",
-        snippet="Partial evidence from search result",
-        summary="Some context",
+        snippet="Tiny note",
+        summary="",
         content_text="",
         highlights=[],
         score=0.05,
@@ -136,4 +131,4 @@ def test_retriever_keeps_blocked_domains_off_direct_fetch():
 
     assert len(batch.pages) == 1
     assert batch.pages[0].metadata["source_type"] == "search_snippet_partial"
-    assert fetcher.safe_fetch_calls == []
+    assert fetcher.safe_fetch_calls == ["https://blocked.example.com/page"]

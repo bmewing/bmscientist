@@ -62,6 +62,22 @@ from bmscientist.price_cache import StructuredPriceCache
 from bmscientist.prompt_library import PROMPTS
 from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_search_result, compose_partial_text
 from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options
+from bmscientist.skills import (
+    EPISuiteSkill,
+    MoleculeAvailabilitySkill,
+    MoleculeIdentityPubChemSkill,
+    MoleculeNeighborExpansionSkill,
+    NoveltyPatentScreenSkill,
+    PubChemProfileSkill,
+    RDKitProfileSkill,
+    RDKitSimilarityAndAlertsSkill,
+    RXN4ChemistryRetrosynthesisSkill,
+    SafetyTriageSkill,
+    SkillContext,
+    SkillRegistry,
+    SkillRunResult,
+    SkillRunner,
+)
 
 
 if TYPE_CHECKING:
@@ -148,17 +164,31 @@ class LocalEvidenceRetriever:
         return self.search_many(queries, top_k_per_query=6, max_results=max_results)
 
     def retrieve_for_hypothesis(self, document: ResearchGoalDocument, hypothesis: Hypothesis, max_results: int = 16) -> list[dict[str, Any]]:
-        queries = [
-            document.raw_goal,
-            hypothesis.title,
-            f"{hypothesis.application or ''} {hypothesis.candidate_material or ''} {hypothesis.incumbent_material or ''}".strip(),
-            f"{hypothesis.market_segment or ''} {hypothesis.candidate_material or ''} strategic fit".strip(),
-            f"{hypothesis.application or ''} {hypothesis.incumbent_material or ''} price usd kg".strip(),
-            f"{hypothesis.application or ''} {hypothesis.next_best_competitive_alternative or ''} price usd kg".strip(),
-            f"{hypothesis.application or ''} {hypothesis.market_segment or ''} market size {' '.join(document.regions)}".strip(),
-            f"{hypothesis.application or ''} replacement drivers regulatory sustainability".strip(),
-            f"{hypothesis.application or ''} {hypothesis.candidate_material or ''} drop in replacement {hypothesis.incumbent_material or ''}".strip(),
-        ]
+        queries = [document.raw_goal, hypothesis.title]
+        if document.research_mode == "materials_opportunity":
+            queries.extend(
+                [
+                    f"{hypothesis.application or ''} {hypothesis.candidate_material or ''} {hypothesis.incumbent_material or ''}".strip(),
+                    f"{hypothesis.market_segment or ''} {hypothesis.candidate_material or ''} strategic fit".strip(),
+                    f"{hypothesis.application or ''} {hypothesis.incumbent_material or ''} price usd kg".strip(),
+                    f"{hypothesis.application or ''} {hypothesis.next_best_competitive_alternative or ''} price usd kg".strip(),
+                    f"{hypothesis.application or ''} {hypothesis.market_segment or ''} market size {' '.join(document.regions)}".strip(),
+                    f"{hypothesis.application or ''} replacement drivers regulatory sustainability".strip(),
+                    f"{hypothesis.application or ''} {hypothesis.candidate_material or ''} drop in replacement {hypothesis.incumbent_material or ''}".strip(),
+                ]
+            )
+        else:
+            artifact = hypothesis.candidate_artifact or {}
+            primary_field = document.candidate_artifact_schema.primary_identifier_field
+            primary_value = artifact.get(primary_field)
+            queries.extend(
+                [
+                    f"{hypothesis.application or ''} {hypothesis.candidate_material or hypothesis.title}".strip(),
+                    f"{hypothesis.market_segment or ''} {hypothesis.candidate_material or hypothesis.title} performance".strip(),
+                    f"{hypothesis.application or ''} {' '.join(hypothesis.application_requirements[:3])}".strip(),
+                    str(primary_value).strip() if primary_value else "",
+                ]
+            )
         queries.extend(self._hypothesis_queries_from_contract(document, hypothesis))
         normalized_queries = [query for query in queries if query]
         return self.search_many(normalized_queries, top_k_per_query=5, max_results=max_results)
@@ -596,8 +626,9 @@ class ResearchPlanningAgent:
         "qualified material",
     )
 
-    def __init__(self, llm: DeepSeekLLM):
+    def __init__(self, llm: DeepSeekLLM, skill_runner: SkillRunner | None = None):
         self._llm = llm
+        self._skill_runner = skill_runner
 
     @staticmethod
     def _default_generated_count(target_hypotheses_final: int) -> int:
@@ -622,6 +653,7 @@ class ResearchPlanningAgent:
             target_hypotheses_final=target_hypotheses_final,
             regions=regions or [],
             strategic_fit_notes=strategic_fit_notes or "",
+            available_skills_json=json.dumps(self._available_skills_catalog(), indent=2),
         )
         draft = self._llm.complete_json(ResearchPlanDraft, system_prompt, user_prompt)
         draft = self._stabilize_plan_draft(raw_goal, draft)
@@ -668,8 +700,9 @@ class ResearchPlanningAgent:
         user_prompt = PROMPTS.render(
             "research_planning_agent",
             "update_research_goal.user",
-            current_goal_json=document.model_dump_json(indent=2),
+            current_goal_json=document.compact_json(indent=2),
             feedback=feedback,
+            available_skills_json=json.dumps(self._available_skills_catalog(), indent=2),
         )
         updated = self._llm.complete_json(UpdatedResearchPlan, system_prompt, user_prompt)
         updated = self._stabilize_updated_plan(updated.raw_goal or document.raw_goal, updated, feedback)
@@ -771,6 +804,11 @@ class ResearchPlanningAgent:
             }
         )
 
+    def _available_skills_catalog(self) -> list[dict[str, Any]]:
+        if self._skill_runner is None:
+            return []
+        return self._skill_runner.all_skill_catalog()
+
     @classmethod
     def _resolved_candidate_origin_policy(
         cls,
@@ -844,10 +882,17 @@ class ResearchPlanningAgent:
 class GenerationAgent:
     _minimum_batch_size = 5
 
-    def __init__(self, llm: DeepSeekLLM, retriever: LocalEvidenceRetriever, graph_evidence: GraphMarketEvidence | None = None):
+    def __init__(
+        self,
+        llm: DeepSeekLLM,
+        retriever: LocalEvidenceRetriever,
+        graph_evidence: GraphMarketEvidence | None = None,
+        skill_runner: SkillRunner | None = None,
+    ):
         self._llm = llm
         self._retriever = retriever
         self._graph_evidence = graph_evidence
+        self._skill_runner = skill_runner
 
     @property
     def batch_size(self) -> int:
@@ -892,6 +937,19 @@ class GenerationAgent:
             }
             for row in evidence_rows[:40]
         ]
+        skill_context = SkillContext(
+            phase="generation",
+            document=document,
+            purpose="Expand the molecule design space with structured analog and capability signals before generation.",
+            evidence_rows=tuple(evidence_rows),
+            target_count=document.target_hypotheses_generated,
+            avoid_hypotheses=tuple(avoid_hypotheses or ()),
+            metadata={"existing_signatures": self._existing_hypothesis_prompt_payload(document, avoid_hypotheses or [])},
+        )
+        available_skills = self._skill_runner.catalog_for_context(skill_context) if self._skill_runner is not None else []
+        skill_results = self._skill_runner.run_auto(skill_context) if self._skill_runner is not None else []
+        if skill_results:
+            evidence_payload.extend(self._skill_evidence_payload(skill_results))
         return self._generate_in_batches(
             document=document,
             evidence_payload=evidence_payload,
@@ -904,6 +962,9 @@ class GenerationAgent:
             on_progress=on_progress,
             on_batch=on_batch,
             avoid_hypotheses=avoid_hypotheses,
+            available_skills_json=json.dumps(available_skills, indent=2),
+            generation_skill_outputs_json=json.dumps([item.as_prompt_dict() for item in skill_results], indent=2),
+            seed_candidates_json=json.dumps(self._seed_candidates(skill_results), indent=2),
         )
 
     def generate_from_meta_review(
@@ -938,6 +999,19 @@ class GenerationAgent:
             }
             for row in evidence_rows[:35]
         ]
+        skill_context = SkillContext(
+            phase="generation",
+            document=document,
+            purpose="Address meta-review whitespace gaps with structured analog seed candidates and molecule capability signals.",
+            evidence_rows=tuple(evidence_rows),
+            target_count=target_count,
+            avoid_hypotheses=tuple(avoid_hypotheses or ()),
+            question_text=" ".join(meta_review_round.whitespace_gaps),
+        )
+        available_skills = self._skill_runner.catalog_for_context(skill_context) if self._skill_runner is not None else []
+        skill_results = self._skill_runner.run_auto(skill_context) if self._skill_runner is not None else []
+        if skill_results:
+            evidence_payload.extend(self._skill_evidence_payload(skill_results))
         return self._generate_in_batches(
             document=document,
             evidence_payload=evidence_payload,
@@ -952,6 +1026,9 @@ class GenerationAgent:
             whitespace_gaps_json=json.dumps(meta_review_round.whitespace_gaps, indent=2),
             on_batch=on_batch,
             avoid_hypotheses=avoid_hypotheses,
+            available_skills_json=json.dumps(available_skills, indent=2),
+            generation_skill_outputs_json=json.dumps([item.as_prompt_dict() for item in skill_results], indent=2),
+            seed_candidates_json=json.dumps(self._seed_candidates(skill_results), indent=2),
         )
 
     def _generate_in_batches(
@@ -974,6 +1051,9 @@ class GenerationAgent:
         batch_size = max(1, min(self.batch_size_for(limit), limit))
         max_attempts = max(2, ((limit + batch_size - 1) // batch_size) * 2)
         attempts_without_progress = 0
+        available_skills_json = extra_context.pop("available_skills_json", "[]")
+        generation_skill_outputs_json = extra_context.pop("generation_skill_outputs_json", "[]")
+        seed_candidates_json = extra_context.pop("seed_candidates_json", "[]")
 
         while len(hypotheses) < limit and attempts_without_progress < max_attempts:
             remaining = limit - len(hypotheses)
@@ -983,10 +1063,13 @@ class GenerationAgent:
                 "generation_agent",
                 user_section,
                 research_goal=document.raw_goal,
-                document_json=document.model_dump_json(indent=2),
+                document_json=document.compact_json(indent=2),
                 evidence_payload_json=json.dumps(evidence_payload, indent=2),
                 target_hypotheses_generated=batch_target,
                 target_count=batch_target,
+                available_skills_json=available_skills_json,
+                generation_skill_outputs_json=generation_skill_outputs_json,
+                seed_candidates_json=seed_candidates_json,
                 existing_hypotheses_json=json.dumps(
                     self._existing_hypothesis_prompt_payload(document, list(hypotheses.values())),
                     indent=2,
@@ -1031,6 +1114,33 @@ class GenerationAgent:
                 on_progress(len(hypotheses), progress_total)
 
         return list(hypotheses.values())[:limit]
+
+    @staticmethod
+    def _seed_candidates(skill_results: list[SkillRunResult]) -> list[dict[str, Any]]:
+        seeds: list[dict[str, Any]] = []
+        for result in skill_results:
+            seeds.extend(result.seed_candidates)
+        return seeds
+
+    @staticmethod
+    def _skill_evidence_payload(skill_results: list[SkillRunResult]) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for result in skill_results:
+            for row in result.evidence_rows:
+                payload.append(
+                    {
+                        "chunk_id": row.get("id"),
+                        "application": row.get("application"),
+                        "incumbent_material": row.get("incumbent_material"),
+                        "candidate_materials": row.get("candidate_materials"),
+                        "metadata": row.get("metadata", {}),
+                        "source_url": row.get("source_url"),
+                        "source_title": row.get("source_title"),
+                        "relevance_score": row.get("relevance_score"),
+                        "excerpt": str(row.get("chunk_text", ""))[:500],
+                    }
+                )
+        return payload[:20]
 
     @classmethod
     def _existing_hypothesis_prompt_payload(
@@ -1446,7 +1556,7 @@ class RankingAgent:
             "ranking_agent",
             "rank.user",
             research_goal=document.raw_goal,
-            document_json=document.model_dump_json(indent=2),
+            document_json=document.compact_json(indent=2),
             target_final_count=target_final_count,
             hypotheses_json=json.dumps(payload, indent=2),
         )
@@ -1985,7 +2095,7 @@ class ProximityCheckAgent:
             "proximity_check_agent",
             "review.user",
             research_goal=document.raw_goal,
-            document_json=document.model_dump_json(indent=2),
+            document_json=document.compact_json(indent=2),
             hypotheses_json=json.dumps(payload, indent=2),
             max_synthesized_hypotheses=max_synthesized_hypotheses,
         )
@@ -2533,7 +2643,7 @@ class MetaReviewAgent:
             "meta_review_agent",
             "review.user",
             research_goal=document.raw_goal,
-            document_json=document.model_dump_json(indent=2),
+            document_json=document.compact_json(indent=2),
             best_patterns_json=json.dumps(ranking_round.best_patterns, indent=2),
             worst_patterns_json=json.dumps(ranking_round.worst_patterns, indent=2),
             previous_gaps_json=json.dumps(document.whitespace_gap_notes, indent=2),
@@ -2682,7 +2792,7 @@ class FinalPortfolioAgent:
             "final_portfolio_agent",
             "build_report.user",
             research_goal=document.raw_goal,
-            document_json=document.model_dump_json(indent=2),
+            document_json=document.compact_json(indent=2),
             stop_reason=stop_reason,
             ranking_round_json=json.dumps(ranking_payload, indent=2),
             meta_review_round_json=json.dumps(meta_payload, indent=2),
@@ -2767,6 +2877,7 @@ class ReflectionAgent:
         price_cache: StructuredPriceCache | None = None,
         graph_evidence: GraphMarketEvidence | None = None,
         volume_estimation_llm: DeepSeekLLM | None = None,
+        skill_runner: SkillRunner | None = None,
     ):
         self._llm = llm
         self._retriever = retriever
@@ -2775,6 +2886,7 @@ class ReflectionAgent:
         self._price_cache = price_cache
         self._graph_evidence = graph_evidence
         self._volume_estimation_llm = volume_estimation_llm
+        self._skill_runner = skill_runner
 
     def reflect(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> tuple[Hypothesis, int]:
         use_material_path = not document.evaluation_criteria and document.research_mode == "materials_opportunity"
@@ -2786,8 +2898,13 @@ class ReflectionAgent:
                 LOGGER.exception("Structured price cache unavailable during reflection for %s", hypothesis.hypothesis_id)
         local_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
         evidence_rows = self._augment_evidence_rows(document, hypothesis, local_rows, price_document)
+        skill_context = self._skill_context(document, hypothesis, evidence_rows)
+        available_skills = self._available_skill_catalog(skill_context)
+        skill_results = self._run_skills(skill_context)
+        if skill_results:
+            evidence_rows = self._merge_evidence_rows(evidence_rows, self._skill_evidence_rows(skill_results))
         stale = self._retriever.is_stale(local_rows, document.preferred_evidence_recency_days)
-        initial_review = self._review(document, hypothesis, evidence_rows)
+        initial_review = self._review(document, hypothesis, evidence_rows, available_skills, skill_results)
 
         discovery_run_ids: list[str] = []
         search_queries: list[str] = []
@@ -2806,11 +2923,13 @@ class ReflectionAgent:
             if search_queries:
                 refreshed_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
                 evidence_rows = self._augment_evidence_rows(document, hypothesis, refreshed_rows, price_document)
+                if skill_results:
+                    evidence_rows = self._merge_evidence_rows(evidence_rows, self._skill_evidence_rows(skill_results))
 
         if use_material_path:
             evidence_rows = self._augment_with_ai_market_volume_estimate(document, hypothesis, evidence_rows)
 
-        final_review = self._review(document, hypothesis, evidence_rows)
+        final_review = self._review(document, hypothesis, evidence_rows, available_skills, skill_results)
         assessment = final_review.assessment
         if use_material_path:
             assessment = self._merge_price_metrics(
@@ -2818,6 +2937,7 @@ class ReflectionAgent:
                 hypothesis,
                 price_document,
             )
+        assessment = self._merge_skill_criterion_results(assessment, skill_results)
         assessment = self._finalize_missing_assessment_fields(document, hypothesis, assessment, evidence_rows)
         assessment = assessment.model_copy(
             update={
@@ -2833,6 +2953,80 @@ class ReflectionAgent:
             }
         )
         return reflected, len(discovery_run_ids)
+
+    @staticmethod
+    def _requested_skill_ids(document: ResearchGoalDocument) -> tuple[str, ...]:
+        return tuple(
+            OrderedDict.fromkeys(
+                str(request.tool_id or "").strip()
+                for request in document.tool_requests
+                if str(request.tool_id or "").strip()
+            )
+        )
+
+    def _skill_context(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+    ) -> SkillContext:
+        return SkillContext(
+            phase="reflection",
+            document=document,
+            hypothesis=hypothesis,
+            purpose=(
+                "Evaluate structured criteria for the candidate using available local, graph, and skill-backed evidence."
+            ),
+            requested_skill_ids=self._requested_skill_ids(document),
+            evidence_rows=tuple(evidence_rows),
+            question_text=document.raw_goal,
+        )
+
+    def _available_skill_catalog(self, context: SkillContext) -> list[dict[str, Any]]:
+        if self._skill_runner is None:
+            return []
+        return self._skill_runner.catalog_for_context(context)
+
+    def _run_skills(self, context: SkillContext) -> list[SkillRunResult]:
+        if self._skill_runner is None:
+            return []
+        return self._skill_runner.run_auto(context)
+
+    @staticmethod
+    def _skill_evidence_rows(skill_results: list[SkillRunResult]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for result in skill_results:
+            if result.status == "completed":
+                rows.extend(result.evidence_rows)
+        return rows
+
+    @staticmethod
+    def _merge_skill_criterion_results(
+        assessment: ReflectionAssessment,
+        skill_results: list[SkillRunResult],
+    ) -> ReflectionAssessment:
+        if not skill_results:
+            return assessment
+        merged: "OrderedDict[str, CandidateEvaluationResult]" = OrderedDict()
+        for result in assessment.criterion_results:
+            if result.criterion_name:
+                merged[result.criterion_name] = result
+        for skill_result in skill_results:
+            if skill_result.status != "completed":
+                continue
+            for result in skill_result.criterion_results:
+                if not result.criterion_name:
+                    continue
+                existing = merged.get(result.criterion_name)
+                if existing is None:
+                    merged[result.criterion_name] = result
+                    continue
+                if existing.tool_id is None and result.tool_id is not None:
+                    merged[result.criterion_name] = result
+                    continue
+                if existing.tool_id == result.tool_id and existing.confidence < result.confidence:
+                    merged[result.criterion_name] = result
+        return assessment.model_copy(update={"criterion_results": list(merged.values())})
 
     def _augment_evidence_rows(
         self,
@@ -2946,8 +3140,8 @@ class ReflectionAgent:
         user_prompt = (
             "Estimate the current annual substrate/material volume for this hypothesis's market/application. "
             "Also estimate material-level volume shares for the incumbent and relevant alternatives when evidence supports it.\n\n"
-            f"Research goal:\n{document.model_dump_json(indent=2)}\n\n"
-            f"Hypothesis:\n{hypothesis.model_dump_json(indent=2)}\n\n"
+            f"Research goal:\n{document.compact_json(indent=2)}\n\n"
+            f"Hypothesis:\n{hypothesis.compact_json(indent=2)}\n\n"
             f"Evidence rows:\n{json.dumps(evidence_payload, indent=2)}\n\n"
             "Return JSON with market_name, application_name, total_substrate_volume_value, "
             "total_substrate_volume_unit, volume_year, revenue_value, revenue_unit, revenue_year, "
@@ -3053,9 +3247,22 @@ class ReflectionAgent:
                 merged[row_id] = row
         return list(merged.values())
 
-    def _review(self, document: ResearchGoalDocument, hypothesis: Hypothesis, evidence_rows: list[dict[str, Any]]) -> ReflectionReviewOutput:
+    def _review(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]] | None = None,
+        skill_results: list[SkillRunResult] | None = None,
+    ) -> ReflectionReviewOutput:
         if document.evaluation_criteria or document.research_mode != "materials_opportunity":
-            return self._review_generic_criteria(document, hypothesis, evidence_rows)
+            return self._review_generic_criteria(
+                document,
+                hypothesis,
+                evidence_rows,
+                available_skills or [],
+                skill_results or [],
+            )
         technical = self._review_category(document, hypothesis, evidence_rows, "technical")
         commercial = self._review_category(document, hypothesis, evidence_rows, "commercial")
         strategic = self._review_category(document, hypothesis, evidence_rows, "strategic")
@@ -3078,6 +3285,8 @@ class ReflectionAgent:
         document: ResearchGoalDocument,
         hypothesis: Hypothesis,
         evidence_rows: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]],
+        skill_results: list[SkillRunResult],
     ) -> ReflectionReviewOutput:
         criteria = document.evaluation_criteria or self._default_generic_criteria(document, hypothesis)
         if not criteria:
@@ -3106,11 +3315,13 @@ class ReflectionAgent:
             user_prompt = PROMPTS.render(
                 "reflection_agent",
                 "review_criteria.user",
-                document_json=document.model_dump_json(indent=2),
-                hypothesis_json=hypothesis.model_dump_json(indent=2),
+                document_json=document.compact_json(indent=2),
+                hypothesis_json=hypothesis.compact_json(indent=2),
                 evidence_payload_json=json.dumps(evidence_payload, indent=2),
                 criteria_json=json.dumps([criterion.model_dump() for criterion in batch], indent=2),
                 tool_requests_json=json.dumps([request.model_dump() for request in document.tool_requests], indent=2),
+                available_skills_json=json.dumps(available_skills, indent=2),
+                skill_outputs_json=json.dumps([result.as_prompt_dict() for result in skill_results], indent=2),
             )
             reviews.append(self._llm.complete_json(ReflectionReviewOutput, system_prompt, user_prompt))
         return ReflectionReviewOutput(
@@ -3170,8 +3381,8 @@ class ReflectionAgent:
         user_prompt = PROMPTS.render(
             "reflection_agent",
             "review_category.user",
-            document_json=document.model_dump_json(indent=2),
-            hypothesis_json=hypothesis.model_dump_json(indent=2),
+            document_json=document.compact_json(indent=2),
+            hypothesis_json=hypothesis.compact_json(indent=2),
             evidence_payload_json=json.dumps(evidence_payload, indent=2),
             category=category,
             focus_fields_json=json.dumps(category_fields[category], indent=2),
@@ -3581,6 +3792,21 @@ class CoScientistRunner:
             cost_tracker=self._cost_tracker,
             client_name="meta_review",
         )
+        self._skill_registry = SkillRegistry(
+            [
+                SafetyTriageSkill(config),
+                MoleculeIdentityPubChemSkill(config),
+                RDKitProfileSkill(config),
+                RDKitSimilarityAndAlertsSkill(),
+                PubChemProfileSkill(config),
+                MoleculeAvailabilitySkill(config),
+                NoveltyPatentScreenSkill(config),
+                MoleculeNeighborExpansionSkill(config),
+                EPISuiteSkill(config),
+                RXN4ChemistryRetrosynthesisSkill(config),
+            ]
+        )
+        self._skill_runner = SkillRunner(self._skill_registry)
         if evidence_store is None:
             from bmscientist.store import LanceEvidenceStore
 
@@ -3610,8 +3836,13 @@ class CoScientistRunner:
             self._price_cache.ensure_fresh()
         except Exception:
             LOGGER.exception("Initial structured price cache refresh failed")
-        self._planning_agent = ResearchPlanningAgent(self._planning_llm)
-        self._generation_agent = GenerationAgent(self._generation_llm, self._retriever, self._graph_evidence)
+        self._planning_agent = ResearchPlanningAgent(self._planning_llm, self._skill_runner)
+        self._generation_agent = GenerationAgent(
+            self._generation_llm,
+            self._retriever,
+            self._graph_evidence,
+            self._skill_runner,
+        )
         self._ranking_agent = RankingAgent(self._ranking_llm)
         self._evolution_agent = EvolutionAgent(self._evolution_llm)
         self._proximity_agent = ProximityCheckAgent(self._proximity_llm)
@@ -3635,6 +3866,7 @@ class CoScientistRunner:
             self._price_cache,
             self._graph_evidence,
             self._market_volume_llm,
+            self._skill_runner,
         )
 
     def set_progress_reporter(self, reporter: ProgressReporter | None) -> None:
