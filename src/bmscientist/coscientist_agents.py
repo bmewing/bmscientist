@@ -62,6 +62,14 @@ from bmscientist.price_cache import StructuredPriceCache
 from bmscientist.prompt_library import PROMPTS
 from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_search_result, compose_partial_text
 from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options
+from bmscientist.skills import (
+    EPISuiteSkill,
+    RXN4ChemistryRetrosynthesisSkill,
+    SkillContext,
+    SkillRegistry,
+    SkillRunResult,
+    SkillRunner,
+)
 
 
 if TYPE_CHECKING:
@@ -2767,6 +2775,7 @@ class ReflectionAgent:
         price_cache: StructuredPriceCache | None = None,
         graph_evidence: GraphMarketEvidence | None = None,
         volume_estimation_llm: DeepSeekLLM | None = None,
+        skill_runner: SkillRunner | None = None,
     ):
         self._llm = llm
         self._retriever = retriever
@@ -2775,6 +2784,7 @@ class ReflectionAgent:
         self._price_cache = price_cache
         self._graph_evidence = graph_evidence
         self._volume_estimation_llm = volume_estimation_llm
+        self._skill_runner = skill_runner
 
     def reflect(self, document: ResearchGoalDocument, hypothesis: Hypothesis) -> tuple[Hypothesis, int]:
         use_material_path = not document.evaluation_criteria and document.research_mode == "materials_opportunity"
@@ -2784,10 +2794,15 @@ class ReflectionAgent:
                 price_document = self._price_cache.ensure_fresh()
             except Exception:
                 LOGGER.exception("Structured price cache unavailable during reflection for %s", hypothesis.hypothesis_id)
+        skill_context = self._skill_context(document, hypothesis)
+        available_skills = self._available_skill_catalog(skill_context)
         local_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
         evidence_rows = self._augment_evidence_rows(document, hypothesis, local_rows, price_document)
+        skill_results = self._run_skills(skill_context)
+        if skill_results:
+            evidence_rows = self._merge_evidence_rows(evidence_rows, self._skill_evidence_rows(skill_results))
         stale = self._retriever.is_stale(local_rows, document.preferred_evidence_recency_days)
-        initial_review = self._review(document, hypothesis, evidence_rows)
+        initial_review = self._review(document, hypothesis, evidence_rows, available_skills, skill_results)
 
         discovery_run_ids: list[str] = []
         search_queries: list[str] = []
@@ -2806,11 +2821,13 @@ class ReflectionAgent:
             if search_queries:
                 refreshed_rows = self._retriever.retrieve_for_hypothesis(document, hypothesis)
                 evidence_rows = self._augment_evidence_rows(document, hypothesis, refreshed_rows, price_document)
+                if skill_results:
+                    evidence_rows = self._merge_evidence_rows(evidence_rows, self._skill_evidence_rows(skill_results))
 
         if use_material_path:
             evidence_rows = self._augment_with_ai_market_volume_estimate(document, hypothesis, evidence_rows)
 
-        final_review = self._review(document, hypothesis, evidence_rows)
+        final_review = self._review(document, hypothesis, evidence_rows, available_skills, skill_results)
         assessment = final_review.assessment
         if use_material_path:
             assessment = self._merge_price_metrics(
@@ -2818,6 +2835,7 @@ class ReflectionAgent:
                 hypothesis,
                 price_document,
             )
+        assessment = self._merge_skill_criterion_results(assessment, skill_results)
         assessment = self._finalize_missing_assessment_fields(document, hypothesis, assessment, evidence_rows)
         assessment = assessment.model_copy(
             update={
@@ -2833,6 +2851,77 @@ class ReflectionAgent:
             }
         )
         return reflected, len(discovery_run_ids)
+
+    @staticmethod
+    def _requested_skill_ids(document: ResearchGoalDocument) -> tuple[str, ...]:
+        return tuple(
+            OrderedDict.fromkeys(
+                str(request.tool_id or "").strip()
+                for request in document.tool_requests
+                if str(request.tool_id or "").strip()
+            )
+        )
+
+    def _skill_context(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+    ) -> SkillContext:
+        return SkillContext(
+            phase="reflection",
+            document=document,
+            hypothesis=hypothesis,
+            purpose=(
+                "Evaluate structured criteria for the candidate using available local, graph, and skill-backed evidence."
+            ),
+            requested_skill_ids=self._requested_skill_ids(document),
+        )
+
+    def _available_skill_catalog(self, context: SkillContext) -> list[dict[str, Any]]:
+        if self._skill_runner is None:
+            return []
+        return self._skill_runner.catalog_for_context(context)
+
+    def _run_skills(self, context: SkillContext) -> list[SkillRunResult]:
+        if self._skill_runner is None:
+            return []
+        return self._skill_runner.run_auto(context)
+
+    @staticmethod
+    def _skill_evidence_rows(skill_results: list[SkillRunResult]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for result in skill_results:
+            if result.status == "completed":
+                rows.extend(result.evidence_rows)
+        return rows
+
+    @staticmethod
+    def _merge_skill_criterion_results(
+        assessment: ReflectionAssessment,
+        skill_results: list[SkillRunResult],
+    ) -> ReflectionAssessment:
+        if not skill_results:
+            return assessment
+        merged: "OrderedDict[str, CandidateEvaluationResult]" = OrderedDict()
+        for result in assessment.criterion_results:
+            if result.criterion_name:
+                merged[result.criterion_name] = result
+        for skill_result in skill_results:
+            if skill_result.status != "completed":
+                continue
+            for result in skill_result.criterion_results:
+                if not result.criterion_name:
+                    continue
+                existing = merged.get(result.criterion_name)
+                if existing is None:
+                    merged[result.criterion_name] = result
+                    continue
+                if existing.tool_id is None and result.tool_id is not None:
+                    merged[result.criterion_name] = result
+                    continue
+                if existing.tool_id == result.tool_id and existing.confidence < result.confidence:
+                    merged[result.criterion_name] = result
+        return assessment.model_copy(update={"criterion_results": list(merged.values())})
 
     def _augment_evidence_rows(
         self,
@@ -3053,9 +3142,22 @@ class ReflectionAgent:
                 merged[row_id] = row
         return list(merged.values())
 
-    def _review(self, document: ResearchGoalDocument, hypothesis: Hypothesis, evidence_rows: list[dict[str, Any]]) -> ReflectionReviewOutput:
+    def _review(
+        self,
+        document: ResearchGoalDocument,
+        hypothesis: Hypothesis,
+        evidence_rows: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]] | None = None,
+        skill_results: list[SkillRunResult] | None = None,
+    ) -> ReflectionReviewOutput:
         if document.evaluation_criteria or document.research_mode != "materials_opportunity":
-            return self._review_generic_criteria(document, hypothesis, evidence_rows)
+            return self._review_generic_criteria(
+                document,
+                hypothesis,
+                evidence_rows,
+                available_skills or [],
+                skill_results or [],
+            )
         technical = self._review_category(document, hypothesis, evidence_rows, "technical")
         commercial = self._review_category(document, hypothesis, evidence_rows, "commercial")
         strategic = self._review_category(document, hypothesis, evidence_rows, "strategic")
@@ -3078,6 +3180,8 @@ class ReflectionAgent:
         document: ResearchGoalDocument,
         hypothesis: Hypothesis,
         evidence_rows: list[dict[str, Any]],
+        available_skills: list[dict[str, Any]],
+        skill_results: list[SkillRunResult],
     ) -> ReflectionReviewOutput:
         criteria = document.evaluation_criteria or self._default_generic_criteria(document, hypothesis)
         if not criteria:
@@ -3111,6 +3215,8 @@ class ReflectionAgent:
                 evidence_payload_json=json.dumps(evidence_payload, indent=2),
                 criteria_json=json.dumps([criterion.model_dump() for criterion in batch], indent=2),
                 tool_requests_json=json.dumps([request.model_dump() for request in document.tool_requests], indent=2),
+                available_skills_json=json.dumps(available_skills, indent=2),
+                skill_outputs_json=json.dumps([result.as_prompt_dict() for result in skill_results], indent=2),
             )
             reviews.append(self._llm.complete_json(ReflectionReviewOutput, system_prompt, user_prompt))
         return ReflectionReviewOutput(
@@ -3581,6 +3687,13 @@ class CoScientistRunner:
             cost_tracker=self._cost_tracker,
             client_name="meta_review",
         )
+        self._skill_registry = SkillRegistry(
+            [
+                EPISuiteSkill(config),
+                RXN4ChemistryRetrosynthesisSkill(config),
+            ]
+        )
+        self._skill_runner = SkillRunner(self._skill_registry)
         if evidence_store is None:
             from bmscientist.store import LanceEvidenceStore
 
@@ -3635,6 +3748,7 @@ class CoScientistRunner:
             self._price_cache,
             self._graph_evidence,
             self._market_volume_llm,
+            self._skill_runner,
         )
 
     def set_progress_reporter(self, reporter: ProgressReporter | None) -> None:

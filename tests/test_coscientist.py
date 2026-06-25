@@ -27,6 +27,7 @@ from bmscientist.coscientist_agents import (
 )
 from bmscientist.coscientist_cli import run_coscientist_command, run_coscientist_loop_command
 from bmscientist.coscientist_models import (
+    CandidateEvaluationResult,
     EvaluationCriterion,
     Hypothesis,
     HypothesisEvolutionOutput,
@@ -46,6 +47,7 @@ from bmscientist.coscientist_models import (
 from bmscientist.coscientist_store import CoScientistStore
 from bmscientist.graph_market import GraphMarketEvidence
 from bmscientist.models import EvidenceClassification, PageContent
+from bmscientist.skills import SkillRegistry, SkillRunResult, SkillRunner, SkillSpec
 
 
 class FakeEmbedder:
@@ -59,6 +61,57 @@ class FakeStore:
 
     def search_by_vector(self, vector, top_k=8):
         return self.rows[:top_k]
+
+
+class FakeEPISuiteSkill:
+    def __init__(self, results=None, rows=None):
+        self.results = [
+            item if isinstance(item, CandidateEvaluationResult) else CandidateEvaluationResult.model_validate(item)
+            for item in (results or [])
+        ]
+        self.rows = rows or []
+        self.calls = []
+        self._spec = SkillSpec(
+            skill_id="epa_episuite",
+            description="Fake EPISuite skill for tests.",
+            phases=("reflection",),
+            supported_research_modes=("candidate_design",),
+            required_candidate_fields=("smiles",),
+            expected_outputs=("log_kow", "fish_lc50_mg_l"),
+            trigger_keywords=("smiles", "toxicity"),
+            provider="test",
+        )
+
+    @property
+    def spec(self):
+        return self._spec
+
+    def is_applicable(self, context):
+        candidate_artifact = getattr(context.hypothesis, "candidate_artifact", {}) or {}
+        return bool(str(candidate_artifact.get("smiles") or "").strip())
+
+    def should_run(self, context):
+        return True
+
+    def predict_smiles(self, smiles: str):
+        self.calls.append(smiles)
+        return self.results
+
+    def build_evidence_rows(self, *, smiles: str, candidate_name: str, application=None, incumbent_material=None):
+        return list(self.rows)
+
+    def run(self, context):
+        candidate_artifact = getattr(context.hypothesis, "candidate_artifact", {}) or {}
+        smiles = str(candidate_artifact.get("smiles") or "").strip()
+        self.calls.append(smiles)
+        return SkillRunResult(
+            skill_id=self.spec.skill_id,
+            status="completed",
+            criterion_results=list(self.results),
+            evidence_rows=list(self.rows),
+            notes=["Fake EPISuite executed."],
+            rationale="Test skill execution.",
+        )
 
 
 class RecordingProgressReporter:
@@ -1159,6 +1212,139 @@ def test_reflection_assessment_normalizes_criterion_result_aliases():
     assert result.criterion_name == "water_compatibility"
     assert result.normalized_score == 0.55
     assert result.rationale == "Estimated to have acceptable water compatibility."
+
+
+def test_reflection_agent_merges_episuite_results_for_smiles_candidates():
+    class ReflectionLLM:
+        def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+            return response_model.model_validate(
+                {
+                    "assessment": {
+                        "criterion_results": [
+                            {
+                                "criterion_name": "aquatic_toxicity_risk",
+                                "value": "screen needed",
+                                "normalized_score": 0.5,
+                                "confidence": 0.3,
+                                "rationale": "Waiting on supporting evidence.",
+                            }
+                        ]
+                    },
+                    "needs_additional_search": False,
+                    "follow_up_search_queries": [],
+                }
+            )
+
+    class ReflectionRetriever:
+        def retrieve_for_hypothesis(self, document, hypothesis, max_results=16):
+            return []
+
+        def is_stale(self, rows, preferred_recency_days):
+            return False
+
+    class ReflectionDiscoveryTool:
+        def run(self, query, limits):
+            raise AssertionError("EPISuite-backed reflection should not have needed external discovery in this test.")
+
+    document = ResearchGoalDocument.model_validate(
+        {
+            "research_id": "episuite-1",
+            "raw_goal": "Find new small molecules with lower aquatic toxicity risk.",
+            "target_hypotheses_final": 1,
+            "target_hypotheses_generated": 1,
+            "research_mode": "candidate_design",
+            "candidate_artifact_schema": {
+                "artifact_type": "small_molecule",
+                "primary_identifier_field": "smiles",
+                "required_fields": ["smiles"],
+            },
+            "evaluation_criteria": [
+                {
+                    "name": "aquatic_toxicity_risk",
+                    "description": "Prefer candidates with better ecotoxicology profiles.",
+                    "suggested_tool_ids": ["epa_episuite"],
+                }
+            ],
+            "tool_requests": [
+                {
+                    "tool_id": "epa_episuite",
+                    "purpose": "Predict molecular fate and ecotoxicity endpoints from SMILES.",
+                    "status": "available",
+                }
+            ],
+        }
+    )
+    hypothesis = Hypothesis.model_validate(
+        {
+            "hypothesis_id": "hyp-episuite",
+            "research_id": "episuite-1",
+            "status": "generated",
+            "title": "Candidate coalescent E",
+            "summary": "A small-molecule candidate.",
+            "application": "waterborne coatings",
+            "candidate_artifact": {
+                "name_or_label": "Candidate E",
+                "smiles": "CCOC(=O)OCC",
+            },
+        }
+    )
+    episuite_skill = FakeEPISuiteSkill(
+        results=[
+            {
+                "criterion_name": "log_kow",
+                "value": 2.14,
+                "confidence": 0.72,
+                "rationale": "Predicted from EPA EPISuite.",
+                "evidence_mode": "external_tool",
+                "tool_id": "epa_episuite",
+                "is_inferred": True,
+            },
+            {
+                "criterion_name": "fish_lc50_mg_l",
+                "value": 48.5,
+                "unit": "mg/L",
+                "confidence": 0.72,
+                "rationale": "Predicted from EPA EPISuite.",
+                "evidence_mode": "external_tool",
+                "tool_id": "epa_episuite",
+                "is_inferred": True,
+            },
+        ],
+        rows=[
+            {
+                "id": "episuite:1:log_kow",
+                "source_url": "https://episuite.dev/api/submit?smiles=CCOC(=O)OCC",
+                "source_title": "EPA EPISuite prediction",
+                "application": "waterborne coatings",
+                "incumbent_material": None,
+                "candidate_materials": ["Candidate E"],
+                "relevance_score": 0.82,
+                "retrieved_at": "2026-06-24T00:00:00+00:00",
+                "chunk_text": "EPA EPISuite predicted log_kow for the candidate.",
+                "metadata": {"source_type": "external-tool", "tool_id": "epa_episuite", "endpoint_name": "log_kow"},
+            }
+        ],
+    )
+
+    skill_runner = SkillRunner(SkillRegistry([episuite_skill]))
+    agent = ReflectionAgent(
+        ReflectionLLM(),
+        ReflectionRetriever(),
+        ReflectionDiscoveryTool(),
+        skill_runner=skill_runner,
+    )
+
+    reflected, discovery_runs = agent.reflect(document, hypothesis)
+
+    assert discovery_runs == 0
+    results_by_name = {
+        result.criterion_name: result
+        for result in (reflected.reflection_assessment.criterion_results if reflected.reflection_assessment else [])
+    }
+    assert episuite_skill.calls == ["CCOC(=O)OCC"]
+    assert results_by_name["aquatic_toxicity_risk"].tool_id is None
+    assert results_by_name["log_kow"].tool_id == "epa_episuite"
+    assert results_by_name["fish_lc50_mg_l"].unit == "mg/L"
 
 
 def test_hypothesis_seed_normalizes_non_unit_score_scales():

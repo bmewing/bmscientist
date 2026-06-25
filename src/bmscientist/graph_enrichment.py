@@ -2087,8 +2087,12 @@ class GraphEnrichmentStore:
         text = endpoint_name.lower()
         if any(token in text for token in ("tox", "ecotox", "fish", "hazard")):
             return "toxicity"
-        if any(token in text for token in ("solubility", "logp", "vapor", "boiling")):
+        if any(token in text for token in ("solubility", "logp", "log_kow", "koc", "vapor", "boiling", "melting", "henry")):
             return "physicochemical"
+        if any(token in text for token in ("biodegrad", "bcf", "half_life", "half-life")):
+            return "environmental_fate"
+        if any(token in text for token in ("retrosynthesis", "synthe", "route_depth", "route_count", "precursor")):
+            return "synthesis"
         if any(token in text for token in ("coales", "mfft", "tg", "film")):
             return "performance"
         return "general"
