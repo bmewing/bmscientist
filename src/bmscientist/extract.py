@@ -66,10 +66,6 @@ class PageFetcher:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": config.user_agent})
 
-    def should_skip_direct_fetch(self, url: str) -> bool:
-        domain = extract_domain(url)
-        return any(domain == blocked or domain.endswith(f".{blocked}") for blocked in self._config.skip_fetch_domains)
-
     def fetch(self, result: SearchResultItem) -> PageContent:
         response = self._session.get(str(result.url), timeout=self._timeout)
         response.raise_for_status()

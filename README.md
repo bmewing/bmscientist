@@ -18,7 +18,7 @@ Use the local virtual environment for all Python commands on this project:
 
 Create a `.env` from `.env.example` and add your API keys.
 
-## What Is New In 0.9.1
+## What Is New In 0.9.2
 
 The project now has a typed chemistry skill layer that can be used by planning, generation, reflection, and graph enrichment.
 
@@ -52,7 +52,6 @@ BMSCIENTIST_DATA_DIR=./data
 
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 REQUEST_TIMEOUT_SECONDS=60
-SKIP_FETCH_DOMAINS=sciencedirect.com
 
 # Optional chemistry skill integrations
 EPISUITE_API_BASE_URL=https://episuite.dev

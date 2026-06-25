@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.2
+
+### Fixed
+- Removed the legacy `SKIP_FETCH_DOMAINS` direct-fetch denylist so retrieval stays lean and Exa-guided fallback no longer carries stale domain-specific policy.
+- Simplified the Exa retrieval fallback path to always attempt direct fetch when configured, while still preserving partial evidence when direct access fails.
+- Cleaned the public configuration examples and docs to match the slimmer retrieval model.
+
 ## 0.9.1
 
 ### Fixed
