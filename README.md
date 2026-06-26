@@ -18,7 +18,13 @@ Use the local virtual environment for all Python commands on this project:
 
 Create a `.env` from `.env.example` and add your API keys.
 
-## What Is New In 0.9.3
+## What Is New In 0.9.4
+
+Meta-review and regeneration are now more tightly grounded in the project target size. In practice, that means the system is less likely to ask for oversized top-k review batches or extra molecule generation when the requested final shortlist is already small and well covered.
+
+If the top target-sized shortlist already contains the required number of novel, well-documented options, the loop can now treat that as sufficient even when weaker leftover candidates still have unresolved gaps.
+
+## What Was New In 0.9.3
 
 The project now has a typed chemistry skill layer that can be used by planning, generation, reflection, and graph enrichment.
 

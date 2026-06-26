@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.4
+
+### Fixed
+- Tightened meta-review guidance so follow-up work stays grounded in the project target size instead of expanding into oversized top-k lists or unnecessary extra candidate batches.
+- Updated shortlist sufficiency framing so a project can stop once the required number of novel, well-supported candidates is covered, even if weaker surplus ideas remain elsewhere in the portfolio.
+
 ## 0.9.3
 
 ### Fixed

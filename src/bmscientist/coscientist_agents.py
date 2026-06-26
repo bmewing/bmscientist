@@ -2511,6 +2511,8 @@ class ProximityCheckAgent:
 
 
 class MetaReviewAgent:
+    _PROJECT_SIZE_GUARDRAIL_PREFIX = "Project-size guardrail:"
+
     def __init__(self, llm: DeepSeekLLM):
         self._llm = llm
 
@@ -2538,6 +2540,7 @@ class MetaReviewAgent:
         except Exception as exc:
             LOGGER.warning("Meta-review failed (%s); falling back to deterministic gap review", exc)
             output = self._fallback_review(document, active_reflected, ranking_round, feedback_hypotheses)
+        normalized_guidance = self._normalize_generation_guidance(document, output.generation_guidance)
 
         previous_gaps = document.whitespace_gap_notes
         current_gaps = output.whitespace_gaps
@@ -2574,7 +2577,7 @@ class MetaReviewAgent:
             update={
                 "whitespace_gap_notes": current_gaps,
                 "whitespace_gap_persistence_count": persistence_count,
-                "meta_review_generation_guidance": output.generation_guidance,
+                "meta_review_generation_guidance": normalized_guidance,
                 "emerging_concept_labels": self._collect_concepts(active_reflected),
                 "last_meta_review_round_index": round_index,
             }
@@ -2584,7 +2587,7 @@ class MetaReviewAgent:
             research_id=document.research_id,
             round_index=round_index,
             whitespace_gaps=current_gaps,
-            generation_guidance=output.generation_guidance,
+            generation_guidance=normalized_guidance,
             coverage_assessment=output.coverage_assessment,
             gap_shrinkage_status=shrinkage_status,
             coverage_sufficient=output.coverage_sufficient,
@@ -2601,6 +2604,7 @@ class MetaReviewAgent:
         ranking_round: RankingRound,
         feedback_hypotheses: list[Hypothesis],
     ) -> MetaReviewOutput:
+        hypotheses_by_id = {hypothesis.hypothesis_id: hypothesis for hypothesis in hypotheses}
         payload = [
             {
                 "hypothesis_id": hypothesis.hypothesis_id,
@@ -2638,6 +2642,24 @@ class MetaReviewAgent:
             }
             for hypothesis in feedback_hypotheses
         ]
+        top_shortlist_payload = [
+            {
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "title": hypothesis.title,
+                "candidate_material": hypothesis.candidate_material,
+                "application": hypothesis.application,
+                "ranking_score": hypothesis.ranking_score,
+                "ranking_status": hypothesis.ranking_status,
+                "reflection": RankingAgent._assessment_payload(hypothesis.reflection_assessment),
+                "evidence_gaps": (
+                    hypothesis.reflection_assessment.evidence_gap_notes if hypothesis.reflection_assessment else []
+                ),
+                "user_feedback_status": hypothesis.user_feedback_status,
+                "user_feedback_comment": hypothesis.user_feedback_comment,
+            }
+            for hypothesis_id in ranking_round.promoted_hypothesis_ids[: document.target_hypotheses_final]
+            if (hypothesis := hypotheses_by_id.get(hypothesis_id)) is not None
+        ]
         system_prompt = PROMPTS.render("meta_review_agent", "review.system")
         user_prompt = PROMPTS.render(
             "meta_review_agent",
@@ -2649,10 +2671,35 @@ class MetaReviewAgent:
             previous_gaps_json=json.dumps(document.whitespace_gap_notes, indent=2),
             previous_guidance_json=json.dumps(document.meta_review_generation_guidance, indent=2),
             gap_persistence_count=document.whitespace_gap_persistence_count,
+            target_final_count=document.target_hypotheses_final,
+            current_active_count=len(hypotheses),
+            current_shortlist_count=len(top_shortlist_payload),
+            remaining_to_target_count=max(0, document.target_hypotheses_final - len(top_shortlist_payload)),
+            top_shortlist_json=json.dumps(top_shortlist_payload, indent=2),
             hypotheses_json=json.dumps(payload, indent=2),
             feedback_hypotheses_json=json.dumps(feedback_payload, indent=2),
         )
         return self._llm.complete_json(MetaReviewOutput, system_prompt, user_prompt)
+
+    @classmethod
+    def _normalize_generation_guidance(
+        cls,
+        document: ResearchGoalDocument,
+        guidance: list[str],
+    ) -> list[str]:
+        project_size_guardrail = (
+            f"{cls._PROJECT_SIZE_GUARDRAIL_PREFIX} Anchor follow-up work to the target of "
+            f"{document.target_hypotheses_final} final candidate(s). Treat the current top "
+            f"{document.target_hypotheses_final} shortlist as the main decision set, and do not request "
+            "broader batches or top-k worklists larger than that target unless the shortlist itself is failing "
+            "the research goal."
+        )
+        normalized = [
+            item.strip()
+            for item in guidance
+            if item and item.strip() and not item.strip().startswith(cls._PROJECT_SIZE_GUARDRAIL_PREFIX)
+        ]
+        return [project_size_guardrail, *list(OrderedDict.fromkeys(normalized))]
 
     @staticmethod
     def _fallback_review(

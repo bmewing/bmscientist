@@ -139,7 +139,7 @@ class AppConfig(BaseModel):
     lancedb_path: Path | None = Field(default=None)
     embedding_model: str = Field(default="BAAI/bge-base-en-v1.5")
     request_timeout_seconds: int = Field(default=20, ge=5, le=600)
-    user_agent: str = Field(default="bmscientist/0.6.0")
+    user_agent: str = Field(default="bmscientist/0.9.4")
     min_relevance_score: float = Field(default=0.6, ge=0.0, le=1.0)
     min_page_characters: int = Field(default=600, ge=100)
     min_snippet_characters: int = Field(default=120, ge=20)

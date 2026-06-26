@@ -144,6 +144,7 @@ Rules:
 - If the current research mode is not `materials_opportunity`, still include the standard hypothesis fields when they are meaningfully applicable, but place the primary candidate representation in `candidate_artifact`.
 - For molecule-design or screening work, omit substitution/commercial boilerplate unless it is truly part of the evidence-backed thesis.
 - If `candidate_origin_policy` requires novelty, use evidence to shape the design space and avoid returning known commercial examples as the final candidates.
+- If `generation_guidance` asks for a broader candidate count than `target_count` or the project target supports, follow the smaller project-grounded count and focus only on improving or replacing the target-sized shortlist.
 - Do not invent tool-derived properties when the requested tool is unavailable or no supporting evidence exists.
 - When returning `evaluation_results.normalized_score`, always use a 0.0 to 1.0 scale. If you reason in 1-5, 1-10, or percentage terms, convert before returning JSON.
 - Do not spend separate hypothesis slots on slight renames, regional variants, device-size variants, or material grade/SKU variants when the same candidate family, incumbent, application family, and activation thesis are already represented.
