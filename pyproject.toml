@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmscientist"
-version = "0.9.2"
+version = "0.9.3"
 description = "Agentic framework for scientific materials discovery — hypothesis generation, evidence retrieval, and knowledge graph enrichment."
 readme = "README.md"
 requires-python = ">=3.12"

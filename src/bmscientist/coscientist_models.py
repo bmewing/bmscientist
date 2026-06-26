@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -262,6 +263,199 @@ def coerce_text_value(value: Any) -> str:
         parts = [coerce_text_value(item) for item in value]
         return "; ".join(part for part in parts if part)
     return str(value).strip()
+
+
+def normalize_weight_mapping(value: Any) -> dict[str, float]:
+    if value is None:
+        return {}
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for key, raw_value in value.items():
+        candidate = raw_value
+        if isinstance(raw_value, BaseModel):
+            candidate = raw_value.model_dump()
+        if isinstance(candidate, dict):
+            candidate = first_present(candidate, "weight", "value", "score", "normalized_score")
+        if candidate is None:
+            continue
+        try:
+            normalized[str(key)] = float(candidate)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def coerce_optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value) or None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        numeric = int(value)
+        return numeric if numeric > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"\d+", text)
+    if not match:
+        return None
+    numeric = int(match.group(0))
+    return numeric if numeric > 0 else None
+
+
+def normalize_candidate_artifact_schema_payload(value: Any) -> dict[str, Any]:
+    payload = coerce_metric_payload(value)
+    if not payload:
+        return {}
+    normalized = dict(payload)
+    alias_map = {
+        "artifact_type": ("artifact", "type", "candidate_type", "artifact_schema_type"),
+        "primary_identifier_field": ("primary_field", "identifier_field", "primary_identifier", "key_field"),
+        "required_fields": ("required", "required_identifiers", "must_have_fields", "required_artifact_fields"),
+        "optional_fields": ("optional", "optional_identifiers", "nice_to_have_fields"),
+        "validation_rules": ("rules", "validation", "checks"),
+        "examples": ("example", "sample", "samples"),
+    }
+    for canonical, aliases in alias_map.items():
+        if normalized.get(canonical) is not None:
+            continue
+        alias_value = first_present(normalized, *aliases)
+        if alias_value is not None:
+            normalized[canonical] = alias_value
+    return normalized
+
+
+def normalize_evaluation_criterion_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, str):
+        text = value.strip()
+        return {"name": text} if text else {}
+    if not isinstance(value, dict):
+        return {}
+    payload = dict(value)
+    if ("name" not in payload or not str(payload.get("name") or "").strip()) and len(payload) == 1:
+        key, raw_value = next(iter(payload.items()))
+        nested = normalize_evaluation_criterion_payload(raw_value)
+        if nested:
+            nested["name"] = nested.get("name") or str(key).strip()
+            return nested
+        return {"name": str(key).strip()}
+    alias_map = {
+        "name": ("criterion_name", "criterion", "metric", "criterion_id", "id", "objective_name"),
+        "description": ("purpose", "criterion_description", "notes", "rationale", "explanation"),
+        "direction": ("objective", "goal_direction", "desired_direction", "optimize"),
+        "target_value": ("target", "target_metric", "target_threshold", "target_range"),
+        "weight": ("priority", "importance", "ranking_weight"),
+        "required_candidate_fields": ("required_fields", "candidate_fields", "required_artifact_fields", "required_inputs"),
+        "evidence_mode": ("evidence_source", "evidence_type", "validation_mode", "source_mode"),
+        "suggested_search_queries": ("search_queries", "queries", "suggested_queries"),
+        "suggested_tool_ids": ("tool_ids", "tools", "requested_tools", "skill_ids", "suggested_skills"),
+        "reflection_guidance": ("guidance", "review_guidance", "validation_guidance", "reflection_notes"),
+        "failure_modes": ("risks", "pitfalls", "watchouts", "caveats"),
+    }
+    for canonical, aliases in alias_map.items():
+        if payload.get(canonical) is not None:
+            continue
+        alias_value = first_present(payload, *aliases)
+        if alias_value is not None:
+            payload[canonical] = alias_value
+    return payload
+
+
+def normalize_tool_request_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, str):
+        text = value.strip()
+        return {"tool_id": text, "purpose": ""} if text else {}
+    if not isinstance(value, dict):
+        return {}
+    payload = dict(value)
+    if ("tool_id" not in payload or not str(payload.get("tool_id") or "").strip()) and len(payload) == 1:
+        key, raw_value = next(iter(payload.items()))
+        nested = normalize_tool_request_payload(raw_value)
+        if nested:
+            nested["tool_id"] = nested.get("tool_id") or str(key).strip()
+            return nested
+        return {"tool_id": str(key).strip(), "purpose": ""}
+    alias_map = {
+        "tool_id": ("tool", "skill_id", "requested_tool_id", "id", "name"),
+        "purpose": ("description", "rationale", "reason", "why_needed", "notes"),
+        "status": ("tool_status", "availability"),
+        "candidate_packages": ("packages", "package_names", "candidate_tools"),
+        "required_inputs": ("inputs", "required_fields", "parameters"),
+        "expected_outputs": ("outputs", "return_values", "predicted_outputs"),
+        "installation_notes": ("setup_notes", "install_notes"),
+        "execution_notes": ("usage_notes", "run_notes"),
+        "validation_examples": ("examples", "sample_outputs"),
+        "limitations": ("caveats", "constraints", "blockers"),
+    }
+    for canonical, aliases in alias_map.items():
+        if payload.get(canonical) is not None:
+            continue
+        alias_value = first_present(payload, *aliases)
+        if alias_value is not None:
+            payload[canonical] = alias_value
+    if payload.get("tool_id") is None and payload.get("purpose") is not None:
+        payload["tool_id"] = coerce_text_value(payload.get("purpose"))
+    if payload.get("purpose") is None:
+        payload["purpose"] = ""
+    return payload
+
+
+def normalize_research_plan_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    payload = coerce_metric_payload(value)
+    if not payload:
+        return {}
+    wrapper = first_present(payload, "research_plan", "plan", "goal_plan", "updated_plan")
+    if isinstance(wrapper, dict):
+        merged = dict(wrapper)
+        for key, raw_value in payload.items():
+            if key not in {"research_plan", "plan", "goal_plan", "updated_plan"} and key not in merged:
+                merged[key] = raw_value
+        payload = merged
+    alias_map = {
+        "raw_goal": ("goal", "revised_goal", "updated_goal"),
+        "research_mode": ("mode", "opportunity_type"),
+        "regions": ("region_scope", "geographies"),
+        "strategic_fit_criteria": ("success_criteria", "strategic_criteria", "fit_criteria"),
+        "target_incumbent_materials": ("incumbent_materials", "materials_to_replace"),
+        "preferred_candidate_materials": ("candidate_materials", "preferred_materials"),
+        "candidate_material_preferences": ("candidate_preferences", "material_preferences"),
+        "candidate_origin_policy": ("origin_policy",),
+        "novelty_requirements": ("novelty_constraints", "novelty_goals"),
+        "known_candidate_exclusion_terms": ("exclude_terms", "exclusions"),
+        "novelty_check_policy": ("novelty_policy",),
+        "recycling_or_sustainability_angles": ("sustainability_angles", "sustainability_goals"),
+        "material_scope": ("materials_scope", "molecule_scope"),
+        "application_scope": ("applications", "applications_scope", "target_applications"),
+        "opportunity_modes": ("modes", "strategy_modes"),
+        "opportunity_speed_horizon_months": ("speed_horizon_months", "horizon_months", "commercialization_horizon_months"),
+        "commercialization_constraints": ("constraints", "commercial_constraints"),
+        "ranking_weights": ("weights", "criterion_weights", "scoring_weights"),
+        "success_definition": ("definition_of_success", "success_summary"),
+        "candidate_artifact_schema": ("artifact_schema", "candidate_schema", "output_schema"),
+        "evaluation_criteria": ("criteria", "evaluation_metrics", "scoring_criteria"),
+        "reflection_guidance": ("review_guidance", "validation_guidance", "guidance"),
+        "tool_requests": ("requested_tools", "tools", "skill_requests", "skills"),
+        "search_strategy_notes": ("search_notes", "retrieval_notes", "query_strategy"),
+        "strategic_fit_notes": ("strategic_notes", "user_notes"),
+    }
+    for canonical, aliases in alias_map.items():
+        if payload.get(canonical) is not None:
+            continue
+        alias_value = first_present(payload, *aliases)
+        if alias_value is not None:
+            payload[canonical] = alias_value
+    return payload
 
 
 def normalize_confidence_value(value: Any) -> float:
@@ -557,6 +751,11 @@ class CandidateArtifactSchema(BaseModel):
     validation_rules: list[str] = Field(default_factory=list)
     examples: list[dict[str, Any]] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return normalize_candidate_artifact_schema_payload(value)
+
     @field_validator("required_fields", "optional_fields", "validation_rules", mode="before")
     @classmethod
     def default_list_fields(cls, value: Any) -> list[str]:
@@ -580,6 +779,11 @@ class EvaluationCriterion(BaseModel):
     suggested_tool_ids: list[str] = Field(default_factory=list)
     reflection_guidance: list[str] = Field(default_factory=list)
     failure_modes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return normalize_evaluation_criterion_payload(value)
 
     @field_validator(
         "required_candidate_fields",
@@ -615,6 +819,11 @@ class ToolRequest(BaseModel):
     tool_id: str
     purpose: str
     status: ToolRequestStatus = "requested"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return normalize_tool_request_payload(value)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -844,6 +1053,11 @@ class ResearchPlanDraft(BaseModel):
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     search_strategy_notes: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return normalize_research_plan_payload(value)
+
     @field_validator(
         "strategic_fit_criteria",
         "target_incumbent_materials",
@@ -877,9 +1091,12 @@ class ResearchPlanDraft(BaseModel):
     @field_validator("ranking_weights", mode="before")
     @classmethod
     def default_weights(cls, value: Any) -> dict[str, float]:
-        if value is None:
-            return {}
-        return {str(key): float(raw_value) for key, raw_value in value.items()}
+        return normalize_weight_mapping(value)
+
+    @field_validator("opportunity_speed_horizon_months", mode="before")
+    @classmethod
+    def normalize_horizon_months(cls, value: Any) -> int | None:
+        return coerce_optional_positive_int(value)
 
     @field_validator("candidate_artifact_schema", mode="before")
     @classmethod
@@ -893,7 +1110,7 @@ class ResearchPlanDraft(BaseModel):
 
 
 class UpdatedResearchPlan(BaseModel):
-    raw_goal: str
+    raw_goal: str = ""
     research_mode: ResearchMode = "materials_opportunity"
     regions: list[str] = Field(default_factory=list)
     strategic_fit_criteria: list[str] = Field(default_factory=list)
@@ -918,6 +1135,11 @@ class UpdatedResearchPlan(BaseModel):
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     search_strategy_notes: list[str] = Field(default_factory=list)
     strategic_fit_notes: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        return normalize_research_plan_payload(value)
 
     @field_validator(
         "regions",
@@ -953,9 +1175,12 @@ class UpdatedResearchPlan(BaseModel):
     @field_validator("ranking_weights", mode="before")
     @classmethod
     def default_weights(cls, value: Any) -> dict[str, float]:
-        if value is None:
-            return {}
-        return {str(key): float(raw_value) for key, raw_value in value.items()}
+        return normalize_weight_mapping(value)
+
+    @field_validator("opportunity_speed_horizon_months", mode="before")
+    @classmethod
+    def normalize_horizon_months(cls, value: Any) -> int | None:
+        return coerce_optional_positive_int(value)
 
     @field_validator("candidate_artifact_schema", mode="before")
     @classmethod

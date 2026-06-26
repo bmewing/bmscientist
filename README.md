@@ -18,7 +18,7 @@ Use the local virtual environment for all Python commands on this project:
 
 Create a `.env` from `.env.example` and add your API keys.
 
-## What Is New In 0.9.2
+## What Is New In 0.9.3
 
 The project now has a typed chemistry skill layer that can be used by planning, generation, reflection, and graph enrichment.
 

@@ -217,6 +217,98 @@ class NovelPlanningLLM:
         )
 
 
+class MessyPlanningLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        return response_model.model_validate(
+            {
+                "plan": {
+                    "mode": "candidate_design",
+                    "success_criteria": ["low aquatic toxicity", "waterborne compatibility"],
+                    "materials_to_replace": ["traditional coalescing aids"],
+                    "candidate_preferences": ["small molecules with plausible commercial use"],
+                    "sustainability_goals": ["lower hazard profile"],
+                    "materials_scope": ["waterborne coating additives"],
+                    "target_applications": ["latex coatings"],
+                    "strategy_modes": ["candidate_screening"],
+                    "commercialization_horizon_months": "12 months",
+                    "weights": {
+                        "strategic_fit": {"weight": 0.5},
+                        "toxicity": "0.5",
+                    },
+                    "definition_of_success": "Find candidate coalescing aids worth deeper screening.",
+                    "artifact_schema": {
+                        "type": "small_molecule",
+                        "primary_identifier": "smiles",
+                        "required": ["name_or_label", "smiles", "intended_binder_system"],
+                        "optional": ["boiling_point_c"],
+                        "rules": ["SMILES should be syntactically valid where possible"],
+                    },
+                    "criteria": [
+                        {
+                            "criterion": "aquatic_toxicity_risk",
+                            "criterion_description": "Avoid candidates with high aquatic toxicity concern.",
+                            "objective": "avoid",
+                            "candidate_fields": "smiles",
+                            "evidence_source": "qsar",
+                            "tool_ids": "opera_qsar",
+                            "queries": "candidate aquatic toxicity prediction",
+                            "guidance": "Look for toxicity signals or missing data.",
+                        },
+                        {
+                            "film_formation_proxy": {
+                                "description": "Estimate whether the candidate can support film formation.",
+                                "optimize": "maximize",
+                                "search_queries": ["coalescent boiling point latex"],
+                                "tools": ["rdkit_profile"],
+                            }
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "tool": "opera_qsar",
+                            "description": "Estimate aquatic toxicity and related properties from SMILES.",
+                            "package_names": "OPERA command-line application",
+                            "inputs": "smiles",
+                            "outputs": "toxicity_endpoints",
+                        }
+                    ],
+                    "search_notes": "Combine molecule identity terms with toxicity/property terms.",
+                }
+            }
+        )
+
+
+class MessyUpdatedPlanningLLM:
+    def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
+        return response_model.model_validate(
+            {
+                "updated_plan": {
+                    "goal": "Refocus on European waterborne coatings with lower aquatic toxicity risk.",
+                    "mode": "candidate_design",
+                    "region_scope": ["Europe"],
+                    "criteria": [
+                        {
+                            "criterion": "aquatic_toxicity_risk",
+                            "objective": "avoid",
+                            "evidence_source": "computational_prediction",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "tool": "epa_episuite",
+                            "description": "Estimate fate and ecotoxicity endpoints from SMILES.",
+                            "availability": "available",
+                        }
+                    ],
+                    "artifact_schema": {
+                        "type": "small_molecule",
+                        "primary_identifier": "smiles",
+                    },
+                }
+            }
+        )
+
+
 class GenerationLLM:
     def complete_json(self, response_model, system_prompt, user_prompt, temperature=0.1):
         return response_model.model_validate(
@@ -1101,6 +1193,53 @@ def test_research_planning_detects_de_novo_smiles_intent():
     assert document.candidate_origin_policy == "de_novo_design"
     assert document.novelty_check_policy == "identifier_lookup"
     assert "smiles" in document.candidate_artifact_schema.required_fields
+
+
+def test_research_planning_normalizes_wrapped_alias_heavy_payloads():
+    agent = ResearchPlanningAgent(MessyPlanningLLM())
+
+    document = agent.create_research_goal(
+        research_id="screen-3",
+        raw_goal="Find a waterborne coalescing aid with lower aquatic toxicity risk.",
+        target_hypotheses_final=3,
+        regions=["North America"],
+        strategic_fit_notes=None,
+        preferred_evidence_recency_days=180,
+        reflection_search_limits=ReflectionSearchLimits(),
+    )
+
+    assert document.research_mode == "candidate_design"
+    assert document.opportunity_speed_horizon_months == 12
+    assert document.ranking_weights == {"strategic_fit": 0.5, "toxicity": 0.5}
+    assert document.candidate_artifact_schema.primary_identifier_field == "smiles"
+    assert document.candidate_artifact_schema.required_fields == [
+        "name_or_label",
+        "smiles",
+        "intended_binder_system",
+    ]
+    assert document.evaluation_criteria[0].name == "aquatic_toxicity_risk"
+    assert document.evaluation_criteria[0].evidence_mode == "external_tool"
+    assert document.evaluation_criteria[0].suggested_tool_ids == ["opera_qsar"]
+    assert document.evaluation_criteria[1].name == "film_formation_proxy"
+    assert document.evaluation_criteria[1].direction == "maximize"
+    assert document.tool_requests[0].tool_id == "opera_qsar"
+    assert document.tool_requests[0].candidate_packages == ["OPERA command-line application"]
+    assert document.search_strategy_notes == ["Combine molecule identity terms with toxicity/property terms."]
+
+
+def test_research_plan_update_normalizes_wrapped_alias_heavy_payloads():
+    agent = ResearchPlanningAgent(MessyUpdatedPlanningLLM())
+    base = make_generic_document()
+
+    updated = agent.update_research_goal(base, "Shift focus to Europe.")
+
+    assert updated.raw_goal == "Refocus on European waterborne coatings with lower aquatic toxicity risk."
+    assert updated.regions == ["Europe"]
+    assert updated.candidate_artifact_schema.primary_identifier_field == "smiles"
+    assert updated.evaluation_criteria[0].name == "aquatic_toxicity_risk"
+    assert updated.evaluation_criteria[0].evidence_mode == "external_tool"
+    assert updated.tool_requests[0].tool_id == "epa_episuite"
+    assert updated.tool_requests[0].status == "available"
 
 
 def test_hypothesis_seed_accepts_candidate_artifact():
