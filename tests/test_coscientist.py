@@ -2482,7 +2482,32 @@ def test_meta_review_prompt_includes_previous_gaps_and_persistence_state():
 
     assert "Previous whitespace gaps" in llm.user_prompt
     assert "Current unresolved-gap persistence count" in llm.user_prompt
+    assert "Portfolio target status" in llm.user_prompt
+    assert "Target final hypotheses: 3" in llm.user_prompt
+    assert "Current top target-sized shortlist" in llm.user_prompt
     assert "Expand into adjacent clear rigid consumer applications." in llm.user_prompt
+
+
+def test_meta_review_adds_project_size_guardrail_to_generation_guidance():
+    document = make_document()
+    ranking_round = RankingAgent(RankingLLM()).rank(document, [make_reflected_hypothesis()], 1, 3, 1)[0]
+
+    updated_document, meta_round = MetaReviewAgent(MetaReviewLLM()).review(
+        document=document,
+        hypotheses=[make_reflected_hypothesis()],
+        ranking_round=ranking_round,
+        round_index=1,
+        gap_overlap_threshold=0.6,
+        max_gap_persistence_rounds=1,
+    )
+
+    assert updated_document.meta_review_generation_guidance[0].startswith("Project-size guardrail:")
+    assert "target of 3 final candidate(s)" in updated_document.meta_review_generation_guidance[0]
+    assert meta_round.generation_guidance == updated_document.meta_review_generation_guidance
+    assert any(
+        "clear rigid applications outside medical trays" in item
+        for item in updated_document.meta_review_generation_guidance
+    )
 
 
 def test_final_portfolio_agent_writes_conclusive_report_with_validation_gaps():
