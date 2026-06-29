@@ -19,6 +19,7 @@ from bmscientist.coscientist_models import (
     RankingRound,
     ResearchGoalDocument,
 )
+from bmscientist.ingestion import decrypt_payload, encrypt_payload, validate_aes256_key
 
 
 LOGGER = logging.getLogger(__name__)
@@ -134,8 +135,11 @@ class CoScientistStore:
         "weaver",
     )
 
-    def __init__(self, root: Path = Path("data/coscientist")):
+    def __init__(self, root: Path = Path("data/coscientist"), encryption_key: bytes | None = None):
         self.root = root
+        self.encryption_key = encryption_key
+        if self.encryption_key is not None:
+            validate_aes256_key(self.encryption_key)
         self.ensure_directories()
 
     def ensure_directories(self) -> None:
@@ -201,12 +205,12 @@ class CoScientistStore:
     def save_research_goal(self, document: ResearchGoalDocument) -> Path:
         self.ensure_run_directories(document.research_id)
         path = self.research_goal_path(document.research_id)
-        path.write_text(document.compact_json(indent=2), encoding="utf-8")
+        self._write_text(path, document.compact_json(indent=2))
         return path
 
     def load_research_goal(self, research_id: str) -> ResearchGoalDocument:
         path = self.research_goal_path(research_id)
-        return ResearchGoalDocument.model_validate_json(path.read_text(encoding="utf-8"))
+        return ResearchGoalDocument.model_validate_json(self._read_text(path))
 
     def append_hypothesis_snapshot(self, hypothesis: Hypothesis) -> Path:
         return self.save_hypothesis(hypothesis)
@@ -215,7 +219,7 @@ class CoScientistStore:
         self.ensure_run_directories(hypothesis.research_id)
         path = self.hypothesis_file_path(hypothesis)
         tmp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-        tmp_path.write_text(hypothesis.compact_json(indent=2), encoding="utf-8")
+        self._write_text(tmp_path, hypothesis.compact_json(indent=2))
         self._remove_hypothesis_from_other_stages(hypothesis, keep_stage=path.parent.name)
         tmp_path.replace(path)
 
@@ -270,7 +274,7 @@ class CoScientistStore:
                     continue
                 try:
                     claimed_path.touch()
-                    hypothesis = Hypothesis.model_validate_json(claimed_path.read_text(encoding="utf-8"))
+                    hypothesis = Hypothesis.model_validate_json(self._read_text(claimed_path))
                 except (OSError, PermissionError):
                     LOGGER.exception("Failed to read claimed hypothesis %s; releasing claim", claimed_path)
                     try:
@@ -377,7 +381,7 @@ class CoScientistStore:
         reflecting_dir = self.hypotheses_dir(research_id) / "reflecting"
 
         for path in sorted(reflecting_dir.glob("*.json")):
-            hypothesis = Hypothesis.model_validate_json(path.read_text(encoding="utf-8"))
+            hypothesis = Hypothesis.model_validate_json(self._read_text(path))
             lease_expiry = hypothesis.reflection_lease_expires_at
             if lease_expiry is not None and lease_expiry > now:
                 continue
@@ -406,7 +410,7 @@ class CoScientistStore:
             saw_missing = False
             for path in paths:
                 try:
-                    snapshots.append(Hypothesis.model_validate_json(path.read_text(encoding="utf-8")))
+                    snapshots.append(Hypothesis.model_validate_json(self._read_text(path)))
                 except FileNotFoundError as exc:
                     last_missing = exc
                     saw_missing = True
@@ -422,7 +426,7 @@ class CoScientistStore:
         snapshots: list[Hypothesis] = []
         for path in self._hypothesis_files(research_id):
             try:
-                snapshots.append(Hypothesis.model_validate_json(path.read_text(encoding="utf-8")))
+                snapshots.append(Hypothesis.model_validate_json(self._read_text(path)))
             except FileNotFoundError:
                 continue
         return snapshots
@@ -458,19 +462,19 @@ class CoScientistStore:
     def write_report(self, research_id: str, content: str) -> Path:
         self.ensure_run_directories(research_id)
         path = self.report_path(research_id)
-        path.write_text(content, encoding="utf-8")
+        self._write_text(path, content)
         return path
 
     def write_loop_report(self, research_id: str, content: str) -> Path:
         self.ensure_run_directories(research_id)
         path = self.loop_report_path(research_id)
-        path.write_text(content, encoding="utf-8")
+        self._write_text(path, content)
         return path
 
     def write_tool_report(self, research_id: str, content: str) -> Path:
         self.ensure_run_directories(research_id)
         path = self.tool_report_path(research_id)
-        path.write_text(content, encoding="utf-8")
+        self._write_text(path, content)
         return path
 
     def write_cost_report(self, research_id: str, payload: dict[str, object]) -> Path:
@@ -488,9 +492,7 @@ class CoScientistStore:
     def append_ranking_round(self, ranking_round: RankingRound) -> Path:
         self.ensure_run_directories(ranking_round.research_id)
         path = self.ranking_path(ranking_round.research_id)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(ranking_round.model_dump_json())
-            handle.write("\n")
+        self._append_jsonl_line(path, ranking_round.model_dump_json())
         return path
 
     def load_ranking_rounds(self, research_id: str) -> list[RankingRound]:
@@ -498,7 +500,7 @@ class CoScientistStore:
         path = self.ranking_path(research_id)
         if not path.exists():
             return rounds
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in self._read_text(path).splitlines():
             if line.strip():
                 rounds.append(RankingRound.model_validate_json(line))
         return rounds
@@ -506,9 +508,7 @@ class CoScientistStore:
     def append_proximity_round(self, proximity_round: ProximityRound) -> Path:
         self.ensure_run_directories(proximity_round.research_id)
         path = self.proximity_path(proximity_round.research_id)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(proximity_round.model_dump_json())
-            handle.write("\n")
+        self._append_jsonl_line(path, proximity_round.model_dump_json())
         return path
 
     def load_proximity_rounds(self, research_id: str) -> list[ProximityRound]:
@@ -516,7 +516,7 @@ class CoScientistStore:
         path = self.proximity_path(research_id)
         if not path.exists():
             return rounds
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in self._read_text(path).splitlines():
             if line.strip():
                 rounds.append(ProximityRound.model_validate_json(line))
         return rounds
@@ -524,9 +524,7 @@ class CoScientistStore:
     def append_meta_review_round(self, meta_review_round: MetaReviewRound) -> Path:
         self.ensure_run_directories(meta_review_round.research_id)
         path = self.meta_review_path(meta_review_round.research_id)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(meta_review_round.model_dump_json())
-            handle.write("\n")
+        self._append_jsonl_line(path, meta_review_round.model_dump_json())
         return path
 
     def load_meta_review_rounds(self, research_id: str) -> list[MetaReviewRound]:
@@ -534,7 +532,7 @@ class CoScientistStore:
         path = self.meta_review_path(research_id)
         if not path.exists():
             return rounds
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in self._read_text(path).splitlines():
             if line.strip():
                 rounds.append(MetaReviewRound.model_validate_json(line))
         return rounds
@@ -542,6 +540,26 @@ class CoScientistStore:
     @staticmethod
     def to_pretty_json(data: dict) -> str:
         return json.dumps(data, indent=2)
+
+    def _read_text(self, path: Path) -> str:
+        if self.encryption_key is None:
+            return path.read_text(encoding="utf-8")
+        return decrypt_payload(path.read_bytes(), self.encryption_key).decode("utf-8")
+
+    def _write_text(self, path: Path, content: str) -> None:
+        if self.encryption_key is None:
+            path.write_text(content, encoding="utf-8")
+            return
+        path.write_bytes(encrypt_payload(content.encode("utf-8"), self.encryption_key))
+
+    def _append_jsonl_line(self, path: Path, line: str) -> None:
+        if self.encryption_key is None:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.write("\n")
+            return
+        existing = self._read_text(path) if path.exists() else ""
+        self._write_text(path, f"{existing}{line}\n")
 
     def _random_project_name(self) -> str:
         rng = secrets.SystemRandom()

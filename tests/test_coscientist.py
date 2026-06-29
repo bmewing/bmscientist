@@ -33,8 +33,11 @@ from bmscientist.coscientist_models import (
     Hypothesis,
     HypothesisEvolutionOutput,
     HypothesisGenerationOutput,
+    MetaReviewRound,
     MetaReviewOutput,
     PriceMetric,
+    ProximityConcept,
+    ProximityRound,
     ProximityMergePolicy,
     ProximityReviewOutput,
     RankedHypothesis,
@@ -47,6 +50,7 @@ from bmscientist.coscientist_models import (
 )
 from bmscientist.coscientist_store import CoScientistStore
 from bmscientist.graph_market import GraphMarketEvidence
+from bmscientist.ingestion import ENCRYPTED_PAYLOAD_MAGIC
 from bmscientist.models import EvidenceClassification, PageContent
 from bmscientist.skills import SkillRegistry, SkillRunResult, SkillRunner, SkillSpec
 
@@ -76,6 +80,7 @@ class FakeEPISuiteSkill:
             skill_id="epa_episuite",
             description="Fake EPISuite skill for tests.",
             phases=("reflection",),
+            aliases=("ecosar", "biowin", "joback", "opera_qsar", "test"),
             supported_research_modes=("candidate_design",),
             required_candidate_fields=("smiles",),
             expected_outputs=("log_kow", "fish_lc50_mg_l"),
@@ -1402,12 +1407,12 @@ def test_reflection_agent_merges_episuite_results_for_smiles_candidates():
                 {
                     "name": "aquatic_toxicity_risk",
                     "description": "Prefer candidates with better ecotoxicology profiles.",
-                    "suggested_tool_ids": ["epa_episuite"],
+                    "suggested_tool_ids": ["ECOSAR"],
                 }
             ],
             "tool_requests": [
                 {
-                    "tool_id": "epa_episuite",
+                    "tool_id": "ECOSAR",
                     "purpose": "Predict molecular fate and ecotoxicity endpoints from SMILES.",
                     "status": "available",
                 }
@@ -1482,7 +1487,8 @@ def test_reflection_agent_merges_episuite_results_for_smiles_candidates():
         for result in (reflected.reflection_assessment.criterion_results if reflected.reflection_assessment else [])
     }
     assert episuite_skill.calls == ["CCOC(=O)OCC"]
-    assert results_by_name["aquatic_toxicity_risk"].tool_id is None
+    assert results_by_name["aquatic_toxicity_risk"].tool_id == "epa_episuite"
+    assert results_by_name["aquatic_toxicity_risk"].value == 48.5
     assert results_by_name["log_kow"].tool_id == "epa_episuite"
     assert results_by_name["fish_lc50_mg_l"].unit == "mg/L"
 
@@ -1770,7 +1776,66 @@ def test_report_includes_tool_requests():
 
     assert "opera_qsar" in report
     assert "Dependent criteria: aquatic_toxicity_risk" in report
+    assert "## Requested In Research Contract" in report
+    assert "## Still Missing Or Still Unresolved" in report
     assert "Run opera_qsar before final selection." in report
+
+
+def test_report_shows_canonical_skill_family_and_executed_equivalent():
+    document = ResearchGoalDocument.model_validate(
+        {
+            "research_id": "screen-episuite",
+            "raw_goal": "Screen coalescing aids.",
+            "target_hypotheses_final": 1,
+            "target_hypotheses_generated": 1,
+            "research_mode": "candidate_design",
+            "candidate_artifact_schema": {
+                "artifact_type": "small_molecule",
+                "primary_identifier_field": "smiles",
+            },
+            "evaluation_criteria": [
+                {
+                    "name": "aquatic_toxicity_risk",
+                    "description": "Prefer candidates with low aquatic toxicity risk.",
+                    "suggested_tool_ids": ["ECOSAR"],
+                }
+            ],
+            "tool_requests": [
+                {
+                    "tool_id": "ECOSAR",
+                    "purpose": "Predict aquatic toxicity.",
+                    "status": "available",
+                }
+            ],
+        }
+    )
+    hypothesis = make_hypothesis().model_copy(
+        update={
+            "reflection_assessment": ReflectionAssessment.model_validate(
+                {
+                    "criterion_results": [
+                        {
+                            "criterion_name": "aquatic_toxicity_risk",
+                            "value": 120.0,
+                            "unit": "mg/L",
+                            "normalized_score": 0.75,
+                            "confidence": 0.8,
+                            "rationale": "Mapped from EPISuite LC50 output.",
+                            "tool_id": "epa_episuite",
+                            "evidence_mode": "external_tool",
+                            "is_inferred": True,
+                        }
+                    ]
+                }
+            )
+        }
+    )
+
+    report = CoScientistRunner._build_tool_request_report(document, [hypothesis])
+
+    assert "Canonical skill family: epa_episuite" in report
+    assert "Executed equivalent family: yes" in report
+    assert "## Executed Skills / Skill Families" in report
 
 
 def test_evaluation_criterion_normalizes_evidence_mode_aliases():
@@ -2855,6 +2920,102 @@ def test_coscientist_store_saves_compact_candidate_design_hypothesis_json(tmp_pa
     assert "incumbent_material" not in payload
     assert "application_requirements" not in payload
     assert "unknowns" not in payload
+
+
+def test_coscientist_store_encrypts_sensitive_artifacts_when_key_present(tmp_path):
+    key = b"0123456789abcdef0123456789abcdef"
+    store = CoScientistStore(tmp_path / "coscientist", encryption_key=key)
+    document = make_document()
+    hypothesis = make_hypothesis()
+    ranking_round = RankingRound(
+        ranking_round_id="rank-1",
+        research_id=document.research_id,
+        round_index=1,
+        candidate_count=1,
+        target_final_count=1,
+        ranked_hypothesis_ids=[hypothesis.hypothesis_id],
+        promoted_hypothesis_ids=[hypothesis.hypothesis_id],
+        rankings=[
+            RankedHypothesis(
+                hypothesis_id=hypothesis.hypothesis_id,
+                rank=1,
+                score=0.81,
+                recommended_action="advance",
+            )
+        ],
+        best_patterns=["Good strategic fit."],
+    )
+    proximity_round = ProximityRound(
+        proximity_round_id="prox-1",
+        research_id=document.research_id,
+        round_index=1,
+        concepts=[ProximityConcept(concept_label="medical trays", member_hypothesis_ids=[hypothesis.hypothesis_id])],
+        labeled_hypothesis_ids=[hypothesis.hypothesis_id],
+        notes=["Grouped related tray ideas."],
+    )
+    meta_review_round = MetaReviewRound(
+        meta_review_round_id="meta-1",
+        research_id=document.research_id,
+        round_index=1,
+        whitespace_gaps=["Need broader regional coverage."],
+        generation_guidance=["Explore adjacent sterile packaging."],
+        coverage_assessment="Coverage is still narrow.",
+    )
+
+    goal_path = store.save_research_goal(document)
+    hypothesis_path = store.save_hypothesis(hypothesis)
+    report_path = store.write_report(document.research_id, "Confidential reflection summary")
+    loop_report_path = store.write_loop_report(document.research_id, "Confidential loop summary")
+    tool_report_path = store.write_tool_report(document.research_id, "Confidential tool requests")
+    ranking_path = store.append_ranking_round(ranking_round)
+    proximity_path = store.append_proximity_round(proximity_round)
+    meta_review_path = store.append_meta_review_round(meta_review_round)
+    cost_path = store.write_cost_report(document.research_id, {"token_total": 123, "usd_total": 4.56})
+
+    for path, plaintext in [
+        (goal_path, document.raw_goal),
+        (hypothesis_path, hypothesis.title),
+        (report_path, "Confidential reflection summary"),
+        (loop_report_path, "Confidential loop summary"),
+        (tool_report_path, "Confidential tool requests"),
+        (ranking_path, "Good strategic fit."),
+        (proximity_path, "medical trays"),
+        (meta_review_path, "Coverage is still narrow."),
+    ]:
+        payload = path.read_bytes()
+        assert payload.startswith(ENCRYPTED_PAYLOAD_MAGIC)
+        assert plaintext.encode("utf-8") not in payload
+
+    assert store.load_research_goal(document.research_id).raw_goal == document.raw_goal
+    assert store.load_hypotheses(document.research_id)[0].title == hypothesis.title
+    assert store.load_ranking_rounds(document.research_id)[0].ranking_round_id == "rank-1"
+    assert store.load_proximity_rounds(document.research_id)[0].proximity_round_id == "prox-1"
+    assert store.load_meta_review_rounds(document.research_id)[0].meta_review_round_id == "meta-1"
+
+    assert cost_path.read_text(encoding="utf-8").startswith("{")
+    assert store.load_cost_report(document.research_id) == {"token_total": 123, "usd_total": 4.56}
+
+
+def test_coscientist_store_claims_encrypted_generated_hypothesis(tmp_path):
+    key = b"0123456789abcdef0123456789abcdef"
+    store = CoScientistStore(tmp_path / "coscientist", encryption_key=key)
+    hypothesis = make_hypothesis()
+    store.append_hypothesis_snapshot(hypothesis)
+
+    claimed = store.claim_next_generated_hypothesis(hypothesis.research_id, worker_id="worker-a", lease_seconds=120)
+
+    assert claimed is not None
+    assert claimed.status == "reflecting"
+    reflecting_path = (
+        tmp_path / "coscientist" / hypothesis.research_id / "hypotheses" / "reflecting" / f"{hypothesis.hypothesis_id}.json"
+    )
+    assert reflecting_path.read_bytes().startswith(ENCRYPTED_PAYLOAD_MAGIC)
+
+    store.release_reflection_claim(claimed, "temporary failure")
+    latest = {item.hypothesis_id: item for item in store.latest_hypotheses(hypothesis.research_id)}
+
+    assert latest[hypothesis.hypothesis_id].status == "generated"
+    assert latest[hypothesis.hypothesis_id].reflection_error == "temporary failure"
 
 
 def test_local_evidence_retriever_candidate_design_queries_omit_price_boilerplate():

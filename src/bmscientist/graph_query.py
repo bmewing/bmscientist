@@ -3,11 +3,13 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
+from bmscientist.ingestion import ENCRYPTED_PARQUET_SUFFIX, read_encrypted_table
 from bmscientist.llm import DeepSeekLLM
 from bmscientist.models import GraphEntityMatch, GraphEntityMatchBuckets, GraphQueryPlan, GraphQueryResult, GraphTableSchema
 from bmscientist.material_alias import normalize_alias_text
@@ -17,27 +19,31 @@ from bmscientist.prompt_library import PROMPTS
 DEFAULT_GRAPH_PATH = Path("data/graph")
 
 
+@dataclass(frozen=True)
+class GraphTableSource:
+    table_name: str
+    parquet_path: Path
+    scope: str
+    encrypted: bool = False
+
+
 class DuckDBGraphQueryEngine:
-    def __init__(self, graph_path: Path | None = None):
-        self._graph_path = graph_path if graph_path is not None else DEFAULT_GRAPH_PATH
+    def __init__(
+        self,
+        graph_path: Path | None = None,
+        *,
+        public_graph_path: Path | None = None,
+        private_graph_path: Path | None = None,
+        decryption_key: bytes | None = None,
+    ):
+        self._graph_path = public_graph_path if public_graph_path is not None else graph_path if graph_path is not None else DEFAULT_GRAPH_PATH
+        self._private_graph_path = private_graph_path
+        self._decryption_key = decryption_key
+        if self._private_graph_path is not None and self._decryption_key is None:
+            raise ValueError("A private graph path requires a session decryption key.")
 
     def list_tables(self) -> list[GraphTableSchema]:
-        tables: list[GraphTableSchema] = []
-        for category in ("nodes", "edges", "enrichment"):
-            base = self._graph_path / category
-            if not base.exists():
-                continue
-            for path in sorted(base.glob("*.parquet")):
-                table_name = path.stem
-                columns = self._columns_for_path(path)
-                tables.append(
-                    GraphTableSchema(
-                        table_name=table_name,
-                        parquet_path=str(path.resolve()),
-                        columns=columns,
-                    )
-                )
-        return tables
+        return self._effective_table_schemas()
 
     def schema_summary(self) -> str:
         sections = []
@@ -63,12 +69,13 @@ class DuckDBGraphQueryEngine:
         ]
         matches_by_label: dict[str, list[GraphEntityMatch]] = {}
         for label, key in labels:
-            path = self._graph_path / "nodes" / f"{label}.parquet"
-            if not path.exists():
+            sources = self._sources_for_table(label, category="nodes")
+            if not sources:
                 continue
             con = duckdb.connect(database=":memory:")
             try:
-                rows = con.execute(f"SELECT * FROM read_parquet({quote_literal(str(path.resolve()))})").fetchall()
+                self._register_table_view(con, label, sources)
+                rows = con.execute(f"SELECT * FROM {quote_ident(label)}").fetchall()
                 columns = [item[0] for item in con.description or []]
             finally:
                 con.close()
@@ -123,10 +130,7 @@ class DuckDBGraphQueryEngine:
         normalized_sql = self._validate_sql(sql)
         con = duckdb.connect(database=":memory:")
         try:
-            for table in self.list_tables():
-                con.execute(
-                    f"CREATE VIEW {quote_ident(table.table_name)} AS SELECT * FROM read_parquet({quote_literal(table.parquet_path)})",
-                )
+            self._register_all_table_views(con)
             wrapped_sql = f"SELECT * FROM ({normalized_sql}) AS graph_query_result LIMIT {int(limit) + 1}"
             rel = con.execute(wrapped_sql)
             rows = rel.fetchall()
@@ -143,6 +147,118 @@ class DuckDBGraphQueryEngine:
             )
         finally:
             con.close()
+
+    def _table_sources(self) -> list[GraphTableSource]:
+        sources: list[GraphTableSource] = []
+        for category in ("nodes", "edges", "enrichment"):
+            base = self._graph_path / category
+            if not base.exists():
+                continue
+            for path in sorted(base.glob("*.parquet")):
+                sources.append(GraphTableSource(path.stem, path, "public", encrypted=False))
+        if self._private_graph_path is not None:
+            for category in ("nodes", "edges", "enrichment", "chunks"):
+                base = self._private_graph_path / category
+                if not base.exists():
+                    continue
+                for path in sorted(base.glob(f"*{ENCRYPTED_PARQUET_SUFFIX}")):
+                    table_name = path.name[: -len(ENCRYPTED_PARQUET_SUFFIX)]
+                    sources.append(GraphTableSource(table_name, path, "private", encrypted=True))
+        return sources
+
+    def _sources_by_table(self) -> dict[str, list[GraphTableSource]]:
+        grouped: dict[str, list[GraphTableSource]] = {}
+        for source in self._table_sources():
+            grouped.setdefault(source.table_name, []).append(source)
+        return grouped
+
+    def _sources_for_table(self, table_name: str, *, category: str | None = None) -> list[GraphTableSource]:
+        sources = self._sources_by_table().get(table_name, [])
+        if category is None:
+            return sources
+        return [source for source in sources if source.parquet_path.parent.name == category]
+
+    def _effective_table_schemas(self) -> list[GraphTableSchema]:
+        tables: list[GraphTableSchema] = []
+        for table_name, sources in sorted(self._sources_by_table().items()):
+            if len(sources) == 1:
+                source = sources[0]
+                tables.append(
+                    GraphTableSchema(
+                        table_name=table_name,
+                        parquet_path=str(source.parquet_path.resolve()),
+                        columns=self._columns_for_source(source),
+                    )
+                )
+                continue
+            public_sources = [source for source in sources if source.scope == "public"]
+            private_sources = [source for source in sources if source.scope == "private"]
+            if public_sources and private_sources and self._same_columns(sources):
+                tables.append(
+                    GraphTableSchema(
+                        table_name=table_name,
+                        parquet_path=", ".join(str(source.parquet_path.resolve()) for source in sources),
+                        columns=["graph_scope", *self._columns_for_source(sources[0])],
+                    )
+                )
+            else:
+                for source in sources:
+                    exposed_name = table_name if source.scope == "public" else f"private_{table_name}"
+                    tables.append(
+                        GraphTableSchema(
+                            table_name=exposed_name,
+                            parquet_path=str(source.parquet_path.resolve()),
+                            columns=self._columns_for_source(source),
+                        )
+                    )
+        return tables
+
+    def _register_all_table_views(self, con: duckdb.DuckDBPyConnection) -> None:
+        for table_name, sources in self._sources_by_table().items():
+            self._register_table_view(con, table_name, sources)
+
+    def _register_table_view(self, con: duckdb.DuckDBPyConnection, table_name: str, sources: list[GraphTableSource]) -> None:
+        if not sources:
+            return
+        if len(sources) == 1:
+            relation_name = self._register_source_relation(con, sources[0])
+            con.execute(f"CREATE VIEW {quote_ident(table_name)} AS SELECT * FROM {quote_ident(relation_name)}")
+            return
+        if self._same_columns(sources):
+            relation_names = [self._register_source_relation(con, source) for source in sources]
+            selects = [
+                f"SELECT {quote_literal(source.scope)} AS graph_scope, * FROM {quote_ident(relation_name)}"
+                for source, relation_name in zip(sources, relation_names, strict=False)
+            ]
+            con.execute(f"CREATE VIEW {quote_ident(table_name)} AS {' UNION ALL '.join(selects)}")
+            return
+        for source in sources:
+            exposed_name = table_name if source.scope == "public" else f"private_{table_name}"
+            relation_name = self._register_source_relation(con, source)
+            con.execute(f"CREATE VIEW {quote_ident(exposed_name)} AS SELECT * FROM {quote_ident(relation_name)}")
+
+    def _register_source_relation(self, con: duckdb.DuckDBPyConnection, source: GraphTableSource) -> str:
+        relation_name = f"__{source.scope}_{source.table_name}"
+        if source.encrypted:
+            if self._decryption_key is None:
+                raise ValueError("Cannot query encrypted private graph tables without a decryption key.")
+            con.register(relation_name, read_encrypted_table(source.parquet_path, self._decryption_key))
+        else:
+            con.execute(
+                f"CREATE VIEW {quote_ident(relation_name)} AS SELECT * FROM read_parquet({quote_literal(str(source.parquet_path.resolve()))})",
+            )
+        return relation_name
+
+    def _same_columns(self, sources: list[GraphTableSource]) -> bool:
+        column_sets = [self._columns_for_source(source) for source in sources]
+        return bool(column_sets) and all(columns == column_sets[0] for columns in column_sets[1:])
+
+    def _columns_for_source(self, source: GraphTableSource) -> list[str]:
+        if source.encrypted:
+            if self._decryption_key is None:
+                raise ValueError("Cannot inspect encrypted private graph tables without a decryption key.")
+            return read_encrypted_table(source.parquet_path, self._decryption_key).column_names
+        return self._columns_for_path(source.parquet_path)
 
     def _columns_for_path(self, path: Path) -> list[str]:
         con = duckdb.connect(database=":memory:")

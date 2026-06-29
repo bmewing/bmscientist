@@ -406,7 +406,7 @@ def run_coscientist_feedback_command(
     from bmscientist.coscientist_store import CoScientistStore
     from bmscientist.graph_enrichment import GraphEnrichmentStore
 
-    store = CoScientistStore()
+    store = CoScientistStore(encryption_key=config.session_decryption_key)
 
     project_feedback = getattr(args, "project_feedback", None)
     if project_feedback:
@@ -514,7 +514,7 @@ def run_coscientist_meta_review_command(
     from bmscientist.coscientist_store import CoScientistStore
     from bmscientist.coscientist_agents import CoScientistRunner, DeepSeekLLM
     
-    store = CoScientistStore()
+    store = CoScientistStore(encryption_key=config.session_decryption_key)
     document = store.load_research_goal(args.research_id)
     if not document:
         console.print(f"[bold red]Research project {args.research_id} not found.[/bold red]")

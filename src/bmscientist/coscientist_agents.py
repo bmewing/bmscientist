@@ -55,6 +55,7 @@ from bmscientist.coscientist_models import (
 from bmscientist.coscientist_store import CoScientistStore
 from bmscientist.extract import PageFetcher, extract_domain
 from bmscientist.graph_market import GraphMarketEvidence
+from bmscientist.ingestion import EncryptedPrivateEvidenceStore, MergedEvidenceStore
 from bmscientist.llm import DeepSeekLLM
 from bmscientist.manual_ingest import ManualEvidenceIngestor
 from bmscientist.models import ChunkRecord, DiscoverySummary, PageContent, SearchResultItem
@@ -64,10 +65,13 @@ from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_sear
 from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options
 from bmscientist.skills import (
     EPISuiteSkill,
+    HansenSolubilityXGBoostSkill,
+    MolToxPredScreenSkill,
     MoleculeAvailabilitySkill,
     MoleculeIdentityPubChemSkill,
     MoleculeNeighborExpansionSkill,
     NoveltyPatentScreenSkill,
+    PolymerPropertyProfileSkill,
     PubChemProfileSkill,
     RDKitProfileSkill,
     RDKitSimilarityAndAlertsSkill,
@@ -87,6 +91,27 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger(__name__)
+
+TOOL_FAMILY_CANONICAL_IDS: dict[str, str] = {
+    "ecosar": "epa_episuite",
+    "test": "epa_episuite",
+    "t.e.s.t.": "epa_episuite",
+    "biowin": "epa_episuite",
+    "joback": "epa_episuite",
+    "opera_qsar": "epa_episuite",
+    "epa_episuite_api": "epa_episuite",
+    "episuite": "epa_episuite",
+    "patent_screen": "novelty_patent_screen",
+    "novelty_check": "novelty_patent_screen",
+    "prior_art_search": "novelty_patent_screen",
+}
+
+
+def canonical_tool_family_id(tool_id: str | None) -> str | None:
+    text = str(tool_id or "").strip()
+    if not text:
+        return None
+    return TOOL_FAMILY_CANONICAL_IDS.get(text.lower(), text)
 
 
 class ProgressReporter(Protocol):
@@ -2984,7 +3009,7 @@ class ReflectionAgent:
                 hypothesis,
                 price_document,
             )
-        assessment = self._merge_skill_criterion_results(assessment, skill_results)
+        assessment = self._merge_skill_criterion_results(document, assessment, skill_results)
         assessment = self._finalize_missing_assessment_fields(document, hypothesis, assessment, evidence_rows)
         assessment = assessment.model_copy(
             update={
@@ -3049,6 +3074,7 @@ class ReflectionAgent:
 
     @staticmethod
     def _merge_skill_criterion_results(
+        document: ResearchGoalDocument,
         assessment: ReflectionAssessment,
         skill_results: list[SkillRunResult],
     ) -> ReflectionAssessment:
@@ -3073,7 +3099,174 @@ class ReflectionAgent:
                     continue
                 if existing.tool_id == result.tool_id and existing.confidence < result.confidence:
                     merged[result.criterion_name] = result
+        executed_results = [
+            result
+            for skill_result in skill_results
+            if skill_result.status == "completed"
+            for result in skill_result.criterion_results
+            if result.criterion_name
+        ]
+        for criterion in document.evaluation_criteria:
+            mapped = ReflectionAgent._mapped_skill_result_for_criterion(criterion, executed_results)
+            if mapped is None:
+                continue
+            existing = merged.get(criterion.name)
+            if existing is None:
+                merged[criterion.name] = mapped
+                continue
+            if existing.tool_id is None and mapped.tool_id is not None:
+                merged[criterion.name] = mapped
+                continue
+            if existing.confidence < mapped.confidence:
+                merged[criterion.name] = mapped
         return assessment.model_copy(update={"criterion_results": list(merged.values())})
+
+    @staticmethod
+    def _mapped_skill_result_for_criterion(
+        criterion: EvaluationCriterion,
+        executed_results: list[CandidateEvaluationResult],
+    ) -> CandidateEvaluationResult | None:
+        if not executed_results:
+            return None
+        by_name = {
+            result.criterion_name: result
+            for result in executed_results
+            if result.criterion_name
+        }
+        direct = by_name.get(criterion.name)
+        if direct is not None:
+            return direct
+
+        criterion_text = " ".join(
+            [
+                criterion.name,
+                criterion.description,
+                criterion.target_value or "",
+                *criterion.suggested_tool_ids,
+            ]
+        ).lower()
+        suggested_families = {
+            canonical_tool_family_id(tool_id)
+            for tool_id in criterion.suggested_tool_ids
+            if canonical_tool_family_id(tool_id)
+        }
+
+        if (
+            "novel" in criterion_text
+            or "patent" in criterion_text
+            or "prior art" in criterion_text
+            or "novelty_patent_screen" in suggested_families
+        ):
+            novelty = by_name.get("novelty_patent_screen")
+            if novelty is not None:
+                return novelty.model_copy(update={"criterion_name": criterion.name, "is_inferred": True})
+
+        if ReflectionAgent._criterion_is_aquatic_toxicity(criterion_text, suggested_families):
+            toxicity = ReflectionAgent._aquatic_toxicity_result(criterion.name, executed_results)
+            if toxicity is not None:
+                return toxicity
+
+        if "biodegrad" in criterion_text or "ready biodegradation" in criterion_text:
+            biodeg = by_name.get("ready_biodegradation_probability")
+            if biodeg is not None:
+                value = float(biodeg.value) if isinstance(biodeg.value, (int, float)) else biodeg.normalized_score
+                return biodeg.model_copy(
+                    update={
+                        "criterion_name": criterion.name,
+                        "normalized_score": max(0.0, min(1.0, float(value or 0.0))),
+                        "confidence": min(0.88, max(biodeg.confidence, 0.76)),
+                        "rationale": (
+                            f"Mapped from executed `{biodeg.criterion_name}` endpoint produced by `{biodeg.tool_id}`."
+                        ),
+                        "is_inferred": True,
+                    }
+                )
+
+        if "boiling" in criterion_text or "volatil" in criterion_text or "vapor pressure" in criterion_text:
+            boiling = by_name.get("boiling_point_c")
+            if boiling is not None and isinstance(boiling.value, (int, float)):
+                boiling_c = float(boiling.value)
+                if boiling_c >= 250:
+                    normalized = 0.9
+                elif boiling_c >= 200:
+                    normalized = 0.75
+                elif boiling_c >= 150:
+                    normalized = 0.45
+                else:
+                    normalized = 0.2
+                return boiling.model_copy(
+                    update={
+                        "criterion_name": criterion.name,
+                        "normalized_score": normalized,
+                        "confidence": min(0.85, max(boiling.confidence, 0.74)),
+                        "rationale": (
+                            f"Mapped from executed boiling-point endpoint `{boiling.criterion_name}` "
+                            f"produced by `{boiling.tool_id}`."
+                        ),
+                        "is_inferred": True,
+                    }
+                )
+        return None
+
+    @staticmethod
+    def _criterion_is_aquatic_toxicity(criterion_text: str, suggested_families: set[str | None]) -> bool:
+        return (
+            "aquatic" in criterion_text
+            or "ecotox" in criterion_text
+            or "lc50" in criterion_text
+            or "ec50" in criterion_text
+            or "toxicit" in criterion_text
+            or "epa_episuite" in suggested_families
+        )
+
+    @staticmethod
+    def _aquatic_toxicity_result(
+        criterion_name: str,
+        executed_results: list[CandidateEvaluationResult],
+    ) -> CandidateEvaluationResult | None:
+        endpoint_names = ("fish_lc50_mg_l", "daphnia_ec50_mg_l", "algae_ec50_mg_l")
+        endpoints = [
+            result
+            for result in executed_results
+            if result.criterion_name in endpoint_names and isinstance(result.value, (int, float))
+        ]
+        if not endpoints:
+            return None
+        worst_case = min(endpoints, key=lambda item: float(item.value))
+        mg_l = float(worst_case.value)
+        if mg_l <= 1:
+            normalized = 0.05
+        elif mg_l <= 10:
+            normalized = 0.2
+        elif mg_l <= 100:
+            normalized = 0.45
+        elif mg_l <= 1000:
+            normalized = 0.75
+        else:
+            normalized = 0.9
+        endpoint_summary = ", ".join(
+            f"{item.criterion_name}={float(item.value):g} {item.unit or ''}".strip()
+            for item in endpoints
+        )
+        citation_urls = list(
+            OrderedDict.fromkeys(url for item in endpoints for url in item.citation_urls if url)
+        )
+        return CandidateEvaluationResult(
+            criterion_name=criterion_name,
+            value=mg_l,
+            unit=worst_case.unit or "mg/L",
+            normalized_score=normalized,
+            confidence=min(0.86, max(item.confidence for item in endpoints)),
+            rationale=(
+                "Mapped from executed aquatic-toxicity endpoints. "
+                f"Worst observed endpoint was `{worst_case.criterion_name}` at {mg_l:g} {worst_case.unit or 'mg/L'}. "
+                f"Available endpoints: {endpoint_summary}."
+            ),
+            evidence_mode="external_tool",
+            tool_id=worst_case.tool_id,
+            citation_urls=citation_urls,
+            is_inferred=True,
+        )
 
     def _augment_evidence_rows(
         self,
@@ -3849,6 +4042,9 @@ class CoScientistRunner:
                 MoleculeAvailabilitySkill(config),
                 NoveltyPatentScreenSkill(config),
                 MoleculeNeighborExpansionSkill(config),
+                MolToxPredScreenSkill(config),
+                PolymerPropertyProfileSkill(config),
+                HansenSolubilityXGBoostSkill(config),
                 EPISuiteSkill(config),
                 RXN4ChemistryRetrosynthesisSkill(config),
             ]
@@ -3857,7 +4053,12 @@ class CoScientistRunner:
         if evidence_store is None:
             from bmscientist.store import LanceEvidenceStore
 
-            self._evidence_store = LanceEvidenceStore(config.resolved_lancedb_path())
+            public_store = LanceEvidenceStore(config.resolved_lancedb_path())
+            if config.private_graph_path is not None and config.session_decryption_key is not None:
+                private_store = EncryptedPrivateEvidenceStore(config.private_graph_path, config.session_decryption_key)
+                self._evidence_store = MergedEvidenceStore(public_store, private_store)
+            else:
+                self._evidence_store = public_store
         else:
             self._evidence_store = evidence_store
         if embedder is None:
@@ -3867,7 +4068,7 @@ class CoScientistRunner:
         else:
             self._embedder = embedder
         self._discovery_agent = discovery_agent
-        self._artifact_store = artifact_store or CoScientistStore()
+        self._artifact_store = artifact_store or CoScientistStore(encryption_key=config.session_decryption_key)
         self._retriever = LocalEvidenceRetriever(self._evidence_store, self._embedder)
         self._price_cache = StructuredPriceCache(config)
         self._graph_evidence = GraphMarketEvidence()
@@ -5105,6 +5306,19 @@ class CoScientistRunner:
 
     @staticmethod
     def _build_tool_request_report(document: ResearchGoalDocument, hypotheses: list[Hypothesis]) -> str:
+        executed_tool_ids = list(
+            OrderedDict.fromkeys(
+                result.tool_id
+                for hypothesis in hypotheses
+                for result in ((hypothesis.reflection_assessment.criterion_results if hypothesis.reflection_assessment else []) or [])
+                if result.tool_id
+            )
+        )
+        executed_families = {
+            canonical_tool_family_id(tool_id)
+            for tool_id in executed_tool_ids
+            if canonical_tool_family_id(tool_id)
+        }
         lines = [
             "# Tool Requests",
             "",
@@ -5113,29 +5327,41 @@ class CoScientistRunner:
             f"Research mode: {document.research_mode}",
             "",
         ]
-        if not document.tool_requests:
+        if not document.tool_requests and not executed_tool_ids:
             lines.append("No tool requests recorded.")
             return "\n".join(lines)
-        for request in document.tool_requests:
-            dependent_criteria = [
-                criterion.name
-                for criterion in document.evaluation_criteria
-                if request.tool_id in criterion.suggested_tool_ids
-            ]
-            lines.extend(
-                [
-                    f"## {request.tool_id}",
-                    "",
-                    f"- Purpose: {request.purpose}",
-                    f"- Status: {request.status}",
-                    f"- Candidate packages: {', '.join(request.candidate_packages) or 'None recorded'}",
-                    f"- Required inputs: {', '.join(request.required_inputs) or 'None recorded'}",
-                    f"- Expected outputs: {', '.join(request.expected_outputs) or 'None recorded'}",
-                    f"- Dependent criteria: {', '.join(dependent_criteria) or 'None recorded'}",
-                    f"- Limitations: {', '.join(request.limitations) or 'None recorded'}",
-                    "",
+        if document.tool_requests:
+            lines.extend(["## Requested In Research Contract", ""])
+            for request in document.tool_requests:
+                dependent_criteria = [
+                    criterion.name
+                    for criterion in document.evaluation_criteria
+                    if request.tool_id in criterion.suggested_tool_ids
+                    or canonical_tool_family_id(request.tool_id)
+                    in {canonical_tool_family_id(tool_id) for tool_id in criterion.suggested_tool_ids}
                 ]
-            )
+                canonical_family = canonical_tool_family_id(request.tool_id)
+                lines.extend(
+                    [
+                        f"### {request.tool_id}",
+                        "",
+                        f"- Canonical skill family: {canonical_family or 'unknown'}",
+                        f"- Executed equivalent family: {'yes' if canonical_family in executed_families else 'no'}",
+                        f"- Purpose: {request.purpose}",
+                        f"- Status: {request.status}",
+                        f"- Candidate packages: {', '.join(request.candidate_packages) or 'None recorded'}",
+                        f"- Required inputs: {', '.join(request.required_inputs) or 'None recorded'}",
+                        f"- Expected outputs: {', '.join(request.expected_outputs) or 'None recorded'}",
+                        f"- Dependent criteria: {', '.join(dependent_criteria) or 'None recorded'}",
+                        f"- Limitations: {', '.join(request.limitations) or 'None recorded'}",
+                        "",
+                    ]
+                )
+        if executed_tool_ids:
+            lines.extend(["## Executed Skills / Skill Families", ""])
+            for tool_id in executed_tool_ids:
+                lines.append(f"- {tool_id} (canonical family: {canonical_tool_family_id(tool_id)})")
+            lines.append("")
         hypothesis_notes = list(
             OrderedDict.fromkeys(
                 note
@@ -5145,6 +5371,6 @@ class CoScientistRunner:
             )
         )
         if hypothesis_notes:
-            lines.extend(["## Reflection Notes", ""])
+            lines.extend(["## Still Missing Or Still Unresolved", ""])
             lines.extend([f"- {note}" for note in hypothesis_notes])
         return "\n".join(lines)

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.5
+
+### Added
+- Added optional AES-256-GCM encryption support to `CoScientistStore` so `research_goal.json`, hypothesis snapshots, rounds JSONL files, and CoScientist text reports can be stored encrypted at rest when a session key is supplied.
+
+### Changed
+- Wired `CoScientistRunner` and CoScientist CLI workflows to reuse `SESSION_DECRYPTION_KEY` / `PRIVATE_GRAPH_PATH` configuration, keeping secure private-graph access and encrypted run artifacts on the same config path.
+
+### Fixed
+- Preserved cleartext `reports/cost.json` output for audit and billing workflows while securing the rest of the sensitive CoScientist project payloads.
+
 ## 0.9.4
 
 ### Fixed
