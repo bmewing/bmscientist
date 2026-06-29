@@ -128,3 +128,24 @@ def test_config_loads_deepseek_model_pricing_override(tmp_path):
     assert pricing.input_cost_per_million_tokens == 1.0
     assert pricing.output_cost_per_million_tokens == 2.0
     assert pricing.cached_input_cost_per_million_tokens == 0.1
+
+
+def test_config_loads_private_graph_settings_and_session_key(tmp_path):
+    session_key_hex = "11" * 32
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "DEEPSEEK_API_KEY=x",
+                "EXA_API_KEY=y",
+                "PRIVATE_GRAPH_PATH=data/private-graph",
+                f"SESSION_DECRYPTION_KEY={session_key_hex}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig.from_env(env_path)
+
+    assert config.private_graph_path == Path("data/private-graph")
+    assert config.session_decryption_key == bytes.fromhex(session_key_hex)

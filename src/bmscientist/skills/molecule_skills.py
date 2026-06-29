@@ -8,6 +8,8 @@ from typing import Any, Callable
 import requests
 
 from bmscientist.coscientist_models import CandidateEvaluationResult
+from bmscientist.models import SearchResultItem
+from bmscientist.search import ExaSearchClient, ExaSearchOptions
 from bmscientist.skills.base import SkillContext, SkillRunResult, SkillSpec
 from bmscientist.skills.molecule_support import (
     HAZARD_ALERT_SMARTS,
@@ -856,16 +858,27 @@ class MoleculeNeighborExpansionSkill(_BasePubChemSkill):
 
 
 class NoveltyPatentScreenSkill(_BasePubChemSkill):
-    def __init__(self, config: Any | None = None, *, pubchem_client: PubChemClient | None = None):
+    _FREE_PRIOR_ART_DOMAINS = ("patents.google.com", "chemrxiv.org", "arxiv.org")
+
+    def __init__(
+        self,
+        config: Any | None = None,
+        *,
+        pubchem_client: PubChemClient | None = None,
+        search_client: Any | None = None,
+    ):
         super().__init__(config, pubchem_client=pubchem_client)
+        self._search_client = search_client
+        if self._search_client is None and config is not None and getattr(config, "exa_api_key", ""):
+            self._search_client = ExaSearchClient(config)
         self._spec = SkillSpec(
             skill_id=NOVELTY_PATENT_TOOL_ID,
             description=(
                 "Perform a free, approximate novelty screen based on PubChem identity resolution and source-record "
-                "presence. This is not a legal patent opinion."
+                "presence, plus free patent/literature search signals. This is not a legal patent opinion."
             ),
             phases=("reflection",),
-            aliases=("novelty_screen", "patent_screen", "novelty_check"),
+            aliases=("novelty_screen", "patent_screen", "novelty_check", "prior_art_search", "literature_novelty"),
             supported_research_modes=("candidate_design", "generic_screening"),
             expected_outputs=("novelty_patent_screen",),
             trigger_keywords=("novelty", "patent", "known substance", "commercial"),
@@ -924,15 +937,30 @@ class NoveltyPatentScreenSkill(_BasePubChemSkill):
                 score = 0.45
                 label = "known_compound_no_vendor_signal"
                 notes.append(f"PubChem returned CID {cid} but no source records were found.")
+        search_hits = self._search_free_prior_art(identifiers, resolved.get("identifiers", {}))
+        if search_hits:
+            exact_hit = any(hit["exact_identifier_hit"] for hit in search_hits)
+            label = "possible_prior_art_signal_exact" if exact_hit else "possible_prior_art_signal"
+            score = min(score, 0.16 if exact_hit else 0.22)
+            notes.append(
+                f"Free prior-art search found {len(search_hits)} domain-filtered result(s) across patents/preprints."
+            )
+        elif cid is None:
+            score = max(score, 0.78)
+            label = "no_free_prior_art_hits_unresolved"
+            notes.append("No free patent/preprint hits were found for the candidate identifiers.")
         result = CandidateEvaluationResult(
             criterion_name="novelty_patent_screen",
             value=label,
             normalized_score=score,
-            confidence=0.68,
-            rationale="Approximate novelty score derived from PubChem resolution and source-record presence only.",
+            confidence=0.76 if search_hits else 0.68,
+            rationale=(
+                "Approximate novelty score derived from PubChem identity/source-record signals and free "
+                "patent/literature search results."
+            ),
             evidence_mode="external_tool",
             tool_id=self.spec.skill_id,
-            citation_urls=["https://pubchem.ncbi.nlm.nih.gov"],
+            citation_urls=["https://pubchem.ncbi.nlm.nih.gov", *[hit["url"] for hit in search_hits[:5]]],
             is_inferred=True,
         )
         evidence_rows = [
@@ -955,19 +983,139 @@ class NoveltyPatentScreenSkill(_BasePubChemSkill):
                     "cid": cid,
                     "novelty_label": label,
                     "novelty_score": score,
+                    "free_prior_art_hit_count": len(search_hits),
                 },
             }
         ]
+        evidence_rows.extend(
+            {
+                "id": f"novelty-search:{index}:{hit['url']}",
+                "source_url": hit["url"],
+                "source_title": hit["title"] or "Free prior-art search result",
+                "application": None,
+                "incumbent_material": None,
+                "candidate_materials": [compact_text(resolved.get("identifiers", {}).get("name") or identifiers.name or "Candidate")],
+                "relevance_score": 0.81 if hit["exact_identifier_hit"] else 0.72,
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "chunk_text": (
+                    f"Free prior-art search result from {hit['domain']} for novelty checking. "
+                    f"Title: {hit['title'] or 'Untitled'}. Snippet: {hit['snippet'] or 'n/a'}"
+                )[:1800],
+                "metadata": {
+                    "source_type": "external-tool",
+                    "tool_id": self.spec.skill_id,
+                    "search_domain": hit["domain"],
+                    "exact_identifier_hit": hit["exact_identifier_hit"],
+                    "search_query": hit["search_query"],
+                },
+            }
+            for index, hit in enumerate(search_hits[:5], start=1)
+        )
         return SkillRunResult(
             skill_id=self.spec.skill_id,
             status="completed",
             criterion_results=[result],
             evidence_rows=evidence_rows,
             notes=notes,
-            rationale="Performed a free approximate novelty screen using PubChem identity and source-record data.",
+            rationale="Performed a free approximate novelty screen using PubChem identity/source data and free patent/literature search.",
             resolved_identifiers=resolved.get("identifiers", {}),
-            metadata={"cid": cid, "novelty_label": label, "novelty_score": score},
+            metadata={"cid": cid, "novelty_label": label, "novelty_score": score, "free_prior_art_hits": search_hits[:5]},
         )
+
+    def _search_free_prior_art(
+        self,
+        identifiers: MoleculeIdentifiers,
+        resolved_identifiers: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if self._search_client is None:
+            return []
+        hits: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for query in self._prior_art_queries(identifiers, resolved_identifiers)[:3]:
+            try:
+                response = self._search_client.search(
+                    query,
+                    num_results=4,
+                    options=ExaSearchOptions(
+                        search_type="keyword",
+                        text_max_characters=1200,
+                        highlights_max_characters=300,
+                        include_text=True,
+                        include_highlights=True,
+                        include_summary=False,
+                        include_domains=list(self._FREE_PRIOR_ART_DOMAINS),
+                    ),
+                )
+            except Exception:
+                LOGGER.exception("Free prior-art search failed for novelty query `%s`", query)
+                continue
+            for item in getattr(response, "results", []) or []:
+                url = str(getattr(item, "url", "") or "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                hits.append(
+                    {
+                        "url": url,
+                        "title": str(getattr(item, "title", "") or ""),
+                        "snippet": str(getattr(item, "snippet", "") or ""),
+                        "domain": self._domain_from_result(item),
+                        "search_query": query,
+                        "exact_identifier_hit": self._exact_identifier_hit(query, item),
+                    }
+                )
+        return hits
+
+    @staticmethod
+    def _domain_from_result(item: SearchResultItem | Any) -> str:
+        url = str(getattr(item, "url", "") or "")
+        try:
+            return url.split("/")[2].lower()
+        except IndexError:
+            return ""
+
+    @staticmethod
+    def _exact_identifier_hit(query: str, item: SearchResultItem | Any) -> bool:
+        needle = compact_text(query).lower().strip('"')
+        haystacks = [
+            str(getattr(item, "title", "") or ""),
+            str(getattr(item, "snippet", "") or ""),
+            str(getattr(item, "summary", "") or ""),
+            str(getattr(item, "content_text", "") or ""),
+            str(getattr(item, "url", "") or ""),
+            " ".join(getattr(item, "highlights", []) or []),
+        ]
+        lowered = " ".join(haystacks).lower()
+        return bool(needle and needle in lowered)
+
+    @staticmethod
+    def _prior_art_queries(
+        identifiers: MoleculeIdentifiers,
+        resolved_identifiers: dict[str, Any],
+    ) -> list[str]:
+        raw_values = [
+            resolved_identifiers.get("inchi_key"),
+            resolved_identifiers.get("inchikey"),
+            resolved_identifiers.get("canonical_smiles"),
+            resolved_identifiers.get("smiles"),
+            resolved_identifiers.get("name"),
+            identifiers.inchikey,
+            identifiers.canonical_smiles,
+            identifiers.smiles,
+            identifiers.name,
+        ]
+        queries: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_values:
+            text = compact_text(raw)
+            if not text:
+                continue
+            query = f"\"{text}\""
+            key = query.lower()
+            if key not in seen:
+                seen.add(key)
+                queries.append(query)
+        return queries
 
 
 class LiteratureAnswerSkill:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,29 @@ def _normalize_reasoning_effort(value: Any) -> str | None:
     if text in {"none", "disabled", "off"}:
         return None
     return "high"
+
+
+def _coerce_optional_secret_bytes(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value or None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        decoded_hex = bytes.fromhex(text)
+    except ValueError:
+        decoded_hex = None
+    if decoded_hex:
+        return decoded_hex
+    try:
+        decoded_b64 = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        decoded_b64 = None
+    if decoded_b64:
+        return decoded_b64
+    return text.encode("utf-8")
 
 
 class DeepSeekThinkingConfig(BaseModel):
@@ -137,6 +162,8 @@ class AppConfig(BaseModel):
     hf_token: str | None = None
     data_dir: Path = Field(default=Path("data"))
     lancedb_path: Path | None = Field(default=None)
+    private_graph_path: Path | None = None
+    session_decryption_key: bytes | None = None
     embedding_model: str = Field(default="BAAI/bge-base-en-v1.5")
     request_timeout_seconds: int = Field(default=20, ge=5, le=600)
     user_agent: str = Field(default="bmscientist/0.9.4")
@@ -167,6 +194,11 @@ class AppConfig(BaseModel):
         if self.lancedb_path is None:
             self.lancedb_path = self.data_dir / "lancedb"
         return self
+
+    @field_validator("session_decryption_key", mode="before")
+    @classmethod
+    def _normalize_session_decryption_key(cls, value: Any) -> bytes | None:
+        return _coerce_optional_secret_bytes(value)
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "AppConfig":
@@ -227,6 +259,12 @@ class AppConfig(BaseModel):
 
         if lancedb_env:
             values["lancedb_path"] = Path(lancedb_env)
+        private_graph_path_env = os.getenv("PRIVATE_GRAPH_PATH")
+        if private_graph_path_env:
+            values["private_graph_path"] = Path(private_graph_path_env)
+        session_decryption_key_env = os.getenv("SESSION_DECRYPTION_KEY")
+        if session_decryption_key_env:
+            values["session_decryption_key"] = session_decryption_key_env
 
         from pydantic import ValidationError
         try:

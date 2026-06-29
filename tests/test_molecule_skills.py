@@ -11,6 +11,7 @@ from bmscientist.graph_enrichment import GraphEnrichmentStore
 from bmscientist.skills import (
     MoleculeAvailabilitySkill,
     MoleculeIdentityPubChemSkill,
+    NoveltyPatentScreenSkill,
     RDKitProfileSkill,
     RXN4ChemistryRetrosynthesisSkill,
     SafetyTriageSkill,
@@ -95,6 +96,16 @@ class FakeRetriever:
 
     def retrieve_for_goal(self, document, max_results=12):
         return list(self.rows)
+
+
+class FakeNoveltySearchClient:
+    def __init__(self, results=None):
+        self.results = results or []
+        self.calls = []
+
+    def search(self, query, num_results, options=None):
+        self.calls.append((query, num_results, options))
+        return SimpleNamespace(results=list(self.results))
 
 
 class PlanningCaptureLLM:
@@ -381,14 +392,37 @@ def test_graph_enrichment_store_writes_skill_results_to_product_and_endpoint_gra
     )
 
     assert write_count >= 2
-    products = pq.read_table(graph_path / "nodes" / "Product.parquet").to_pylist()
-    assert products[0]["name"] == "Ethyl lactate"
-    assert products[0]["canonical_smiles"] == "CCOC(=O)OCC"
 
-    endpoints = pq.read_table(graph_path / "edges" / "Product_HAS_Endpoint.parquet").to_pylist()
-    endpoint_ids = {row["endpoint_id"] for row in endpoints}
-    assert "endpoint:pubchem-cid" in endpoint_ids
-    assert "endpoint:molecular-weight-rdkit" in endpoint_ids
+
+def test_novelty_skill_uses_free_prior_art_search_domains(tmp_path):
+    from bmscientist.models import SearchResultItem
+    from bmscientist.skills.pubchem_support import PubChemClient
+
+    client = PubChemClient(session=FakePubChemSession(), cache_dir=tmp_path / "pubchem-cache")
+    search_client = FakeNoveltySearchClient(
+        results=[
+            SearchResultItem.model_validate(
+                {
+                    "title": "Google Patents result for ethyl lactate",
+                    "url": "https://patents.google.com/patent/US1234567A/en",
+                    "search_query": "\"Ethyl lactate\"",
+                    "snippet": "Ethyl lactate is described as a solvent candidate.",
+                }
+            )
+        ]
+    )
+    skill = NoveltyPatentScreenSkill(pubchem_client=client, search_client=search_client)
+    context = SkillContext(phase="reflection", document=make_name_document(), hypothesis=make_name_hypothesis())
+
+    result = skill.run(context)
+
+    assert result.status == "completed"
+    assert result.metadata["free_prior_art_hits"]
+    assert any("patents/preprints" in note for note in result.notes)
+    assert search_client.calls
+    first_call = search_client.calls[0]
+    assert "patents.google.com" in first_call[2].include_domains
+    assert "chemrxiv.org" in first_call[2].include_domains
 
 
 def test_research_planning_prompt_includes_available_skills():

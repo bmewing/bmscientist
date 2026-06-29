@@ -38,8 +38,11 @@ from bmscientist.retrieval import ExaPageRetriever, build_partial_page_from_sear
 from bmscientist.search import ExaSearchClient, deduplicate_search_results, default_search_options, load_search_results_file
 from bmscientist.skills import (
     EPISuiteSkill,
+    HansenSolubilityXGBoostSkill,
+    MolToxPredScreenSkill,
     MoleculeAvailabilitySkill,
     MoleculeIdentityPubChemSkill,
+    PolymerPropertyProfileSkill,
     PubChemProfileSkill,
     RDKitProfileSkill,
     SafetyTriageSkill,
@@ -59,6 +62,9 @@ GRAPH_ENRICHMENT_SKILL_IDS = (
     "safety_triage",
     "molecule_availability",
     "epa_episuite",
+    "moltoxpred_screen",
+    "polymer_property_profile",
+    "hansen_solubility_xgboost",
 )
 
 
@@ -116,6 +122,9 @@ class DiscoveryAgent:
                     PubChemProfileSkill(config),
                     MoleculeAvailabilitySkill(config),
                     EPISuiteSkill(config),
+                    MolToxPredScreenSkill(config),
+                    PolymerPropertyProfileSkill(config),
+                    HansenSolubilityXGBoostSkill(config),
                 ]
             )
         )

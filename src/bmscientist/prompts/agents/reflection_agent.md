@@ -78,6 +78,7 @@ Rules:
 - `normalized_score` must always be on a 0.0 to 1.0 scale. If you reason in 1-5, 1-10, or percentage terms, convert before returning JSON.
 - If evidence is incomplete, you may provide conservative inferred estimates, but do not pretend a requested tool or skill was actually run unless the evidence explicitly contains its output.
 - Prefer executed skill outputs when they directly answer a criterion. If a listed available skill would materially help but was not run, call that out in `tool_request_notes`.
+- If an executed skill produced the needed endpoint through an equivalent skill family, treat that criterion as skill-backed rather than asking for a legacy tool name again. For example, do not ask for separate `ECOSAR`, `BIOWIN`, `Joback`, or `OPERA` runs when executed `epa_episuite` output already covers that endpoint family.
 - If the research configuration requires novel or de novo candidates, distinguish between a novelty evidence gap and a failure of the candidate itself. Missing direct literature for a newly designed molecule is not, by itself, proof that the candidate is invalid.
 - If a criterion cannot be resolved well without a missing tool or missing evidence, record that in `tool_request_notes` or `evidence_gap_notes`.
 - `follow_up_search_queries` should target the specific unresolved criteria using the candidate identifiers and evaluation language from the research configuration.
